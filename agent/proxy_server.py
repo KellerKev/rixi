@@ -349,42 +349,6 @@ class UniversalProxyServer:
                 "keep_alive": request_data.get("keep_alive", "5m")
             }
         
-        elif api_format == "ollama_generate":
-            # Ollama Generate API format
-            return {
-                "model": response_data.get("model", "llama2"),
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.%fZ", time.gmtime()),
-                "response": content,
-                "done": True,
-                "done_reason": "stop",
-                "context": [],  # Would contain actual context in real implementation
-                "total_duration": 0,
-                "load_duration": 0,
-                "prompt_eval_count": 0,
-                "prompt_eval_duration": 0,
-                "eval_count": 0,
-                "eval_duration": 0
-            }
-        
-        elif api_format == "ollama_chat":
-            # Ollama Chat API format
-            return {
-                "model": response_data.get("model", "llama2"),
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.%fZ", time.gmtime()),
-                "message": {
-                    "role": "assistant",
-                    "content": content
-                },
-                "done": True,
-                "done_reason": "stop",
-                "total_duration": 0,
-                "load_duration": 0,
-                "prompt_eval_count": 0,
-                "prompt_eval_duration": 0,
-                "eval_count": 0,
-                "eval_duration": 0
-            }
-        
         elif api_format == "anthropic":
             messages = request_data.get("messages", [])
             if messages:

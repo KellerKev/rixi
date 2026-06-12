@@ -5,37 +5,36 @@
 echo "🎯 Clean MCP Architecture Usage Examples"
 echo "========================================"
 
-# Example 1: Original agent (no changes)
-echo -e "\n📝 Example 1: Original Agent (Backwards Compatible)"
-echo "python start_agent_configurable.py --task-id <TASK_ID> --aes-key aes.key --original-agent haiku --topic 'mountain stream'"
+# Example 1: Simple haiku workflow
+echo -e "\n📝 Example 1: Simple Haiku Workflow"
+echo "python start_agent.py --task-id <TASK_ID> --aes-key aes.key --config agent_config.yaml --workflow simple_generation --topic 'mountain stream'"
 
-# Example 2: Simple MCP mode
-echo -e "\n🔧 Example 2: Simple MCP Mode"
-echo "python start_agent_configurable.py --task-id <TASK_ID> --aes-key aes.key --haiku-mode simple --topic 'ocean waves'"
+# Example 2: Simple workflow via the MCP entry point
+echo -e "\n🔧 Example 2: MCP Entry Point"
+echo "python start_agent_mcp.py --task-id <TASK_ID> --aes-key aes.key --config agent_config.yaml --workflow simple_generation --topic 'ocean waves'"
 
-# Example 3: Research mode
+# Example 3: Research-enhanced workflow
 echo -e "\n🔍 Example 3: Research-Enhanced Mode"
-echo "python start_agent_configurable.py --task-id <TASK_ID> --aes-key aes.key --haiku-mode research --topic 'quantum computing'"
+echo "python start_agent.py --task-id <TASK_ID> --aes-key aes.key --config agent_config.yaml --workflow research_workflow --topic 'quantum computing'"
 
 # Example 4: Configuration-driven
 echo -e "\n⚙️  Example 4: Configuration-Driven"
-echo "python start_agent_configurable.py --task-id <TASK_ID> --aes-key aes.key --config haiku_agent_config.yaml --topic 'artificial intelligence' --workflow research_haiku"
+echo "python start_agent.py --task-id <TASK_ID> --aes-key aes.key --config haiku_agent_config.yaml --topic 'artificial intelligence' --workflow research_haiku"
 
 # Example 5: Custom configuration
 echo -e "\n🎨 Example 5: Custom Configuration"
-echo "python start_agent_configurable.py --task-id <TASK_ID> --aes-key aes.key --config custom_config.yaml --context '{\"content_type\": \"paragraph\", \"style\": \"poetic\"}'"
+echo "python start_agent.py --task-id <TASK_ID> --aes-key aes.key --config custom_config.yaml --context '{\"content_type\": \"paragraph\", \"style\": \"poetic\"}'"
 
 # Example 6: Generic workflow
 echo -e "\n🔄 Example 6: Generic Workflow"
-echo "python start_agent_configurable.py --task-id <TASK_ID> --aes-key aes.key --config agent_config.yaml --workflow analysis_workflow --topic 'renewable energy'"
+echo "python start_agent.py --task-id <TASK_ID> --aes-key aes.key --config agent_config.yaml --workflow analysis_workflow --topic 'renewable energy'"
 
 echo -e "\n📁 File Structure:"
 echo "├── mcp_manager.py           # Pure MCP management"
 echo "├── mcp_agent.py             # Generic configurable agent"
-echo "├── haiku_agent_mcp.py       # Haiku-specific agent"
-echo "├── start_agent_configurable.py  # Generic runner"
+echo "├── start_agent.py           # Generic runner"
+echo "├── start_agent_mcp.py       # Thin MCP entry point"
 echo "├── agent_config.yaml        # Main configuration"
-echo "├── haiku_agent_config.yaml  # Haiku-specific config"
 echo "└── your_existing_files.py   # Unchanged!"
 
 echo -e "\n✅ Key Benefits:"

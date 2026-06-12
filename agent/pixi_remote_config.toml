@@ -1,6 +1,7 @@
 [config]
 #server-url = "http://localhost:9000"
 server-url = "http://YOUR_SERVER_HOST:9000"
-# Auth token — DO NOT commit real values. Provide via env var or a local,
-# gitignored override file. Example below uses a placeholder only.
-bearertoken = "${RIXI_BEARER_TOKEN}"
+# Auth token — DO NOT commit real values. TOML does not expand ${ENV} syntax,
+# so a real token must be injected here at deploy time (e.g. via templating or
+# a gitignored local override file). The value below is a placeholder only.
+bearer_token = "REPLACE_WITH_REAL_TOKEN_AT_DEPLOY_TIME"

@@ -392,9 +392,10 @@ class ResearchTeam:
 
 class ContentTeam:
     """A team of AI agents for content creation"""
-    
-    def __init__(self, ollama_manager: OllamaManager):
+
+    def __init__(self, ollama_manager: OllamaManager, mcp_client: Optional[LocalMCPClient] = None):
         self.llm = ollama_manager.get_llm()
+        self.mcp_client = mcp_client
     
     def create_content(self, topic: str) -> str:
         """Create engaging content about a topic"""

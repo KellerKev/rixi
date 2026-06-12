@@ -26,6 +26,11 @@
 #   # Forward arbitrary server flags after "--"
 #   ./install-rixi.sh --host me@host --key ~/.ssh/id_rsa -- --log-level DEBUG --key-secret s3cr3t
 #
+# Secrets: --key-secret / --aes-key values are never embedded in the service
+# definition or process command line. They are written to $REMOTE_DIR/rixi.env
+# (chmod 600) on the target and passed to the server via the RIXI_KEY_SECRET /
+# RIXI_AES_KEY environment variables.
+#
 set -euo pipefail
 
 # ----------------------------------------------------------------------------- defaults
@@ -45,7 +50,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_SERVER_DIR="$SCRIPT_DIR/server"
 
 usage() {
-  sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Print the comment header: every line after the shebang up to the first
+  # non-comment line, with the leading "# " stripped.
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"
   exit "${1:-0}"
 }
 
@@ -72,6 +79,11 @@ while [ $# -gt 0 ]; do
 done
 
 # ----------------------------------------------------------------------------- validate
+if [ -n "$SSH_PASSWORD" ]; then
+  log "WARNING: --password puts the SSH password in your shell history and in 'ps' output."
+  log "         Prefer --ask-pass (interactive prompt) or exporting it via the SSHPASS env var."
+fi
+
 [ -n "$SSH_HOST" ] || { err "--host is required"; usage 1; }
 [ -d "$LOCAL_SERVER_DIR" ] || { err "server/ not found next to this script ($LOCAL_SERVER_DIR)"; exit 1; }
 
@@ -105,6 +117,7 @@ fi
 TARGET="$SSH_USER@$SSH_HOST"
 
 run_ssh() {  # run a command string on the target
+  # shellcheck disable=SC2029  # callers deliberately mix client- and remote-side expansion
   if [ -n "$SSH_PASSWORD" ]; then
     SSHPASS="$SSH_PASSWORD" "${PASS_PREFIX[@]}" ssh "${SSH_OPTS[@]}" "$TARGET" "$@"
   else
@@ -152,9 +165,12 @@ push_pixi_binary() {
   tmp="$(mktemp "${TMPDIR:-/tmp}/pixi-bin.XXXXXX")"
   log "Target has no curl/wget — downloading pixi ($triple) here and pushing it over SSH…"
   fetch_to_control "$url" "$tmp" || { rm -f "$tmp"; return 1; }
+  # shellcheck disable=SC2016  # $HOME must expand on the remote, not here
   run_ssh 'mkdir -p "$HOME/.pixi/bin"'
+  # shellcheck disable=SC2088  # literal ~ is expanded by the remote side (see scp_push)
   scp_push "$tmp" '~/.pixi/bin/pixi'
   rm -f "$tmp"
+  # shellcheck disable=SC2016  # $HOME must expand on the remote, not here
   run_ssh 'chmod +x "$HOME/.pixi/bin/pixi" && "$HOME/.pixi/bin/pixi" --version' \
     || { err "pushed pixi binary failed to run on target (arch mismatch?)"; return 1; }
   log "pixi staged on target at ~/.pixi/bin/pixi"
@@ -163,6 +179,7 @@ push_pixi_binary() {
 # ----------------------------------------------------------------------------- connect & detect OS / tooling
 log "Connecting to $TARGET (port $SSH_PORT)…"
 # One round-trip: OS, arch, home, existing pixi path, and whether curl/wget exist.
+# shellcheck disable=SC2016  # the probe script must expand on the remote, not here
 REMOTE_INFO="$(run_ssh '
   P=""; if [ -x "$HOME/.pixi/bin/pixi" ]; then P="$HOME/.pixi/bin/pixi"; elif command -v pixi >/dev/null 2>&1; then P="$(command -v pixi)"; fi
   c=no; command -v curl >/dev/null 2>&1 && c=yes
@@ -192,6 +209,7 @@ elif [ "$TARGET_HAS_CURL" = yes ] || [ "$TARGET_HAS_WGET" = yes ]; then
 else
   # No pixi, no curl, no wget: stage the pixi binary from here.
   push_pixi_binary
+  # shellcheck disable=SC2088  # informational marker only; resolved on the remote
   TARGET_PIXI='~/.pixi/bin/pixi'
 fi
 
@@ -216,12 +234,55 @@ else
   fi
 fi
 
+# ----------------------------------------------------------------------------- forwarded args & secrets
+# Pull --key-secret/--aes-key out of the forwarded args. Their values are written
+# to a chmod-600 env file on the target (as RIXI_KEY_SECRET / RIXI_AES_KEY, which
+# the server reads) instead of being baked into the service definition and
+# showing up in 'ps' output.
+RIXI_KEY_SECRET=""
+RIXI_AES_KEY=""
+RIXI_FWD_ARGS=()
+idx=0
+while [ "$idx" -lt "${#RIXI_EXTRA_ARGS[@]}" ]; do
+  arg="${RIXI_EXTRA_ARGS[$idx]}"
+  case "$arg" in
+    --key-secret)   RIXI_KEY_SECRET="${RIXI_EXTRA_ARGS[$((idx + 1))]:-}"; idx=$((idx + 2)); continue ;;
+    --key-secret=*) RIXI_KEY_SECRET="${arg#--key-secret=}";               idx=$((idx + 1)); continue ;;
+    --aes-key)      RIXI_AES_KEY="${RIXI_EXTRA_ARGS[$((idx + 1))]:-}";    idx=$((idx + 2)); continue ;;
+    --aes-key=*)    RIXI_AES_KEY="${arg#--aes-key=}";                     idx=$((idx + 1)); continue ;;
+  esac
+  RIXI_FWD_ARGS+=("$arg")
+  idx=$((idx + 1))
+done
+if [ -n "$RIXI_KEY_SECRET" ] || [ -n "$RIXI_AES_KEY" ]; then
+  log "Secret flags detected — values go to $REMOTE_DIR/rixi.env (chmod 600), not the service command line"
+fi
+
 # ----------------------------------------------------------------------------- build remote provisioning script
-# Quote each forwarded rixi arg for safe embedding in the remote unit/plist.
+esc_dq() {  # backslash-escape \ and " so the value is safe inside double quotes
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
+}
+
+xml_escape() {  # escape &, <, > for embedding in plist XML
+  local s=$1
+  s=${s//&/&amp;}
+  s=${s//</&lt;}
+  s=${s//>/&gt;}
+  printf '%s' "$s"
+}
+
+# Pre-render the forwarded args in both formats the target needs:
+#  - RIXI_ARGS_QUOTED: double-quoted tokens for the systemd ExecStart= line
+#  - RIXI_ARGS_XML:    one XML-escaped <string> element per arg for the plist
 RIXI_ARGS_QUOTED=""
-for a in "${RIXI_EXTRA_ARGS[@]:-}"; do
-  [ -n "$a" ] || continue
-  RIXI_ARGS_QUOTED+=" $(printf '%q' "$a")"
+RIXI_ARGS_XML=""
+for a in ${RIXI_FWD_ARGS[@]+"${RIXI_FWD_ARGS[@]}"}; do
+  RIXI_ARGS_QUOTED+=" \"$(esc_dq "$a")\""
+  RIXI_ARGS_XML+="        <string>$(xml_escape "$a")</string>
+"
 done
 
 # The remote script is assembled in a temp file from two heredocs: a header of
@@ -234,13 +295,16 @@ trap 'rm -f "$REMOTE_SCRIPT_FILE"' EXIT
 {
 cat <<HEADER
 set -euo pipefail
-REMOTE_DIR='$REMOTE_DIR'
-SERVICE_NAME='$SERVICE_NAME'
-RIXI_PORT='$RIXI_PORT'
-REMOTE_OS='$REMOTE_OS'
-REMOTE_ARCH='$REMOTE_ARCH'
-START='$START'
-RIXI_ARGS='$RIXI_ARGS_QUOTED'
+REMOTE_DIR=$(printf '%q' "$REMOTE_DIR")
+SERVICE_NAME=$(printf '%q' "$SERVICE_NAME")
+RIXI_PORT=$(printf '%q' "$RIXI_PORT")
+REMOTE_OS=$(printf '%q' "$REMOTE_OS")
+REMOTE_ARCH=$(printf '%q' "$REMOTE_ARCH")
+START=$(printf '%q' "$START")
+RIXI_ARGS=$(printf '%q' "$RIXI_ARGS_QUOTED")
+RIXI_ARGS_XML=$(printf '%q' "$RIXI_ARGS_XML")
+RIXI_KEY_SECRET=$(printf '%q' "$RIXI_KEY_SECRET")
+RIXI_AES_KEY=$(printf '%q' "$RIXI_AES_KEY")
 HEADER
 cat <<'BODY'
 log() { printf '\033[36m  [remote]\033[0m %s\n' "$*" >&2; }
@@ -267,7 +331,7 @@ log "Pixi: $("$PIXI" --version)"
 
 cd "$REMOTE_DIR/server"
 
-# --- add the target platform on macOS (manifest ships linux-64 only) ------------
+# --- add the target platform on macOS (no-op if the manifest already has it) -----
 if [ "$REMOTE_OS" = "Darwin" ]; then
   case "$REMOTE_ARCH" in
     arm64)  PLAT="osx-arm64" ;;
@@ -285,12 +349,50 @@ fi
 log "Installing dependencies (pixi install)… this can take a while"
 "$PIXI" install
 
-# --- build the ExecStart argument list ------------------------------------------
+# --- build the server argument list ----------------------------------------------
 # Run with --no-reload (the reload path references a stale module) on the chosen port.
-EXEC_ARGS="run --manifest-path $REMOTE_DIR/server/pixi.toml python rixi_server.py --no-reload --port $RIXI_PORT $RIXI_ARGS"
+BASE_ARGS=(run --manifest-path "$REMOTE_DIR/server/pixi.toml" python rixi_server.py --no-reload --port "$RIXI_PORT")
+
+esc_dq() {  # backslash-escape \ and " so the value is safe inside double quotes
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
+}
+xml_escape() {  # escape &, <, > for embedding in plist XML
+  local s=$1
+  s=${s//&/&amp;}
+  s=${s//</&lt;}
+  s=${s//>/&gt;}
+  printf '%s' "$s"
+}
+
+# --- store secrets in a chmod-600 env file (read by the server) -------------------
+ENV_FILE="$REMOTE_DIR/rixi.env"
+HAVE_SECRETS=0
+if [ -n "$RIXI_KEY_SECRET" ] || [ -n "$RIXI_AES_KEY" ]; then
+  HAVE_SECRETS=1
+  log "Writing key material to $ENV_FILE (mode 600)…"
+  (
+    umask 077
+    : > "$ENV_FILE"
+    [ -z "$RIXI_KEY_SECRET" ] || printf 'RIXI_KEY_SECRET="%s"\n' "$(esc_dq "$RIXI_KEY_SECRET")" >> "$ENV_FILE"
+    [ -z "$RIXI_AES_KEY" ]    || printf 'RIXI_AES_KEY="%s"\n'    "$(esc_dq "$RIXI_AES_KEY")"    >> "$ENV_FILE"
+  )
+  chmod 600 "$ENV_FILE"
+fi
 
 if [ "$REMOTE_OS" = "Linux" ]; then
   # ---- user-level systemd service ----------------------------------------------
+  # Each token is double-quoted (systemd honours quotes in ExecStart=), so paths
+  # and forwarded args containing spaces survive intact.
+  EXEC_START="\"$(esc_dq "$PIXI")\""
+  for tok in "${BASE_ARGS[@]}"; do
+    EXEC_START="$EXEC_START \"$(esc_dq "$tok")\""
+  done
+  EXEC_START="$EXEC_START$RIXI_ARGS"
+  ENV_FILE_LINE=""
+  [ "$HAVE_SECRETS" = 0 ] || ENV_FILE_LINE="EnvironmentFile=$ENV_FILE"
   UNIT_DIR="$HOME/.config/systemd/user"
   mkdir -p "$UNIT_DIR"
   cat > "$UNIT_DIR/$SERVICE_NAME.service" <<UNIT
@@ -302,7 +404,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$REMOTE_DIR/server
-ExecStart=$PIXI $EXEC_ARGS
+$ENV_FILE_LINE
+ExecStart=$EXEC_START
 Restart=on-failure
 RestartSec=3
 
@@ -328,12 +431,29 @@ else
   LABEL="com.rixi.$SERVICE_NAME"
   PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   mkdir -p "$HOME/Library/LaunchAgents"
-  # Emit one <string> per whitespace-split token of EXEC_ARGS.
-  ARGS_XML=""
-  for tok in $EXEC_ARGS; do
-    ARGS_XML="$ARGS_XML        <string>$tok</string>
+  # One XML-escaped <string> per argument: fixed args here, forwarded args
+  # pre-rendered on the control machine (RIXI_ARGS_XML).
+  ARGS_XML="        <string>$(xml_escape "$PIXI")</string>
+"
+  for tok in "${BASE_ARGS[@]}"; do
+    ARGS_XML="$ARGS_XML        <string>$(xml_escape "$tok")</string>
 "
   done
+  ARGS_XML="$ARGS_XML$RIXI_ARGS_XML"
+  # launchd has no EnvironmentFile equivalent, so secrets are embedded in the
+  # plist's EnvironmentVariables dict and the plist itself is chmod 600.
+  ENV_XML=""
+  if [ "$HAVE_SECRETS" = 1 ]; then
+    ENV_XML="    <key>EnvironmentVariables</key>
+    <dict>
+"
+    [ -z "$RIXI_KEY_SECRET" ] || ENV_XML="$ENV_XML        <key>RIXI_KEY_SECRET</key><string>$(xml_escape "$RIXI_KEY_SECRET")</string>
+"
+    [ -z "$RIXI_AES_KEY" ] || ENV_XML="$ENV_XML        <key>RIXI_AES_KEY</key><string>$(xml_escape "$RIXI_AES_KEY")</string>
+"
+    ENV_XML="$ENV_XML    </dict>
+"
+  fi
   cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -342,9 +462,8 @@ else
     <key>Label</key><string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$PIXI</string>
 $ARGS_XML    </array>
-    <key>WorkingDirectory</key><string>$REMOTE_DIR/server</string>
+$ENV_XML    <key>WorkingDirectory</key><string>$REMOTE_DIR/server</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
     <key>StandardOutPath</key><string>$REMOTE_DIR/rixi.out.log</string>
@@ -352,6 +471,7 @@ $ARGS_XML    </array>
 </dict>
 </plist>
 PLIST
+  [ "$HAVE_SECRETS" = 0 ] || chmod 600 "$PLIST"
   UID_NUM="$(id -u)"
   launchctl bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
   if [ "$START" = "1" ]; then

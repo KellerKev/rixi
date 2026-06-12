@@ -34,36 +34,25 @@ class MCPTool(BaseTool):
     
     def _run(self, query: str) -> str:
         """Execute MCP tool synchronously for CrewAI"""
-        # CrewAI expects sync tools, so we run async in event loop
+        # CrewAI expects sync tools, so bridge to asyncio safely
         try:
-            # Try to get existing loop, create new one if needed
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # If loop is running, we need to use run_in_executor
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(self._run_async_tool, query)
-                        result = future.result(timeout=30)
-                else:
-                    result = loop.run_until_complete(self._run_async_tool(query))
+                asyncio.get_running_loop()
             except RuntimeError:
-                # No event loop, create a new one
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    result = loop.run_until_complete(self._run_async_tool(query))
-                finally:
-                    loop.close()
-            
-            return result
-            
+                return self._run_async_tool(query)
+
+            # Called from within a running loop: run in a dedicated thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._run_async_tool, query)
+                return future.result(timeout=30)
+
         except Exception as e:
             return f"Error executing {self._tool_name}: {str(e)}"
-    
+
     def _run_async_tool(self, query: str) -> str:
         """Run the actual async MCP tool call"""
-        return asyncio.create_task(self._execute_mcp_tool(query))
+        return asyncio.run(self._execute_mcp_tool(query))
     
     async def _execute_mcp_tool(self, query: str) -> str:
         """Execute the MCP tool"""

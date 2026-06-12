@@ -6,14 +6,17 @@ version = "0.1.0"
 
 [tasks]
 start = "python inference_server.py"
-# Main HTTP service task
-http-service = "python main.py"
+# Main HTTP service task (demo)
+http-service = "python examples/main.py"
 
 # Simple HTTP server only (no proxy)
-http-server = "python -c 'from main import run_simple_http_server; run_simple_http_server()'"
+http-server = "python -c 'import sys; sys.path.insert(0, \"examples\"); from main import run_simple_http_server; run_simple_http_server()'"
 
 # Flask variant (if flask is installed)
-flask-service = {  cmd = "python flask_service.py" }
+flask-service = {  cmd = "python examples/flask_service.py" }
+
+# Run the test suite
+test = "pytest tests/"
 
 # FastAPI variant (if fastapi is installed)
 fastapi-service = { depends-on = ["install-fastapi"], cmd = "python fastapi_service.py" }
@@ -49,6 +52,7 @@ transformers = ">=4.52.1,<5"
 pytorch = ">=2.7.0,<3"
 accelerate = ">=1.9.0,<2"
 python-multipart = ">=0.0.20,<0.0.21"
+pytest = ">=8"
 
 [pypi-dependencies]
 crewai = "*"

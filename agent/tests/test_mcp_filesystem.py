@@ -1,140 +1,100 @@
-#!/usr/bin/env python3
-# test_mcp_filesystem.py - Test the MCP filesystem server directly
-
+# test_mcp_filesystem.py - Tests for the filesystem MCP server
 import asyncio
-import json
-import os
-from mcp_filesystem import MCPFilesystemHandler
+import pathlib
 
-async def test_filesystem_server():
-    """Test the MCP filesystem server directly"""
-    print("🧪 Testing MCP Filesystem Server...")
-    
-    # Initialize handler
-    handler = MCPFilesystemHandler(".")
-    
-    # Test 1: Write a file
-    print("\n📝 Test 1: Writing a test file...")
-    write_result = await handler.handle_tool_call("write_file", {
-        "path": "mcp_test.txt",
-        "content": "Hello from MCP filesystem server!\nThis is a test file."
-    })
-    print(f"Write result: {json.dumps(write_result, indent=2)}")
-    
-    # Test 2: Read the file back
-    print("\n📖 Test 2: Reading the test file...")
-    read_result = await handler.handle_tool_call("read_file", {
-        "path": "mcp_test.txt"
-    })
-    print(f"Read result: {json.dumps(read_result, indent=2)}")
-    
-    # Test 3: List directory
-    print("\n📂 Test 3: Listing current directory...")
-    list_result = await handler.handle_tool_call("list_directory", {
-        "path": "."
-    })
-    print(f"Directory listing (first 5 items):")
-    for item in list_result.get("items", [])[:5]:
-        print(f"  {item['type']}: {item['name']}")
-    
-    # Test 4: Create directory
-    print("\n📁 Test 4: Creating test directory...")
-    mkdir_result = await handler.handle_tool_call("create_directory", {
-        "path": "test_mcp_dir"
-    })
-    print(f"Create directory result: {json.dumps(mkdir_result, indent=2)}")
-    
-    # Test 5: Write file in new directory
-    print("\n📝 Test 5: Writing file in new directory...")
-    nested_write_result = await handler.handle_tool_call("write_file", {
-        "path": "test_mcp_dir/nested_file.txt",
-        "content": "This is a nested file!"
-    })
-    print(f"Nested write result: {json.dumps(nested_write_result, indent=2)}")
-    
-    # Verify files exist on disk
-    print("\n🔍 Verification: Checking files on disk...")
-    if os.path.exists("mcp_test.txt"):
-        print("✅ mcp_test.txt exists on disk")
-        with open("mcp_test.txt", "r") as f:
-            content = f.read()
-            print(f"   Content: {repr(content[:50])}...")
-    else:
-        print("❌ mcp_test.txt does not exist on disk")
-    
-    if os.path.exists("test_mcp_dir/nested_file.txt"):
-        print("✅ test_mcp_dir/nested_file.txt exists on disk")
-    else:
-        print("❌ test_mcp_dir/nested_file.txt does not exist on disk")
-    
-    print("\n🧹 Cleaning up test files...")
-    try:
-        if os.path.exists("mcp_test.txt"):
-            os.remove("mcp_test.txt")
-            print("✅ Cleaned up mcp_test.txt")
-        
-        if os.path.exists("test_mcp_dir/nested_file.txt"):
-            os.remove("test_mcp_dir/nested_file.txt")
-            print("✅ Cleaned up nested_file.txt")
-        
-        if os.path.exists("test_mcp_dir"):
-            os.rmdir("test_mcp_dir")
-            print("✅ Cleaned up test_mcp_dir")
-    except Exception as e:
-        print(f"⚠️  Cleanup warning: {e}")
-    
-    print("\n🎉 MCP Filesystem Server test completed!")
+import pytest
 
-async def test_with_mcp_manager():
-    """Test using the MCP manager"""
-    print("\n🔧 Testing with MCP Manager...")
-    
-    from mcp_manager import MCPManager, MCPServerConfig
-    
-    manager = MCPManager(prefer_real_servers=True)
-    await manager.start()
-    
-    # Create filesystem server config
-    config = MCPServerConfig(
-        name="test_workspace",
-        command=["python", "-m", "mcp_filesystem", "."],
-        tools=["read_file", "write_file", "list_directory", "create_directory"],
-        description="Test filesystem server",
-        mode="real"
-    )
-    
-    # Register and start server
-    await manager.register_server(config)
-    success = await manager.start_server("test_workspace")
-    print(f"🚀 Server started: {success}")
-    
-    # Get status
-    status = await manager.get_server_status()
-    print(f"📊 Server status: {json.dumps(status, indent=2)}")
-    
-    # Test tool call
-    try:
-        result = await manager.call_tool("write_file", {
-            "path": "manager_test.txt",
-            "content": "Hello from MCP Manager!"
-        })
-        print(f"📝 Write via manager: {json.dumps(result, indent=2)}")
-        
-        # Verify file exists
-        if os.path.exists("manager_test.txt"):
-            print("✅ File created via MCP Manager!")
-            os.remove("manager_test.txt")
-            print("✅ Cleaned up manager_test.txt")
-        else:
-            print("❌ File not created via MCP Manager")
-            
-    except Exception as e:
-        print(f"❌ Error calling tool via manager: {e}")
-    
-    await manager.stop()
-    print("🔧 MCP Manager test completed!")
+from mcp_filesystem import FilesystemMCPServer, MCPFilesystemHandler
 
-if __name__ == "__main__":
-    print("🚀 Starting MCP Filesystem Tests...")
-    asyncio.run(test_filesystem_server())
-    asyncio.run(test_with_mcp_manager())
+
+def test_ensure_safe_path_accepts_paths_inside_root(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    inside = tmp_path / "subdir" / "file.txt"
+    assert server.ensure_safe_path(inside) == inside.resolve()
+
+
+def test_ensure_safe_path_rejects_parent_traversal(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    with pytest.raises(PermissionError):
+        server.ensure_safe_path(tmp_path / ".." / "outside.txt")
+
+
+def test_ensure_safe_path_rejects_absolute_path_outside_root(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    with pytest.raises(PermissionError):
+        server.ensure_safe_path(pathlib.Path("/etc/passwd"))
+
+
+def test_read_file_rejects_traversal(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    result = asyncio.run(server.read_file("../outside.txt"))
+    assert result["success"] is False
+    assert "Access denied" in result["error"]
+
+
+def test_write_file_rejects_absolute_path_outside_root(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    result = asyncio.run(server.write_file("/tmp/definitely_outside.txt", "nope"))
+    assert result["success"] is False
+    assert "Access denied" in result["error"]
+
+
+def test_write_and_read_roundtrip(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    write_result = asyncio.run(server.write_file("notes/hello.txt", "hello mcp"))
+    assert write_result["success"] is True
+    assert (tmp_path / "notes" / "hello.txt").read_text() == "hello mcp"
+
+    read_result = asyncio.run(server.read_file("notes/hello.txt"))
+    assert read_result["success"] is True
+    assert read_result["content"] == "hello mcp"
+
+
+def test_read_file_missing_returns_error(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    result = asyncio.run(server.read_file("does_not_exist.txt"))
+    assert result["success"] is False
+    assert "not found" in result["error"].lower()
+
+
+def test_read_file_enforces_size_cap(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    server.MAX_READ_BYTES = 16
+    (tmp_path / "big.txt").write_text("x" * 100)
+    result = asyncio.run(server.read_file("big.txt"))
+    assert result["success"] is False
+    assert "too large" in result["error"].lower()
+
+
+def test_list_directory(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    (tmp_path / "a.txt").write_text("a")
+    (tmp_path / "sub").mkdir()
+    result = asyncio.run(server.list_directory("."))
+    assert result["success"] is True
+    names = {item["name"] for item in result["items"]}
+    assert names == {"a.txt", "sub"}
+
+
+def test_create_directory(tmp_path):
+    server = FilesystemMCPServer(str(tmp_path))
+    result = asyncio.run(server.create_directory("new/nested"))
+    assert result["success"] is True
+    assert (tmp_path / "new" / "nested").is_dir()
+
+
+def test_handler_unknown_tool(tmp_path):
+    handler = MCPFilesystemHandler(str(tmp_path))
+    result = asyncio.run(handler.handle_tool_call("delete_everything", {}))
+    assert result["success"] is False
+    assert "Unknown tool" in result["error"]
+
+
+def test_handler_routes_tool_calls(tmp_path):
+    handler = MCPFilesystemHandler(str(tmp_path))
+    result = asyncio.run(handler.handle_tool_call(
+        "write_file", {"path": "via_handler.txt", "content": "ok"}
+    ))
+    assert result["success"] is True
+    assert result["tool_name"] == "write_file"
+    assert (tmp_path / "via_handler.txt").read_text() == "ok"

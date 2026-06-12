@@ -7,7 +7,7 @@ channels = ["conda-forge", "pytorch"]
 platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
 
 [dependencies]
-python = ">=3.9,<3.12"
+python = ">=3.9"
 pip = "*"
 requests = "*"
 pyyaml = "*"
@@ -15,20 +15,27 @@ tomli = "*"
 cryptography = "*"
 pydantic = ">=2.0"
 lz4 = ">=4.4.4,<5"
+pyjwt = "*"
 
-[pypi-dependencies]
+[feature.crewai.dependencies]
+python = ">=3.10,<3.13"
+
+[feature.crewai.pypi-dependencies]
 crewai = "*"
 ollama = "*"
 langchain = "*"
 langchain-community = "*"
 langchain-ollama = "*"
 
+[environments]
+crewai = ["crewai"]
+
 [tasks]
 # Development tasks
-dev = "python main.py"
 test = "python -m pytest tests/ -v"
-lint = "python -m flake8 ."
-format = "python -m black ."
+
+[feature.crewai.tasks]
+dev = "python main.py"
 
 # Demo tasks for showcasing different capabilities
 demo-research = "python main.py --task research --topic 'artificial intelligence trends'"

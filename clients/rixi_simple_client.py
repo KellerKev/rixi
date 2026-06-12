@@ -7,7 +7,6 @@ from typing import Dict, Optional
 import shutil
 import lz4.frame, requests
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from tqdm import tqdm
 
 # ───────────────────────── Globals ────────────────────────────────────────
 NONCE_LEN = 12
@@ -15,6 +14,17 @@ current_task_id: Optional[str] = None
 server_url: str = "http://localhost:9000"
 aes_key: Optional[bytes] = None
 _auth_headers: Dict[str, str] = {}          # set in main
+
+# HTTP defaults: (connect timeout, read timeout); streaming reads may block indefinitely
+CONNECT_TIMEOUT = 10
+DEFAULT_TIMEOUT = (CONNECT_TIMEOUT, 30)
+STREAM_TIMEOUT = (CONNECT_TIMEOUT, None)
+
+_http_session = requests.Session()
+
+def _http(method: str, url: str, *, timeout=DEFAULT_TIMEOUT, **kwargs):
+    """Issue an HTTP request through the shared session with a default timeout."""
+    return _http_session.request(method, url, timeout=timeout, **kwargs)
 
 # ───────────────────────── AES helpers ────────────────────────────────────
 def _dec(chunk: bytes) -> str:
@@ -73,25 +83,28 @@ def _signal_handler(sig, frame):
 
     hdr = _auth_headers
     if choice == "1":
-        requests.delete(f"{server_url}/task/{current_task_id}", headers=hdr)
+        _http("DELETE", f"{server_url}/task/{current_task_id}", headers=hdr)
         print("Task terminated."); sys.exit(0)
 
     if choice == "2":
         print(f"Task {current_task_id} left running."); sys.exit(0)
 
     if choice == "3":
-        requests.post(f"{server_url}/task/{current_task_id}/restart", headers=hdr)
+        _http("POST", f"{server_url}/task/{current_task_id}/restart", headers=hdr)
         print("Task restarted."); sys.exit(0)
 
     if choice == "4":
         pkg = _package_dir()
-        with open(pkg, "rb") as fh:
-            files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
-            requests.post(f"{server_url}/task/{current_task_id}/redeploy", headers=hdr, files=files)
+        try:
+            with open(pkg, "rb") as fh:
+                files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
+                _http("POST", f"{server_url}/task/{current_task_id}/redeploy", headers=hdr, files=files)
+        finally:
+            os.unlink(pkg)
         print("Task redeployed."); sys.exit(0)
 
     if choice == "6":                               # NEW
-        requests.post(f"{server_url}/task/{current_task_id}/restart", headers=hdr)
+        _http("POST", f"{server_url}/task/{current_task_id}/restart", headers=hdr)
         print("Task restarting…")
         _attach_stream_only(current_task_id,_auth_headers)             # fall through to live attach
         return                                      # continue monitoring
@@ -163,21 +176,24 @@ def _consume_stream(resp):
 
 # ───────────────────────── Upload / attach wrappers ───────────────────────
 def _upload_and_run(pkg, task, headers):
-    with open(pkg, "rb") as fh:
-        files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
-        data  = {"task_name": task, "keep_alive": "true"}
-        with requests.post(f"{server_url}/upload", files=files, data=data, headers=headers, stream=True) as r:
-            if r.status_code != 200: print("Error:", r.status_code, r.text); return
-            _consume_stream(r)
-    os.unlink(pkg)
+    try:
+        with open(pkg, "rb") as fh:
+            files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
+            data  = {"task_name": task, "keep_alive": "true"}
+            with _http("POST", f"{server_url}/upload", files=files, data=data, headers=headers,
+                       stream=True, timeout=STREAM_TIMEOUT) as r:
+                if r.status_code != 200: print("Error:", r.status_code, r.text); return
+                _consume_stream(r)
+    finally:
+        os.unlink(pkg)
 
 def _attach_stream_only(tid: str, headers):
     """FIXED: Only get the live stream - no duplicate recent_output"""
     print(f"Attaching to task {tid}...")
-    
+
     # Skip the recent_output step and go straight to live stream
-    with requests.get(
-        f"{server_url}/task/{tid}/stream", headers=headers, stream=True
+    with _http(
+        "GET", f"{server_url}/task/{tid}/stream", headers=headers, stream=True, timeout=STREAM_TIMEOUT
     ) as resp:
         if resp.status_code != 200:
             print("Error:", resp.status_code, resp.text)
@@ -191,7 +207,7 @@ def _attach(tid: str, headers):
 def _attach_history(tid: str, headers):
     """Get task history from recent_output, then start live stream"""
     # ➊ backlog from recent_output (formatted properly)
-    r = requests.get(f"{server_url}/task/{tid}", headers=headers)
+    r = _http("GET", f"{server_url}/task/{tid}", headers=headers)
     if r.status_code == 200:
         info = r.json()
         for entry in info.get("recent_output", []):
@@ -205,9 +221,15 @@ def _attach_history(tid: str, headers):
     # ➋ live follow (stream only, no duplicates)
     _attach_stream_only(tid, headers)
 
+def _write_secret_file(path: str, data: str):
+    """Write a secret file with owner-only permissions (0600)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
+
 def perform_handshake(secret: str, rotate: bool):
     data = {"secret": secret, "rotate": rotate}
-    r = requests.post(f"{server_url}/handshake", json=data, headers=_auth_headers)
+    r = _http("POST", f"{server_url}/handshake", json=data, headers=_auth_headers)
     if r.status_code != 200:
         print("Handshake step-1 failed:", r.text); sys.exit(1)
     pub_pem = r.json()["public_key"]
@@ -217,7 +239,7 @@ def perform_handshake(secret: str, rotate: bool):
     new_rot = os.urandom(32)
 
     from cryptography.hazmat.primitives import serialization, hashes
-    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    from cryptography.hazmat.primitives.asymmetric import padding
 
     pub_key = serialization.load_pem_public_key(pub_pem.encode())
     blob = new_aes + new_rot
@@ -230,14 +252,14 @@ def perform_handshake(secret: str, rotate: bool):
         )
     ).decode()
 
-    r2 = requests.post(f"{server_url}/handshake/finish", json={"cipher": cipher},
-                       headers=_auth_headers)
+    r2 = _http("POST", f"{server_url}/handshake/finish", json={"cipher": cipher},
+               headers=_auth_headers)
     if r2.status_code != 200:
         print("Handshake step-2 failed:", r2.text); sys.exit(1)
 
-    # persist to local file
-    pathlib.Path("aes.key").write_text(base64.b64encode(new_aes).decode())
-    pathlib.Path("rotation.secret").write_text(base64.b64encode(new_rot).decode())
+    # persist to local file (owner-only permissions)
+    _write_secret_file("aes.key", base64.b64encode(new_aes).decode())
+    _write_secret_file("rotation.secret", base64.b64encode(new_rot).decode())
     print("Handshake successful – AES key saved (base64)")
     return new_aes, new_rot
 

@@ -59,8 +59,12 @@ class SimpleAgent:
         if hybrid_mode and MCP_AVAILABLE:
             print("🔄 Initializing hybrid mode...")
             self.mcp_manager = MCPManager()
-            asyncio.create_task(self._setup_hybrid_mode())
-    
+
+    async def setup(self):
+        """Complete async setup (hybrid mode MCP servers)"""
+        if self.hybrid_mode and self.mcp_manager:
+            await self._setup_hybrid_mode()
+
     async def _setup_hybrid_mode(self):
         """Setup hybrid mode with local MCP servers"""
         if not self.mcp_manager:
@@ -655,10 +659,10 @@ async def main():
                 headers = {"Authorization": auth_header} if auth_header else {}
                 agent.register_remote_service(name, url, headers)
     
-    # Wait for hybrid setup
+    # Complete hybrid setup
     if args.hybrid:
-        await asyncio.sleep(1)  # Allow MCP setup to complete
-    
+        await agent.setup()
+
     try:
         # Build context from arguments (ORIGINAL)
         context = {}

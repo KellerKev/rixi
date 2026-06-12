@@ -24,11 +24,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import logging.handlers
 import os
 import pathlib
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -38,9 +41,10 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 import jwt
 import lz4.frame
@@ -67,7 +71,7 @@ class JSONFormatter(logging.Formatter):
     
     def format(self, record):
         log_entry = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -252,6 +256,10 @@ secret_uses_remaining: int | None = None   # None = unlimited
 
 aes_key: Optional[bytes] = None  # AES‑256 key
 
+OUTPUT_LINES_MAX = 10000
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+max_upload_bytes: int = 2048 * 1024 * 1024  # configurable via --max-upload-mb
+
 # ─────────────────────────── AES helpers ──────────────────────────────────
 NONCE_LEN = 12
 # at top
@@ -317,7 +325,7 @@ async def refresh_jwks_keys() -> None:
     if not auth_settings.jwks_url:
         return
     try:
-        resp = requests.get(auth_settings.jwks_url, timeout=5)
+        resp = await asyncio.to_thread(requests.get, auth_settings.jwks_url, timeout=5)
         resp.raise_for_status()
         auth_settings.jwks_keys = {k["kid"]: k for k in resp.json().get("keys", []) if "kid" in k}
         logger.info("JWKS keys refreshed", extra={"key_count": len(auth_settings.jwks_keys)})
@@ -328,14 +336,17 @@ async def refresh_jwks_keys() -> None:
 
 async def validate_token(token: str) -> tuple[bool, Optional[dict]]:
     """Validate JWT token and return (is_valid, decoded_payload)"""
+    allowed_algorithms = ["RS256", "ES256"]
     try:
         hdr = jwt.get_unverified_header(token)
-        alg = hdr.get("alg", "RS256")
         kid = hdr.get("kid")
 
         # JWKS
         if auth_settings.jwks_keys and kid:
-            key = auth_settings.jwks_keys.get(kid) or (await refresh_jwks_keys() or auth_settings.jwks_keys.get(kid))
+            key = auth_settings.jwks_keys.get(kid)
+            if not key:
+                await refresh_jwks_keys()
+                key = auth_settings.jwks_keys.get(kid)
             if not key or key.get("kty") != "RSA":
                 return False, None
             from cryptography.hazmat.primitives.asymmetric import rsa
@@ -346,20 +357,20 @@ async def validate_token(token: str) -> tuple[bool, Optional[dict]]:
             pem = rsa.RSAPublicNumbers(e, n).public_key(default_backend()).public_bytes(
                 serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
             )
-            payload = jwt.decode(token, pem, algorithms=[alg], options={"verify_aud": False})
+            payload = jwt.decode(token, pem, algorithms=allowed_algorithms, options={"verify_aud": False})
             return True, payload
 
         # local PEM
         if auth_settings.public_key:
             try:
-                payload = jwt.decode(token, auth_settings.public_key, algorithms=[alg], options={"verify_aud": False})
+                payload = jwt.decode(token, auth_settings.public_key, algorithms=allowed_algorithms, options={"verify_aud": False})
                 return True, payload
             except jwt.InvalidAlgorithmError:
                 from cryptography.hazmat.primitives import serialization
                 from cryptography.hazmat.backends import default_backend
                 try:
                     key_obj = serialization.load_pem_public_key(auth_settings.public_key.encode(), backend=default_backend())
-                    payload = jwt.decode(token, key_obj, algorithms=[alg], options={"verify_aud": False})
+                    payload = jwt.decode(token, key_obj, algorithms=allowed_algorithms, options={"verify_aud": False})
                     return True, payload
                 except Exception:
                     return False, None
@@ -440,9 +451,11 @@ def setup_auth(pub: Optional[str], jwks: Optional[str]) -> None:
 
 # ─────────────────────────── Task helpers ─────────────────────────────────
 running_tasks: Dict[str, Dict[str, Any]] = {}
+running_tasks_lock = threading.Lock()
 
 def cleanup_task(tid: str) -> None:
-    info = running_tasks.pop(tid, None)
+    with running_tasks_lock:
+        info = running_tasks.pop(tid, None)
     if not info:
         return
     proc: subprocess.Popen | None = info.get("process")
@@ -556,6 +569,59 @@ mcp_response_manager = MCPResponseManager()
 # NEW: OFFLINE DEPLOYMENT SUPPORT (PHASE 1)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
+_TASK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+def _validate_task_name(name: str) -> str:
+    """Reject task names that could be abused for shell injection."""
+    if not name or not _TASK_NAME_RE.match(name):
+        logger.warning("Invalid task name rejected", extra={"task_name": repr(name)})
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid task name: only letters, digits, '.', '_' and '-' are allowed",
+        )
+    return name
+
+def _safe_extractall(tar: tarfile.TarFile, dest: str) -> None:
+    """Extract a tar archive while refusing path traversal, links and devices."""
+    try:
+        tar.extractall(dest, filter="data")
+        return
+    except TypeError:
+        pass  # Python < 3.12 has no `filter` argument – validate manually
+    dest_root = os.path.realpath(dest)
+    for member in tar.getmembers():
+        if os.path.isabs(member.name):
+            raise ValueError(f"Archive member has absolute path: {member.name}")
+        target = os.path.realpath(os.path.join(dest_root, member.name))
+        if target != dest_root and not target.startswith(dest_root + os.sep):
+            raise ValueError(f"Archive member escapes destination: {member.name}")
+        if member.issym() or member.islnk():
+            raise ValueError(f"Archive member is a link: {member.name}")
+        if member.isdev():
+            raise ValueError(f"Archive member is a device: {member.name}")
+    tar.extractall(dest)
+
+def _extract_tar(tar_path: str, dest: str) -> None:
+    with tarfile.open(tar_path) as tar:
+        _safe_extractall(tar, dest)
+
+def _decompress_lz4(pkg_path: str, tar_path: str) -> None:
+    """Decompress an LZ4 package to a tar file with a hard size cap."""
+    limit = max_upload_bytes * 10
+    total = 0
+    with lz4.frame.open(pkg_path, "rb") as src, open(tar_path, "wb") as dst:
+        while True:
+            chunk = src.read(UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Decompressed package exceeds limit of {limit} bytes",
+                )
+            dst.write(chunk)
+
 def _detect_package_type(tar_path: str) -> dict:
     """Detect if package is offline (contains .pixi folder) and extract metadata"""
     package_info = {
@@ -612,21 +678,140 @@ def _get_folder_size(folder_path: str) -> int:
         print(f"⚠️ Error calculating folder size: {e}")
     return total_size
 
+# ─────────────────────────── Shared task-run helpers ───────────────────────
+def _write_task_wrapper(work_dir: str, task: str, script_name: str) -> str:
+    """Write the bash wrapper script that runs `pixi run <task>` with full output capture."""
+    task_log_file = os.path.join(work_dir, "task_output.log")
+    script_content = f'''#!/bin/bash
+set -o pipefail
+cd {shlex.quote(work_dir)}
+# Set environment variables to force unbuffered output from Python programs
+export PYTHONUNBUFFERED=1
+export PYTHONIOENCODING=utf-8
+# Force pixi to be verbose and unbuffered
+export PIXI_LOG_LEVEL=info
+# Use stdbuf to disable buffering and capture ALL output including pixi's own logs
+stdbuf -oL -eL pixi run --verbose {shlex.quote(task)} 2>&1 | tee {shlex.quote(task_log_file)}
+exit ${{PIPESTATUS[0]}}
+'''
+    script_path = os.path.join(work_dir, script_name)
+    with open(script_path, 'w') as f:
+        f.write(script_content)
+    os.chmod(script_path, 0o755)
+    return script_path
+
+def _spawn_task_process(script_path: str, work_dir: str, is_offline: bool) -> subprocess.Popen:
+    """Start the wrapper script with the enhanced environment (offline-aware)."""
+    env = {
+        **os.environ,
+        "PIXI_NO_COLOR": "1"  # Disable colors for cleaner output
+    }
+    if is_offline:
+        # Point pixi to use the local .pixi folder
+        env["PIXI_CACHE_DIR"] = os.path.join(work_dir, ".pixi")
+        env["PIXI_OFFLINE"] = "1"  # Hint to pixi that we're in offline mode
+    return subprocess.Popen(
+        ["/bin/bash", script_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Merge stderr into stdout to catch ALL logs
+        stdin=subprocess.PIPE,
+        text=True,
+        bufsize=0,  # Unbuffered to catch output immediately
+        preexec_fn=os.setsid,
+        env=env,
+    )
+
+def _make_reader(tid: Optional[str], get_info, proxy_label: str = ""):
+    """Build the output reader used by upload/restart/redeploy task processes."""
+    def reader(stream, name):
+        try:
+            info = get_info()
+            if info is not None:
+                ready = info.get("reader_ready")
+                if ready is not None:
+                    ready.set()
+
+            for ln in iter(stream.readline, ""):
+                if not ln:  # EOF
+                    break
+
+                info = get_info()
+                if info is None:
+                    continue
+
+                info["output_lines"].append((name, ln))
+                deployment_type = "OFFLINE" if info.get("offline_package") else "ONLINE"
+                task_logger = info.get("task_logger")
+
+                if name == "output":
+                    print(f"[{tid[:8] if tid else 'LIVE'}|{deployment_type}] {ln.rstrip()}")
+                    # Log stdout to structured logs (files only)
+                    logger.debug("Task stdout", extra={
+                        "task_id": tid,
+                        "deployment_type": deployment_type.lower(),
+                        "output_type": "stdout",
+                        "content": ln.rstrip()
+                    })
+                    # Also log to task-specific log file
+                    if task_logger:
+                        task_logger.debug(f"Task output: {ln.rstrip()}", extra={
+                            "task_id": tid,
+                            "deployment_type": deployment_type.lower(),
+                            "output_type": "stdout",
+                            "content": ln.rstrip(),
+                            "timestamp": time.time()
+                        })
+                elif name == "stderr":
+                    print(f"[{tid[:8] if tid else 'LIVE'}|{deployment_type}] ERR: {ln.rstrip()}")
+                    # Log stderr to structured logs (files only)
+                    logger.debug("Task stderr", extra={
+                        "task_id": tid,
+                        "deployment_type": deployment_type.lower(),
+                        "output_type": "stderr",
+                        "content": ln.rstrip()
+                    })
+                    # Also log to task-specific log file
+                    if task_logger:
+                        task_logger.debug(f"Task error: {ln.rstrip()}", extra={
+                            "task_id": tid,
+                            "deployment_type": deployment_type.lower(),
+                            "output_type": "stderr",
+                            "content": ln.rstrip(),
+                            "timestamp": time.time()
+                        })
+
+                # Check for HTTP proxy responses - TASK-BASED ROUTING
+                if name == "output" and ln.strip():
+                    try:
+                        data = json.loads(ln.strip())
+                        if data.get("type") == "http_response":
+                            logger.debug("HTTP response detected", extra={"task_id": tid})
+                            print(f"🔄 {proxy_label}Detected HTTP response for task {tid}")
+                            http_proxy_manager.set_response_for_task(tid, data)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        except Exception as e:
+            logger.error("Output reader error", extra={"task_id": tid, "stream": name, "error": str(e)})
+            if tid:
+                print(f"Reader error for {name}: {e}")
+    return reader
+
 # ─────────────────────────── ENHANCED Pixi runner generator (with offline support) ──────────────────
 async def extract_and_run(pkg: str, task: str, tid: Optional[str]) -> AsyncGenerator[bytes, None]:
     tmp = tempfile.mkdtemp()
     if tid:
-        running_tasks[tid] = {
-            "temp_dir": tmp,
-            "task_name": task,
-            "status": "extracting",
-            "started_at": time.time(),
-            "process": None,
-            "output_lines": [],
-            "reader_ready": threading.Event(),
-            "offline_package": False,  # NEW: Track package type
-            "pixi_lock_hash": None,    # NEW: For future caching (Phase 2)
-        }
+        with running_tasks_lock:
+            running_tasks[tid] = {
+                "temp_dir": tmp,
+                "task_name": task,
+                "status": "extracting",
+                "started_at": time.time(),
+                "process": None,
+                "output_lines": deque(maxlen=OUTPUT_LINES_MAX),
+                "reader_ready": threading.Event(),
+                "offline_package": False,  # NEW: Track package type
+                "pixi_lock_hash": None,    # NEW: For future caching (Phase 2)
+            }
         
         # NEW: Create task-specific logger
         if logging_config:
@@ -638,24 +823,28 @@ async def extract_and_run(pkg: str, task: str, tid: Optional[str]) -> AsyncGener
     yield send_frame((json.dumps({"status": f"Extracting to {tmp}", "task_id": tid}) + "\n").encode())
 
     tar_path = os.path.join(tmp, "package.tar")
-    with lz4.frame.open(pkg, "rb") as src, open(tar_path, "wb") as dst:
-        shutil.copyfileobj(src, dst)
-    
+    try:
+        await asyncio.to_thread(_decompress_lz4, pkg, tar_path)
+    finally:
+        try:
+            os.unlink(pkg)
+        except OSError:
+            pass
+
     # NEW: Check if this is an offline package before extraction
-    package_info = _detect_package_type(tar_path)
+    package_info = await asyncio.to_thread(_detect_package_type, tar_path)
     is_offline = package_info.get("is_offline", False)
     pixi_lock_hash = package_info.get("pixi_lock_hash")
     metadata = package_info.get("metadata")
-    
+
     if tid and tid in running_tasks:
         running_tasks[tid]["offline_package"] = is_offline
         running_tasks[tid]["pixi_lock_hash"] = pixi_lock_hash
         if metadata:
             running_tasks[tid]["package_metadata"] = metadata
-    
+
     # Extract package (includes .pixi folder if present)
-    with tarfile.open(tar_path) as tar:
-        tar.extractall(tmp)
+    await asyncio.to_thread(_extract_tar, tar_path, tmp)
     os.remove(tar_path)
     
     # NEW: Enhanced logging and validation based on package type
@@ -710,29 +899,10 @@ async def extract_and_run(pkg: str, task: str, tid: Optional[str]) -> AsyncGener
     if tid:
         running_tasks[tid]["status"] = "starting"
 
-    cmd = f"cd {tmp} && pixi run {task}"
-    
     # ULTIMATE FIX: Use script to capture ALL command output including shell setup
     # This wrapper script captures even the initial pixi command output AND the program output
-    task_log_file = os.path.join(tmp, "task_output.log")
-    script_content = f'''#!/bin/bash
-set -o pipefail
-cd "{tmp}"
-# Set environment variables to force unbuffered output from Python programs
-export PYTHONUNBUFFERED=1
-export PYTHONIOENCODING=utf-8
-# Force pixi to be verbose and unbuffered
-export PIXI_LOG_LEVEL=info
-# Use stdbuf to disable buffering and capture ALL output including pixi's own logs
-stdbuf -oL -eL pixi run --verbose {task} 2>&1 | tee "{task_log_file}"
-exit ${{PIPESTATUS[0]}}
-'''
-    
-    script_path = os.path.join(tmp, "run_wrapper.sh")
-    with open(script_path, 'w') as f:
-        f.write(script_content)
-    os.chmod(script_path, 0o755)
-    
+    script_path = await asyncio.to_thread(_write_task_wrapper, tmp, task, "run_wrapper.sh")
+
     # Enhanced process startup with offline mode logging
     if is_offline:
         logger.info("Starting task with offline dependencies", extra={"task_id": tid, "deployment_type": "offline"})
@@ -749,29 +919,8 @@ exit ${{PIPESTATUS[0]}}
             "task_id": tid
         }) + "\n").encode())
     
-    # ENHANCED: Set environment to ensure pixi uses local dependencies if available
-    env = {
-        **os.environ,
-        "PIXI_NO_COLOR": "1"  # Disable colors for cleaner output
-    }
-    
-    # Add explicit cache configuration for offline mode
-    if is_offline:
-        # Point pixi to use the local .pixi folder
-        env["PIXI_CACHE_DIR"] = os.path.join(tmp, ".pixi")
-        env["PIXI_OFFLINE"] = "1"  # Hint to pixi that we're in offline mode
-    
     # FIXED: Run the wrapper script to capture ALL output from the very beginning
-    proc = subprocess.Popen(
-        ["/bin/bash", script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # CRITICAL: Merge stderr into stdout to catch ALL logs
-        stdin=subprocess.PIPE,
-        text=True,
-        bufsize=0,  # Unbuffered to catch output immediately
-        preexec_fn=os.setsid,
-        env=env  # Use enhanced environment
-    )
+    proc = _spawn_task_process(script_path, tmp, is_offline)
 
     if tid:
         running_tasks[tid]["process"] = proc
@@ -783,74 +932,7 @@ exit ${{PIPESTATUS[0]}}
         })
 
     # FIXED: Enhanced output reader that captures ALL output from the very beginning
-    def reader(stream, name):
-        try:
-            # Signal that reader is ready
-            if tid and tid in running_tasks:
-                running_tasks[tid]["reader_ready"].set()
-            
-            for ln in iter(stream.readline, ""):
-                if not ln:  # EOF
-                    break
-                    
-                if tid in running_tasks:
-                    running_tasks[tid]["output_lines"].append((name, ln))
-                    
-                    # IMMEDIATE: Print to console for real-time viewing
-                    deployment_type = "OFFLINE" if running_tasks[tid].get("offline_package") else "ONLINE"
-                    task_logger = running_tasks[tid].get("task_logger")
-                    
-                    if name == "output":
-                        print(f"[{tid[:8] if tid else 'LIVE'}|{deployment_type}] {ln.rstrip()}")
-                        # Log stdout to structured logs (files only)
-                        logger.info("Task stdout", extra={
-                            "task_id": tid,
-                            "deployment_type": deployment_type.lower(),
-                            "output_type": "stdout",
-                            "content": ln.rstrip()
-                        })
-                        # NEW: Also log to task-specific log file
-                        if task_logger:
-                            task_logger.info(f"Task output: {ln.rstrip()}", extra={
-                                "task_id": tid,
-                                "deployment_type": deployment_type.lower(),
-                                "output_type": "stdout",
-                                "content": ln.rstrip(),
-                                "timestamp": time.time()
-                            })
-                    elif name == "stderr":
-                        print(f"[{tid[:8] if tid else 'LIVE'}|{deployment_type}] ERR: {ln.rstrip()}")
-                        # Log stderr to structured logs (files only, but this will show on console due to WARNING level)
-                        logger.warning("Task stderr", extra={
-                            "task_id": tid,
-                            "deployment_type": deployment_type.lower(),
-                            "output_type": "stderr", 
-                            "content": ln.rstrip()
-                        })
-                        # NEW: Also log to task-specific log file
-                        if task_logger:
-                            task_logger.warning(f"Task error: {ln.rstrip()}", extra={
-                                "task_id": tid,
-                                "deployment_type": deployment_type.lower(),
-                                "output_type": "stderr",
-                                "content": ln.rstrip(),
-                                "timestamp": time.time()
-                            })
-
-                    # Check for HTTP proxy responses - TASK-BASED ROUTING
-                    if name == "output" and ln.strip():
-                        try:
-                            data = json.loads(ln.strip())
-                            if data.get("type") == "http_response":
-                                logger.debug("HTTP response detected", extra={"task_id": tid})
-                                print(f"🔄 Detected HTTP response for task {tid}")
-                                http_proxy_manager.set_response_for_task(tid, data)
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-        except Exception as e:
-            logger.error("Output reader error", extra={"task_id": tid, "stream": name, "error": str(e)})
-            if tid:
-                print(f"Reader error for {name}: {e}")
+    reader = _make_reader(tid, lambda: running_tasks.get(tid) if tid else None)
 
     # FIXED: Start reader threads BEFORE we start yielding output
     stdout_thread = threading.Thread(target=reader, args=(proc.stdout, "output"), daemon=True)
@@ -912,7 +994,7 @@ exit ${{PIPESTATUS[0]}}
                         complete_output = f.read()
                     
                     # Log the complete program output to structured logs
-                    logger.info("Complete task output captured", extra={
+                    logger.debug("Complete task output captured", extra={
                         "task_id": tid,
                         "deployment_type": deployment_type,
                         "output_type": "complete_program_output",
@@ -923,7 +1005,7 @@ exit ${{PIPESTATUS[0]}}
                     # Also log to task-specific log file if available
                     task_logger = info.get("task_logger")
                     if task_logger:
-                        task_logger.info("Complete program output", extra={
+                        task_logger.debug("Complete program output", extra={
                             "task_id": tid,
                             "deployment_type": deployment_type,
                             "output_type": "complete_program_output", 
@@ -993,60 +1075,6 @@ async def list_log_files(auth: dict = Depends(verify_logs_access)):
             "log_level": logging.getLevelName(logging_config.log_level)
         }
     })
-
-@app.get("/logs/{filename}")
-async def download_log_file(
-    filename: str, 
-    auth: dict = Depends(verify_logs_access),
-    lines: Optional[int] = Query(None, description="Number of recent lines to return (tail)")
-):
-    """Download a specific log file - requires logs_retrieval:enabled JWT claim"""
-    if not logging_config:
-        return JSONResponse({"error": "Logging not configured"}, status_code=500)
-    
-    # Validate filename to prevent directory traversal
-    if ".." in filename or "/" in filename or "\\" in filename:
-        logger.warning("Invalid log filename requested", extra={
-            "filename": filename,
-            "user_id": auth.get("sub", "unknown") if isinstance(auth, dict) else "system"
-        })
-        return JSONResponse({"error": "Invalid filename"}, status_code=400)
-    
-    file_path = logging_config.log_dir / filename
-    if not file_path.exists():
-        return JSONResponse({"error": "Log file not found"}, status_code=404)
-    
-    logger.info("Log file accessed", extra={
-        "filename": filename,
-        "user_id": auth.get("sub", "unknown") if isinstance(auth, dict) else "system",
-        "lines_requested": lines
-    })
-    
-    if lines:
-        # Return last N lines
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                all_lines = f.readlines()
-                recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-                content = ''.join(recent_lines)
-            
-            return Response(
-                content=content,
-                media_type="application/json",
-                headers={
-                    "Content-Disposition": f"attachment; filename={filename}.tail-{lines}.jsonl"
-                }
-            )
-        except Exception as e:
-            logger.error("Error reading log file", extra={"file_name": filename, "error": str(e)})
-            return JSONResponse({"error": "Failed to read log file"}, status_code=500)
-    else:
-        # Return entire file
-        return FileResponse(
-            file_path,
-            media_type="application/json",
-            filename=filename
-        )
 
 @app.get("/logs/stream")
 async def stream_logs(
@@ -1279,6 +1307,60 @@ async def download_task_log(
                 filename=f"task_{task_id}.log"
             )
 
+@app.get("/logs/{filename}")
+async def download_log_file(
+    filename: str,
+    auth: dict = Depends(verify_logs_access),
+    lines: Optional[int] = Query(None, description="Number of recent lines to return (tail)")
+):
+    """Download a specific log file - requires logs_retrieval:enabled JWT claim"""
+    if not logging_config:
+        return JSONResponse({"error": "Logging not configured"}, status_code=500)
+
+    # Validate filename to prevent directory traversal
+    if ".." in filename or "/" in filename or "\\" in filename:
+        logger.warning("Invalid log filename requested", extra={
+            "filename": filename,
+            "user_id": auth.get("sub", "unknown") if isinstance(auth, dict) else "system"
+        })
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
+
+    file_path = logging_config.log_dir / filename
+    if not file_path.exists():
+        return JSONResponse({"error": "Log file not found"}, status_code=404)
+
+    logger.info("Log file accessed", extra={
+        "filename": filename,
+        "user_id": auth.get("sub", "unknown") if isinstance(auth, dict) else "system",
+        "lines_requested": lines
+    })
+
+    if lines:
+        # Return last N lines
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                all_lines = f.readlines()
+                recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                content = ''.join(recent_lines)
+
+            return Response(
+                content=content,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": f"attachment; filename={filename}.tail-{lines}.jsonl"
+                }
+            )
+        except Exception as e:
+            logger.error("Error reading log file", extra={"file_name": filename, "error": str(e)})
+            return JSONResponse({"error": "Failed to read log file"}, status_code=500)
+    else:
+        # Return entire file
+        return FileResponse(
+            file_path,
+            media_type="application/json",
+            filename=filename
+        )
+
 # ─────────────────────────── Routes (Enhanced with Logging) ────────────────
 
 # Global request tracking
@@ -1320,10 +1402,11 @@ async def upload(
     task_name: str = Form("foobar"),
     keep_alive: str = Form("false"),
 ):
+    _validate_task_name(task_name)
     keep = keep_alive.lower() == "true"
     tid = str(uuid.uuid4()) if keep else None
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".lz4")
-    
+
     logger.info("Package upload started", extra={
         "task_id": tid,
         "task_name": task_name,
@@ -1331,27 +1414,40 @@ async def upload(
         "file_name": file.filename,
         "content_type": file.content_type
     })
-    
+
     try:
-        content = await file.read()
-        temp.write(content)
+        total_bytes = 0
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > max_upload_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Upload exceeds limit of {max_upload_bytes} bytes",
+                )
+            temp.write(chunk)
         temp.close()
-        
+
         logger.info("Package upload completed", extra={
             "task_id": tid,
-            "file_size_bytes": len(content)
+            "file_size_bytes": total_bytes
         })
-        
+
         return StreamingResponse(
             extract_and_run(temp.name, task_name, tid),
             media_type="application/octet-stream" if aes_key else "application/json",
         )
     except Exception as exc:
+        temp.close()
         os.unlink(temp.name)
         logger.error("Package upload failed", extra={
             "task_id": tid,
             "error": str(exc)
         })
+        if isinstance(exc, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(exc))
 
 # ENHANCED: Task status endpoint with deployment type info
@@ -1388,8 +1484,8 @@ async def task_status(tid: str, auth: bool = Depends(verify_authentication)):
             }
     
     if "output_lines" in resp:
-        resp["recent_output"] = [{"type": t, "content": c.rstrip()} 
-                               for t, c in resp.pop("output_lines")[-100:]]
+        resp["recent_output"] = [{"type": t, "content": c.rstrip()}
+                               for t, c in list(resp.pop("output_lines"))[-100:]]
     
     logger.debug("Task status retrieved", extra={"task_id": tid, "status": resp.get("status")})
     return JSONResponse(resp)
@@ -1663,7 +1759,7 @@ async def task_http_proxy(
                 })
                 print(f"❌ HTTP request timeout for task {tid} ({deployment_type}), checking recent output...")
                 # Fallback: manually check recent output for our response
-                recent_lines = info.get("output_lines", [])[-50:]  # Check last 50 lines
+                recent_lines = list(info.get("output_lines", []))[-50:]  # Check last 50 lines
                 for line_type, content in recent_lines:
                     if line_type == "output" and content.strip():
                         try:
@@ -1729,7 +1825,7 @@ async def health_check():
     
     return JSONResponse({
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "uptime_seconds": time.time() - server_start_time,
         "service": "pixi-runner-server",
         "features": [
@@ -1755,9 +1851,9 @@ async def health_check():
 async def get_server_status():
     recent_output = []
     for tid, info in running_tasks.items():
-        output_lines = info.get("output_lines", [])
+        output_lines = list(info.get("output_lines", []))
         deployment_type = "offline" if info.get("offline_package") else "online"
-        
+
         for line_type, content in output_lines[-10:]:
             recent_output.append({
                 "type": "output",
@@ -1766,7 +1862,7 @@ async def get_server_status():
                     "deployment_type": deployment_type,
                     "output_type": line_type,
                     "content": content.strip(),
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": datetime.now(timezone.utc).isoformat()
                 })
             })
 
@@ -1848,10 +1944,10 @@ async def get_task_output_history(tid: str, auth: bool = Depends(verify_authenti
     if not info:
         return JSONResponse({"error": "Task not found"}, status_code=404)
     
-    output_lines = info.get("output_lines", [])
+    output_lines = list(info.get("output_lines", []))
     proc = info.get("process")
     deployment_type = "offline" if info.get("offline_package") else "online"
-    
+
     # Format output for easy reading
     formatted_output = []
     for line_type, content in output_lines:
@@ -1885,7 +1981,7 @@ async def stream_task_output(tid: str, auth: bool = Depends(verify_authenticatio
         deployment_type = "offline" if info.get("offline_package") else "online"
         
         # ➊ ENHANCED backlog – send everything already captured with better logging
-        lines = info.get("output_lines", [])
+        lines = list(info.get("output_lines", []))
         logger.info("Stream connection established", extra={
             "task_id": tid,
             "deployment_type": deployment_type,
@@ -1955,6 +2051,7 @@ async def restart_task(
     info = running_tasks[tid]
     temp_dir = info["temp_dir"]
     task_name = info["task_name"]
+    _validate_task_name(task_name)
     deployment_type = "offline" if info.get("offline_package") else "online"
 
     logger.info("Task restart requested", extra={
@@ -1974,103 +2071,18 @@ async def restart_task(
     mcp_response_manager.cleanup_task(tid)
 
     # start new process with the same fix + offline mode support
-    task_log_file = os.path.join(temp_dir, "task_output.log")
-    script_content = f'''#!/bin/bash
-set -o pipefail
-cd "{temp_dir}"
-# Set environment variables to force unbuffered output from Python programs
-export PYTHONUNBUFFERED=1
-export PYTHONIOENCODING=utf-8
-# Force pixi to be verbose and unbuffered
-export PIXI_LOG_LEVEL=info
-# Use stdbuf to disable buffering and capture ALL output including pixi's own logs
-stdbuf -oL -eL pixi run --verbose {task_name} 2>&1 | tee "{task_log_file}"
-exit ${{PIPESTATUS[0]}}
-'''
-    
-    script_path = os.path.join(temp_dir, "restart_wrapper.sh")
-    with open(script_path, 'w') as f:
-        f.write(script_content)
-    os.chmod(script_path, 0o755)
-    
-    # Enhanced environment setup for restart
-    env = {
-        **os.environ,
-        "PIXI_NO_COLOR": "1"
-    }
-    
-    # Maintain offline mode settings
-    if info.get("offline_package"):
-        env["PIXI_CACHE_DIR"] = os.path.join(temp_dir, ".pixi")
-        env["PIXI_OFFLINE"] = "1"
-    
-    proc = subprocess.Popen(
-        ["/bin/bash", script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # Merge stderr into stdout 
-        stdin=subprocess.PIPE,
-        text=True,
-        bufsize=0,  # FIXED: Unbuffered
-        preexec_fn=os.setsid,
-        env=env  # Use enhanced environment
-    )
-    info.update(
-        {"process": proc, "status": "running", "started_at": time.time(), "output_lines": []}
-    )
+    script_path = await asyncio.to_thread(_write_task_wrapper, temp_dir, task_name, "restart_wrapper.sh")
+
+    proc = _spawn_task_process(script_path, temp_dir, bool(info.get("offline_package")))
+    with running_tasks_lock:
+        info.update(
+            {"process": proc, "status": "running", "started_at": time.time(),
+             "output_lines": deque(maxlen=OUTPUT_LINES_MAX)}
+        )
 
     # async output readers with HTTP proxy support
-    def reader(stream, typ):
-        for ln in iter(stream.readline, ""):
-            info["output_lines"].append((typ, ln))
-            task_logger = info.get("task_logger")
-            
-            # Clean console output like servernew12.py  
-            if typ == "output":
-                print(f"[{tid[:8]}|{deployment_type.upper()}] {ln.rstrip()}")
-                # Log to structured logs (files only)
-                logger.info("Task stdout", extra={
-                    "task_id": tid,
-                    "deployment_type": deployment_type,
-                    "output_type": "stdout",
-                    "content": ln.rstrip()
-                })
-                # NEW: Also log to task-specific log file
-                if task_logger:
-                    task_logger.info(f"Task output: {ln.rstrip()}", extra={
-                        "task_id": tid,
-                        "deployment_type": deployment_type,
-                        "output_type": "stdout",
-                        "content": ln.rstrip(),
-                        "timestamp": time.time()
-                    })
-            elif typ == "stderr":
-                print(f"[{tid[:8]}|{deployment_type.upper()}] ERR: {ln.rstrip()}")
-                # Log stderr to structured logs 
-                logger.warning("Task stderr", extra={
-                    "task_id": tid,
-                    "deployment_type": deployment_type,
-                    "output_type": "stderr",
-                    "content": ln.rstrip()
-                })
-                # NEW: Also log to task-specific log file
-                if task_logger:
-                    task_logger.warning(f"Task error: {ln.rstrip()}", extra={
-                        "task_id": tid,
-                        "deployment_type": deployment_type,
-                        "output_type": "stderr",
-                        "content": ln.rstrip(),
-                        "timestamp": time.time()
-                    })
-
-            # Check for HTTP proxy responses
-            if typ == "output" and ln.strip():
-                try:
-                    data = json.loads(ln.strip())
-                    if data.get("type") == "http_response":
-                        print(f"🔄 [RESTART|{deployment_type.upper()}] Detected HTTP response for task {tid}")
-                        http_proxy_manager.set_response_for_task(tid, data)
-                except (json.JSONDecodeError, KeyError):
-                    pass
+    reader = _make_reader(tid, lambda: running_tasks.get(tid),
+                          proxy_label=f"[RESTART|{deployment_type.upper()}] ")
 
     threading.Thread(target=reader, args=(proc.stdout, "output"), daemon=True).start()
 
@@ -2092,6 +2104,7 @@ async def redeploy_task(
 
     info = running_tasks[tid]
     task_name = info["task_name"]
+    _validate_task_name(task_name)
     old_deployment_type = "offline" if info.get("offline_package") else "online"
 
     logger.info("Task redeploy requested", extra={
@@ -2110,143 +2123,78 @@ async def redeploy_task(
     # Clean up MCP state for this task
     mcp_response_manager.cleanup_task(tid)
 
-    # save uploaded LZ4 package
+    # save uploaded LZ4 package, then decompress for package type detection
     tmp_pkg = tempfile.NamedTemporaryFile(delete=False, suffix=".lz4")
-    tmp_pkg.write(await file.read())
-    tmp_pkg.close()
-
-    # Detect new package type
     temp_tar = tempfile.NamedTemporaryFile(delete=False, suffix=".tar")
     temp_tar.close()
-    
-    with lz4.frame.open(tmp_pkg.name, "rb") as src, open(temp_tar.name, "wb") as dst:
-        dst.write(src.read())
-    
-    new_package_info = _detect_package_type(temp_tar.name)
+    try:
+        try:
+            total_bytes = 0
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > max_upload_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload exceeds limit of {max_upload_bytes} bytes",
+                    )
+                tmp_pkg.write(chunk)
+            tmp_pkg.close()
+
+            await asyncio.to_thread(_decompress_lz4, tmp_pkg.name, temp_tar.name)
+        except Exception:
+            os.unlink(temp_tar.name)
+            raise
+    finally:
+        try:
+            tmp_pkg.close()
+            os.unlink(tmp_pkg.name)
+        except OSError:
+            pass
+
+    new_package_info = await asyncio.to_thread(_detect_package_type, temp_tar.name)
     new_is_offline = new_package_info.get("is_offline", False)
     new_pixi_lock_hash = new_package_info.get("pixi_lock_hash")
     new_deployment_type = "offline" if new_is_offline else "online"
-    
+
     print(f"🔄 Redeploying task {tid}: {old_deployment_type} → {new_deployment_type}")
 
     # new temp dir for code
     new_dir = tempfile.mkdtemp()
     tar_path = os.path.join(new_dir, "pkg.tar")
     shutil.move(temp_tar.name, tar_path)
-    
-    with tarfile.open(tar_path) as tar:
-        tar.extractall(new_dir)
-    os.unlink(tar_path)
-    os.unlink(tmp_pkg.name)
 
-    # update info with new package details
-    info.update({
-        "temp_dir": new_dir, 
-        "output_lines": [],
-        "offline_package": new_is_offline,
-        "pixi_lock_hash": new_pixi_lock_hash
-    })
-    
-    if new_package_info.get("metadata"):
-        info["package_metadata"] = new_package_info["metadata"]
+    await asyncio.to_thread(_extract_tar, tar_path, new_dir)
+    os.unlink(tar_path)
+
+    # update info with new package details, then drop the old work dir
+    old_dir = info.get("temp_dir")
+    with running_tasks_lock:
+        info.update({
+            "temp_dir": new_dir,
+            "output_lines": deque(maxlen=OUTPUT_LINES_MAX),
+            "offline_package": new_is_offline,
+            "pixi_lock_hash": new_pixi_lock_hash
+        })
+
+        if new_package_info.get("metadata"):
+            info["package_metadata"] = new_package_info["metadata"]
+    if old_dir:
+        shutil.rmtree(old_dir, ignore_errors=True)
 
     # start new process with enhanced offline support
-    task_log_file = os.path.join(new_dir, "task_output.log")
-    script_content = f'''#!/bin/bash
-set -o pipefail
-cd "{new_dir}"
-# Set environment variables to force unbuffered output from Python programs
-export PYTHONUNBUFFERED=1
-export PYTHONIOENCODING=utf-8
-# Force pixi to be verbose and unbuffered
-export PIXI_LOG_LEVEL=info
-# Use stdbuf to disable buffering and capture ALL output including pixi's own logs
-stdbuf -oL -eL pixi run --verbose {task_name} 2>&1 | tee "{task_log_file}"
-exit ${{PIPESTATUS[0]}}
-'''
-    
-    script_path = os.path.join(new_dir, "redeploy_wrapper.sh")
-    with open(script_path, 'w') as f:
-        f.write(script_content)
-    os.chmod(script_path, 0o755)
-    
-    # Enhanced environment setup for redeploy
-    env = {
-        **os.environ,
-        "PIXI_NO_COLOR": "1"
-    }
-    
-    # Configure for offline mode if needed
-    if new_is_offline:
-        env["PIXI_CACHE_DIR"] = os.path.join(new_dir, ".pixi")
-        env["PIXI_OFFLINE"] = "1"
-    
-    proc = subprocess.Popen(
-        ["/bin/bash", script_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # Merge stderr into stdout
-        stdin=subprocess.PIPE,
-        text=True,
-        bufsize=0,  # FIXED: Unbuffered
-        preexec_fn=os.setsid,
-        env=env  # Use enhanced environment
-    )
-    info.update(
-        {"process": proc, "status": "running", "started_at": time.time()}
-    )
+    script_path = await asyncio.to_thread(_write_task_wrapper, new_dir, task_name, "redeploy_wrapper.sh")
 
-    def reader(stream, typ):
-        for ln in iter(stream.readline, ""):
-            info["output_lines"].append((typ, ln))
-            task_logger = info.get("task_logger")
-            
-            # Clean console output like servernew12.py
-            if typ == "output":
-                print(f"[{tid[:8]}|{new_deployment_type.upper()}] {ln.rstrip()}")
-                # Log to structured logs (files only)
-                logger.info("Task stdout", extra={
-                    "task_id": tid,
-                    "deployment_type": new_deployment_type,
-                    "output_type": "stdout", 
-                    "content": ln.rstrip()
-                })
-                # NEW: Also log to task-specific log file
-                if task_logger:
-                    task_logger.info(f"Task output: {ln.rstrip()}", extra={
-                        "task_id": tid,
-                        "deployment_type": new_deployment_type,
-                        "output_type": "stdout",
-                        "content": ln.rstrip(),
-                        "timestamp": time.time()
-                    })
-            elif typ == "stderr":
-                print(f"[{tid[:8]}|{new_deployment_type.upper()}] ERR: {ln.rstrip()}")
-                # Log stderr to structured logs
-                logger.warning("Task stderr", extra={
-                    "task_id": tid,
-                    "deployment_type": new_deployment_type,
-                    "output_type": "stderr",
-                    "content": ln.rstrip()
-                })
-                # NEW: Also log to task-specific log file
-                if task_logger:
-                    task_logger.warning(f"Task error: {ln.rstrip()}", extra={
-                        "task_id": tid,
-                        "deployment_type": new_deployment_type,
-                        "output_type": "stderr",
-                        "content": ln.rstrip(),
-                        "timestamp": time.time()
-                    })
+    proc = _spawn_task_process(script_path, new_dir, new_is_offline)
+    with running_tasks_lock:
+        info.update(
+            {"process": proc, "status": "running", "started_at": time.time()}
+        )
 
-            # Check for HTTP proxy responses
-            if typ == "output" and ln.strip():
-                try:
-                    data = json.loads(ln.strip())
-                    if data.get("type") == "http_response":
-                        print(f"🔄 [REDEPLOY|{new_deployment_type.upper()}] Detected HTTP response for task {tid}")
-                        http_proxy_manager.set_response_for_task(tid, data)
-                except (json.JSONDecodeError, KeyError):
-                    pass
+    reader = _make_reader(tid, lambda: running_tasks.get(tid),
+                          proxy_label=f"[REDEPLOY|{new_deployment_type.upper()}] ")
 
     threading.Thread(target=reader, args=(proc.stdout, "output"), daemon=True).start()
 
@@ -2279,25 +2227,26 @@ async def handshake_step1(body: HandshakeReq,
         401 if secret mismatch
         200 { "public_key": "<PEM>" }
     """
-    global secret_uses_remaining
-    # limit check
-    if secret_uses_remaining is not None:
-       if secret_uses_remaining <= 0:
-          return JSONResponse({"error": "Secret usage limit reached"}, status_code=403)
-       else:
-          # consume one use
-          secret_uses_remaining -= 1
+    global secret_uses_remaining, ephemeral_privkey, aes_key
 
     if handshake_secret is None:
         return JSONResponse({"error": "Handshake not configured"}, status_code=400)
 
-    if body.secret != handshake_secret:
+    # limit check
+    if secret_uses_remaining is not None and secret_uses_remaining <= 0:
+        return JSONResponse({"error": "Secret usage limit reached"}, status_code=403)
+
+    if not hmac.compare_digest(body.secret.encode(), handshake_secret.encode()):
         return JSONResponse({"error": "Bad secret"}, status_code=401)
 
+    # consume one use only after the secret was validated
+    if secret_uses_remaining is not None:
+        secret_uses_remaining -= 1
+
     if body.rotate:
+        aes_key = None                 # clear live key
         auth_settings.aes_key = None   # clear existing key
     # generate fresh RSA keypair
-    global ephemeral_privkey
     ephemeral_privkey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     pub_pem = ephemeral_privkey.public_key().public_bytes(
         serialization.Encoding.PEM,
@@ -2321,7 +2270,13 @@ async def handshake_step2(req: Dict[str, str],
     from cryptography.hazmat.primitives.asymmetric import padding
     from cryptography.hazmat.primitives import hashes
 
-    ct = base64.b64decode(req["cipher"])
+    cipher_b64 = req.get("cipher")
+    if not cipher_b64:
+        return JSONResponse({"error": "Missing 'cipher' field"}, status_code=400)
+    try:
+        ct = base64.b64decode(cipher_b64)
+    except Exception:
+        return JSONResponse({"error": "Invalid base64 in 'cipher' field"}, status_code=400)
     try:
         plain = ephemeral_privkey.decrypt(
             ct,
@@ -2329,6 +2284,8 @@ async def handshake_step2(req: Dict[str, str],
         )
     except Exception as exc:
         return JSONResponse({"error": f"Decrypt failed: {exc}"}, status_code=400)
+    if len(plain) < 64:
+        return JSONResponse({"error": "Cipher payload too short: expected 64 bytes"}, status_code=400)
     global aes_key
     aes_key = plain[:32]
     rotation_secret = plain[32:64]
@@ -2388,16 +2345,24 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Start LZ4 Pixi Runner with HTTP Proxy, MCP Support + Offline Deployment + JSON Logging")
     p.add_argument("--public-key")
     p.add_argument("--jwks-url")
+    p.add_argument("--host", default="127.0.0.1",
+                    help="Interface to bind (default: 127.0.0.1). Binding a non-loopback "
+                         "host with JWT auth disabled requires --insecure")
     p.add_argument("--port", type=int, default=9000)
-    p.add_argument("--aes-key")
+    p.add_argument("--insecure", action="store_true",
+                    help="Allow binding a non-loopback host while JWT auth is disabled")
+    p.add_argument("--aes-key",
+                    help="Path to base64 AES-256 key file (falls back to RIXI_AES_KEY env var)")
     p.add_argument("--gen-aes", action="store_true")
-    p.add_argument("--no-reload", action="store_true")
     p.add_argument("--key-secret-uses", type=int, default=1,
                     help="How many times the secret can start a handshake "
                          "(1 = default, 0 = unlimited)")
     p.add_argument("--key-secret",
-                    help="Pre-shared secret used for first AES key handshake")
-    
+                    help="Pre-shared secret used for first AES key handshake "
+                         "(falls back to RIXI_KEY_SECRET env var)")
+    p.add_argument("--max-upload-mb", type=int, default=2048,
+                    help="Maximum upload size in MB (default: 2048)")
+
     # NEW: Logging configuration arguments
     p.add_argument("--log-level", default="INFO", 
                     choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -2417,18 +2382,36 @@ if __name__ == "__main__":
     # Initialize logging FIRST
     setup_logging(args.log_level, args.log_dir, args.log_size_mb, args.log_backup_count)
 
-    if args.aes_key:
-        aes_key = base64.b64decode(pathlib.Path(args.aes_key).read_text().strip())
+    max_upload_bytes = args.max_upload_mb * 1024 * 1024
+
+    aes_key_path = args.aes_key or os.environ.get("RIXI_AES_KEY")
+    if aes_key_path:
+        aes_key = base64.b64decode(pathlib.Path(aes_key_path).read_text().strip())
         logger.info("AES key loaded from file")
         print("AES key loaded")
 
     setup_auth(args.public_key, args.jwks_url)
-    setup_handshake(args.key_secret, args.key_secret_uses)
+    key_secret = args.key_secret or os.environ.get("RIXI_KEY_SECRET")
+    setup_handshake(key_secret, args.key_secret_uses)
+
+    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+    if args.host not in loopback_hosts and not auth_settings.enabled:
+        if args.insecure:
+            logger.warning("Binding non-loopback host with authentication disabled", extra={"host": args.host})
+            print("="*70)
+            print(f"⚠️  WARNING: binding {args.host} with JWT auth DISABLED (--insecure).")
+            print("⚠️  Anyone who can reach this port can execute arbitrary code.")
+            print("="*70)
+        else:
+            logger.error("Refusing to bind non-loopback host without authentication", extra={"host": args.host})
+            print(f"ERROR: refusing to bind {args.host} while JWT auth is disabled.")
+            print("Enable auth (--public-key / --jwks-url) or pass --insecure to proceed anyway.")
+            raise SystemExit(1)
 
     print("="*70)
     print("🚀 Enhanced Pixi Runner Server with MCP + Offline Deployment + JSON Logging")
     print("="*70)
-    print(f"📡 Server: 0.0.0.0:{args.port}")
+    print(f"📡 Server: {args.host}:{args.port}")
     print(f"🔒 JWT Auth: {'Enabled' if auth_settings.enabled else 'Disabled'}")
     print(f"🛡️  AES Encryption: {'Enabled' if aes_key else 'Disabled'}")
     print(f"🌐 HTTP Proxy: Enabled")
@@ -2462,6 +2445,7 @@ if __name__ == "__main__":
     print("="*70)
 
     logger.info("Server startup initiated", extra={
+        "host": args.host,
         "port": args.port,
         "log_level": args.log_level,
         "auth_enabled": auth_settings.enabled,
@@ -2470,6 +2454,5 @@ if __name__ == "__main__":
 
     # Always serve the fully-configured module-level `app` (all routes/auth attach to it).
     # Hot-reload is intentionally not used: it needs an import-string app with per-worker
-    # setup, which this single-module server doesn't provide. `--no-reload` is kept as an
-    # accepted no-op for backward compatibility.
-    uvicorn.run(app, host="0.0.0.0", port=args.port, reload=False)
+    # setup, which this single-module server doesn't provide.
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)

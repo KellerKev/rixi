@@ -224,7 +224,7 @@ class GenericAgentRunner:
         
         if agent_type == "haiku":
             # Import only when needed for fallback
-            from agents.haiku_agent import HaikuAgent
+            from ai_agent_framework import HaikuAgent
             
             topic = context.get("topic", "nature")
             output_file = context.get("output_file", "output.txt")

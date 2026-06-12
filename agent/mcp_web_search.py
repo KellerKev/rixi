@@ -6,7 +6,7 @@ import asyncio
 import time
 from typing import Dict, Any, List
 import requests
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 
 class WebSearchMCPServer:
     """Real web search MCP server implementation"""
@@ -54,7 +54,7 @@ class WebSearchMCPServer:
                     "search_method": "real_web_search"
                 }
             else:
-                # Fallback to simulated if all real methods fail
+                # No backend produced results - report an honest failure
                 return await self._fallback_simulated_search(query)
                 
         except Exception as e:
@@ -65,7 +65,8 @@ class WebSearchMCPServer:
         """Search using DuckDuckGo (no API key required)"""
         try:
             # Simple approach using DuckDuckGo instant answers
-            url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1"
+            params = urlencode({"q": query, "format": "json", "no_html": 1, "skip_disambig": 1})
+            url = f"https://api.duckduckgo.com/?{params}"
             response = requests.get(url, timeout=10)
             
             if response.status_code == 200:
@@ -162,36 +163,10 @@ class WebSearchMCPServer:
             return []
     
     async def _bing_search(self, query: str, num_results: int) -> List[Dict[str, Any]]:
-        """Search using Bing API (requires API key)"""
-        try:
-            # Simple web scraping approach (be respectful of rate limits)
-            import urllib.parse
-            
-            encoded_query = urllib.parse.quote_plus(query)
-            url = f"https://www.bing.com/search?q={encoded_query}"
-            
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-            
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                # Simple text extraction (in production, use BeautifulSoup)
-                content = response.text
-                
-                # This is a very basic extraction - in production you'd parse HTML properly
-                results = [{
-                    "title": f"Bing search results for: {query}",
-                    "snippet": f"Found search results for {query}. For better results, configure proper search API.",
-                    "url": url,
-                    "source": "Bing"
-                }]
-                
-                return results
-        except Exception as e:
-            print(f"Bing search failed: {e}")
-            return []
+        """Search using Bing (requires a real API key; no scraping fallback)"""
+        # Without a Bing API key there is no way to return real results,
+        # so report none rather than fabricating them.
+        return []
     
     def _create_search_summary(self, results: List[Dict[str, Any]], query: str) -> str:
         """Create a summary of search results"""
@@ -207,20 +182,13 @@ class WebSearchMCPServer:
         return f"Search for '{query}' found {len(results)} results. " + " ".join(summaries)
     
     async def _fallback_simulated_search(self, query: str) -> Dict[str, Any]:
-        """Fallback to simulated search when real search fails"""
+        """Honest failure when no real search backend is available"""
         return {
-            "success": True,
+            "success": False,
             "query": query,
-            "results": [
-                {
-                    "title": f"Simulated result for: {query}",
-                    "snippet": f"This is simulated search data for '{query}'. Real search services are not available.",
-                    "url": f"https://example.com/search?q={query}",
-                    "source": "Simulation"
-                }
-            ],
-            "summary": f"Simulated search results for '{query}'. Configure real search APIs for actual web research.",
-            "search_method": "simulated_fallback"
+            "results": [],
+            "error": "no search backend configured/available",
+            "search_method": "none"
         }
     
     async def search_documents(self, query: str, doc_type: str = "pdf") -> Dict[str, Any]:

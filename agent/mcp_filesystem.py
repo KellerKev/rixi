@@ -8,7 +8,9 @@ import asyncio
 
 class FilesystemMCPServer:
     """Real filesystem MCP server implementation"""
-    
+
+    MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MB
+
     def __init__(self, root_path: str = "."):
         self.root_path = pathlib.Path(root_path).resolve()
         self.ensure_safe_path(self.root_path)
@@ -33,7 +35,14 @@ class FilesystemMCPServer:
             
             if not safe_path.is_file():
                 return {"error": f"Not a file: {path}", "success": False}
-            
+
+            file_size = safe_path.stat().st_size
+            if file_size > self.MAX_READ_BYTES:
+                return {
+                    "error": f"File too large: {path} is {file_size} bytes (limit {self.MAX_READ_BYTES} bytes)",
+                    "success": False
+                }
+
             content = safe_path.read_text(encoding=encoding)
             return {
                 "success": True,

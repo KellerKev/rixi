@@ -36,12 +36,13 @@ import socket
 import urllib.parse
 import re
 import hashlib
+from collections import OrderedDict
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
 
 # Cryptography imports
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # Optional aiohttp import for external MCP servers
@@ -59,6 +60,25 @@ current_task_id: Optional[str] = None
 server_url: str = "http://localhost:9000"
 aes_key: Optional[bytes] = None
 _auth_headers: Dict[str, str] = {}
+
+# HTTP defaults: (connect timeout, read timeout); streaming reads may block indefinitely
+CONNECT_TIMEOUT = 10
+DEFAULT_TIMEOUT = (CONNECT_TIMEOUT, 30)
+STREAM_TIMEOUT = (CONNECT_TIMEOUT, None)
+
+_http_session = requests.Session()
+
+
+def _http(method: str, url: str, *, timeout=DEFAULT_TIMEOUT, **kwargs):
+    """Issue an HTTP request through the shared session with a default timeout."""
+    return _http_session.request(method, url, timeout=timeout, **kwargs)
+
+
+def _write_secret_file(path: str, data: str):
+    """Write a secret file with owner-only permissions (0600)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
 
 
 def load_pixi_config() -> Dict[str, Any]:
@@ -113,11 +133,12 @@ def _is_valid_url(url: str) -> bool:
         return False
 
 
-def _extract_server_from_token(token: str) -> Optional[str]:
+def _extract_server_from_token(token: str) -> Optional[tuple]:
     """Best-effort extraction of server URL from a JWT without verification.
 
     Checks common claim keys in order: server_url, server-url, aud, iss.
-    For 'aud', supports string or list. Returns the first valid http(s) URL found.
+    For 'aud', supports string or list. Returns (url, claim) for the first
+    valid http(s) URL found, or None.
     """
     if not token:
         return None
@@ -146,18 +167,20 @@ def _extract_server_from_token(token: str) -> Optional[str]:
         if isinstance(val, list):
             for item in val:
                 if isinstance(item, str) and _is_valid_url(item):
-                    return item
+                    return item, key
         elif isinstance(val, str):
             if _is_valid_url(val):
-                return val
+                return val, key
     return None
 
 
-def _resolve_server_url(cli_server: Optional[str], cfg: Dict[str, Any], cli_bearer: Optional[str]) -> (str, str):
+def _resolve_server_url(cli_server: Optional[str], cfg: Dict[str, Any], cli_bearer: Optional[str],
+                        allow_token_url: bool = False) -> (str, str):
     """Resolve server URL with precedence: CLI > env > config > token > default.
 
     Returns (url, source) where source is one of: 'CLI', 'env', 'config', 'token', 'default'.
-    The 'token' source inspects the bearer JWT's claims for an embedded server URL.
+    The 'token' source inspects the bearer JWT's claims for an embedded server URL and is
+    only consulted when explicitly enabled via --server-from-token (allow_token_url=True).
     """
     # 1) CLI argument (explicit)
     if cli_server and cli_server.strip():
@@ -173,17 +196,24 @@ def _resolve_server_url(cli_server: Optional[str], cfg: Dict[str, Any], cli_bear
     if isinstance(cfg_url, str) and cfg_url.strip():
         return cfg_url.strip(), "config"
 
-    # 4) Bearer JWT claim (from CLI, env or config)
-    token = (
-        (cli_bearer or "").strip()
-        or os.getenv("BEARER_TOKEN", "").strip()
-        or os.getenv("PIXI_BEARER_TOKEN", "").strip()
-        or os.getenv("AUTH_TOKEN", "").strip()
-        or (cfg.get("bearer_token") or cfg.get("bearer-token") or "").strip()
-    )
-    token_url = _extract_server_from_token(token)
-    if token_url:
-        return token_url, "token"
+    # 4) Bearer JWT claim (from CLI, env or config) - opt-in only
+    if allow_token_url:
+        token = (
+            (cli_bearer or "").strip()
+            or os.getenv("BEARER_TOKEN", "").strip()
+            or os.getenv("PIXI_BEARER_TOKEN", "").strip()
+            or os.getenv("AUTH_TOKEN", "").strip()
+            or (cfg.get("bearer_token") or cfg.get("bearer-token") or "").strip()
+        )
+        token_result = _extract_server_from_token(token)
+        if token_result:
+            token_url, claim = token_result
+            print("=" * 70)
+            print(f"⚠️ SERVER URL DERIVED FROM BEARER TOKEN (--server-from-token)")
+            print(f"   URL:   {token_url}")
+            print(f"   Claim: '{claim}' (token signature NOT verified)")
+            print("=" * 70)
+            return token_url, f"token claim '{claim}'"
 
     # 5) Fallback default
     return "http://localhost:9000", "default"
@@ -196,7 +226,7 @@ def _quick_check_server_online(url: str, timeout: float = 1.5) -> (bool, str):
     try:
         parts = urllib.parse.urlparse(url)
         if parts.scheme not in ("http", "https"):
-            return False, f"unsupported scheme: {parts.scheme or none}"
+            return False, f"unsupported scheme: {parts.scheme or 'none'}"
         host = parts.hostname
         port = parts.port
         if not host:
@@ -238,19 +268,22 @@ def _package_dir(path=".", env_handler=None, env_profile=None, offline_mode=Fals
         "pixi_size": 0
     }
     
-    # FIXED: Create environment files BEFORE packaging if handler provided
+    # FIXED: Create environment files in a temp dir BEFORE packaging if handler provided
+    env_injection_enabled = bool(env_handler and env_handler.is_enabled())
     env_files_created = []
-    if env_handler and env_handler.is_enabled():
+    env_tmp_dir = None
+    if env_injection_enabled:
         try:
             env_vars = env_handler.get_environment_variables(env_profile)  # FIXED: Pass profile
             if env_vars:
                 profile_info = f" (profile: {env_profile})" if env_profile else ""
-                created_files = env_handler.create_env_files_for_packaging(env_vars, env_profile)
+                env_tmp_dir = tempfile.TemporaryDirectory()
+                created_files = env_handler.create_env_files_for_packaging(env_vars, env_profile, env_tmp_dir.name)
                 env_files_created = list(created_files.keys())
                 print(f"🌍 Including {len(env_files_created)} environment files in package{profile_info}")
         except Exception as e:
             print(f"⚠️ Error creating environment files: {e}")
-    
+
     try:
         with tarfile.open(tar_tmp.name, "w") as tar:
             for root, dirs, files in os.walk(path):
@@ -261,15 +294,18 @@ def _package_dir(path=".", env_handler=None, env_profile=None, offline_mode=Fals
                 else:
                     # Original behavior - exclude all hidden dirs and __pycache__
                     dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
-                
+
                 for f in files:
                     # Enhanced file filtering logic
                     should_include = False
                     is_pixi_file = False
-                    
-                    # Always include environment files
+                    fp = os.path.join(root, f)
+                    arcname = os.path.relpath(fp, path)
+
+                    # Include environment files only when env injection is enabled
+                    # (generated files are added separately from the temp dir)
                     if f in [".env", ".env_injection.sh", ".env_vars.json"]:
-                        should_include = True
+                        should_include = env_injection_enabled and arcname not in env_files_created
                     # Include regular project files (not hidden, not compiled)
                     elif not f.startswith(".") and not f.endswith(".pyc") and not f.endswith("~"):
                         should_include = True
@@ -277,25 +313,33 @@ def _package_dir(path=".", env_handler=None, env_profile=None, offline_mode=Fals
                     elif offline_mode and ".pixi" in root:
                         should_include = True
                         is_pixi_file = True
-                    
+
                     if should_include:
-                        fp = os.path.join(root, f)
-                        arcname = os.path.relpath(fp, path)
-                        
                         # Get file size for stats
                         try:
                             file_size = os.path.getsize(fp)
                             package_stats["total_size"] += file_size
-                            
+
                             if is_pixi_file:
                                 package_stats["dependency_files"] += 1
                                 package_stats["pixi_size"] += file_size
                             else:
                                 package_stats["code_files"] += 1
-                            
+
                             tar.add(fp, arcname)
                         except OSError as e:
                             print(f"⚠️ Warning: Could not add {fp}: {e}")
+
+            # Add generated environment files from the temp dir with explicit arcnames
+            if env_tmp_dir is not None:
+                for arcname in env_files_created:
+                    fp = os.path.join(env_tmp_dir.name, arcname)
+                    try:
+                        package_stats["total_size"] += os.path.getsize(fp)
+                        package_stats["code_files"] += 1
+                        tar.add(fp, arcname)
+                    except OSError as e:
+                        print(f"⚠️ Warning: Could not add {fp}: {e}")
 
         # Add offline package metadata
         if offline_mode:
@@ -322,12 +366,9 @@ def _package_dir(path=".", env_handler=None, env_profile=None, offline_mode=Fals
             return tar_tmp.name
             
     finally:
-        # Clean up temporary environment files
-        for env_file in env_files_created:
-            try:
-                os.unlink(env_file)
-            except OSError:
-                pass
+        # Clean up temporary environment file directory
+        if env_tmp_dir is not None:
+            env_tmp_dir.cleanup()
 
 
 def _validate_offline_prerequisites(path: str, auto_approve: bool = False) -> bool:
@@ -475,7 +516,7 @@ def _dec(chunk: bytes) -> str:
 # JSON processing (matching original)
 _decoder = json.JSONDecoder()
 
-def _push_buffer(text: str):
+def _push_buffer(text: str, on_obj=None):
     """Pull one JSON object from the beginning of text and handle it"""
     text = text.lstrip()
     if not text:
@@ -484,7 +525,7 @@ def _push_buffer(text: str):
         obj, idx = _decoder.raw_decode(text)
     except json.JSONDecodeError:
         return text            # need more bytes
-    _handle_obj(obj)
+    (on_obj or _handle_obj)(obj)
     return text[idx:]          # remainder
 
 
@@ -500,7 +541,7 @@ def _handle_obj(obj: dict):
     if "error"  in obj:  print("Error:", obj["error"])
 
 
-def _consume_stream(resp):
+def _consume_stream(resp, on_obj=None):
     """Consume streaming response with frame decryption (matching original)"""
     buf = b""
     need = None
@@ -527,39 +568,29 @@ def _consume_stream(resp):
             # push through JSON peeler
             plain_buf = plain
             while plain_buf:
-                plain_buf = _push_buffer(plain_buf)
+                plain_buf = _push_buffer(plain_buf, on_obj)
 
 
-def _upload_and_run(pkg, task, headers, env_handler=None):
+def _upload_and_run(pkg, task, headers, env_handler=None, on_obj=None):
     """FIXED: Upload package and run task with environment support"""
-    with open(pkg, "rb") as fh:
-        files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
-        data  = {"task_name": task, "keep_alive": "true"}
-        with requests.post(f"{server_url}/upload", files=files, data=data, headers=headers, stream=True) as r:
-            if r.status_code != 200: 
-                print("Error:", r.status_code, r.text)
-                return
-            _consume_stream(r)
-    os.unlink(pkg)
+    try:
+        with open(pkg, "rb") as fh:
+            files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
+            data  = {"task_name": task, "keep_alive": "true"}
+            with _http("POST", f"{server_url}/upload", files=files, data=data, headers=headers,
+                       stream=True, timeout=STREAM_TIMEOUT) as r:
+                if r.status_code != 200:
+                    print("Error:", r.status_code, r.text)
+                    return
+                _consume_stream(r, on_obj)
+    finally:
+        os.unlink(pkg)
 
 
-def _attach(tid: str, headers):
-    """Attach to running task - print backlog then live-stream (matching original)"""
-    # 1️⃣ backlog
-    r = requests.get(f"{server_url}/task/{tid}", headers=headers)
-    if r.status_code == 200:
-        info = r.json()
-        for item in info.get("recent_output", []):
-            if item["type"] == "output":
-                print(item["content"], end="")
-            elif item["type"] == "stderr":
-                print(item["content"], end="")
-            elif item["type"] == "error":
-                print("Error:", item["content"])
-
-    # 2️⃣ live follow
-    with requests.get(
-        f"{server_url}/task/{tid}/stream", headers=headers, stream=True
+def _attach_stream_only(tid: str, headers):
+    """Attach to running task - live stream only (no duplicate recent_output)"""
+    with _http(
+        "GET", f"{server_url}/task/{tid}/stream", headers=headers, stream=True, timeout=STREAM_TIMEOUT
     ) as resp:
         if resp.status_code != 200:
             print("Error:", resp.status_code, resp.text)
@@ -567,10 +598,15 @@ def _attach(tid: str, headers):
         _consume_stream(resp)
 
 
+def _attach(tid: str, headers):
+    """Attach to running task - stream only to avoid duplicated backlog output"""
+    _attach_stream_only(tid, headers)
+
+
 def _attach_history(tid: str, headers):
-    """Attach with full history (matching original)"""
+    """Attach with full history - print backlog once, then live-stream"""
     # ➊ backlog
-    r = requests.get(f"{server_url}/task/{tid}", headers=headers)
+    r = _http("GET", f"{server_url}/task/{tid}", headers=headers)
     if r.status_code == 200:
         info = r.json()
         for entry in info.get("recent_output", []):
@@ -582,13 +618,13 @@ def _attach_history(tid: str, headers):
                 print("Status:", entry["content"])
 
     # ➋ live follow
-    _attach(tid, headers)
+    _attach_stream_only(tid, headers)
 
 
 def perform_handshake(secret: str, rotate: bool):
     """Perform handshake to get AES key (matching original)"""
     data = {"secret": secret, "rotate": rotate}
-    r = requests.post(f"{server_url}/handshake", json=data, headers=_auth_headers)
+    r = _http("POST", f"{server_url}/handshake", json=data, headers=_auth_headers)
     if r.status_code != 200:
         # Better error handling for handshake limits
         if r.status_code == 403:
@@ -615,38 +651,17 @@ def perform_handshake(secret: str, rotate: bool):
         )
     ).decode()
 
-    r2 = requests.post(f"{server_url}/handshake/finish", json={"cipher": cipher},
-                       headers=_auth_headers)
+    r2 = _http("POST", f"{server_url}/handshake/finish", json={"cipher": cipher},
+               headers=_auth_headers)
     if r2.status_code != 200:
         print("Handshake step-2 failed:", r2.text)
         sys.exit(1)
 
-    # persist to local file
-    Path("aes.key").write_text(base64.b64encode(new_aes).decode())
-    Path("rotation.secret").write_text(base64.b64encode(new_rot).decode())
+    # persist to local file (owner-only permissions)
+    _write_secret_file("aes.key", base64.b64encode(new_aes).decode())
+    _write_secret_file("rotation.secret", base64.b64encode(new_rot).decode())
     print("Handshake successful – AES key saved (base64)")
     return new_aes, new_rot
-
-
-def create_auth_headers(config: Dict[str, Any], cli_bearer_token: Optional[str] = None) -> Dict[str, str]:
-    """Create authentication headers from config"""
-    headers = {}
-    
-    # CLI arguments take precedence
-    if cli_bearer_token:
-        headers["Authorization"] = f"Bearer {cli_bearer_token}"
-        return headers
-    
-    # Check config for various auth methods
-    if config.get("bearer-token") or config.get("bearer_token"):
-        token = config.get("bearer-token") or config.get("bearer_token")
-        headers["Authorization"] = f"Bearer {token}"
-    
-    if config.get("snowflake-token") or config.get("snowflake_token"):
-        token = config.get("snowflake-token") or config.get("snowflake_token")
-        headers["snowflake-auth"] = token
-    
-    return headers
 
 
 def get_auto_approve_setting(cli_auto_approve: bool, config: Dict[str, Any]) -> bool:
@@ -692,7 +707,7 @@ def _signal_handler(sig, frame):
 
     hdr = _auth_headers
     if choice == "1":
-        requests.delete(f"{server_url}/task/{current_task_id}", headers=hdr)
+        _http("DELETE", f"{server_url}/task/{current_task_id}", headers=hdr)
         print("Task terminated.")
         sys.exit(0)
 
@@ -701,20 +716,23 @@ def _signal_handler(sig, frame):
         sys.exit(0)
 
     if choice == "3":
-        requests.post(f"{server_url}/task/{current_task_id}/restart", headers=hdr)
+        _http("POST", f"{server_url}/task/{current_task_id}/restart", headers=hdr)
         print("Task restarted.")
         sys.exit(0)
 
     if choice == "4":
         pkg = _package_dir()
-        with open(pkg, "rb") as fh:
-            files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
-            requests.post(f"{server_url}/task/{current_task_id}/redeploy", headers=hdr, files=files)
+        try:
+            with open(pkg, "rb") as fh:
+                files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
+                _http("POST", f"{server_url}/task/{current_task_id}/redeploy", headers=hdr, files=files)
+        finally:
+            os.unlink(pkg)
         print("Task redeployed.")
         sys.exit(0)
 
     if choice == "6":
-        requests.post(f"{server_url}/task/{current_task_id}/restart", headers=hdr)
+        _http("POST", f"{server_url}/task/{current_task_id}/restart", headers=hdr)
         print("Task restarting...")
         _attach(current_task_id, _auth_headers)
         return
@@ -803,16 +821,14 @@ class EnvironmentHandler:
     
     def _evaluate_condition_path(self, condition_path: str) -> bool:
         """Evaluate a condition path like 'mcp.filesystem.enabled'"""
-        parts = condition_path.split(".")
-        
         # Navigate through config to find the value
         current = self.config
-        for part in parts:
+        for part in condition_path.split("."):
             if isinstance(current, dict) and part in current:
                 current = current[part]
             else:
                 return False
-        
+
         # Convert to boolean
         if isinstance(current, bool):
             return current
@@ -820,30 +836,13 @@ class EnvironmentHandler:
             return current.lower() in ["true", "yes", "1", "enabled"]
         else:
             return bool(current)
-    
+
     def _evaluate_condition(self, condition: str) -> bool:
         """Evaluate a condition string like '${proxy.enabled}' or '${mcp.filesystem.enabled}'"""
         if not condition.startswith("${") or not condition.endswith("}"):
             return False
-            
-        path = condition[2:-1]  # Remove ${ and }
-        parts = path.split(".")
-        
-        # Navigate through config to find the value
-        current = self.config
-        for part in parts:
-            if isinstance(current, dict) and part in current:
-                current = current[part]
-            else:
-                return False
-        
-        # Convert to boolean
-        if isinstance(current, bool):
-            return current
-        elif isinstance(current, str):
-            return current.lower() in ["true", "yes", "1", "enabled"]
-        else:
-            return bool(current)
+
+        return self._evaluate_condition_path(condition[2:-1])  # Remove ${ and }
     
     def _resolve_placeholders(self, env_vars: Dict[str, str]) -> Dict[str, str]:
         """Resolve placeholder variables like ${REMOTE_TASK_ID}"""
@@ -926,11 +925,15 @@ class EnvironmentHandler:
             print(f"⚠️ Unknown secret type: {secret_type}")
             return placeholder
     
-    def create_env_files_for_packaging(self, env_vars: Dict[str, str], profile: Optional[str] = None) -> Dict[str, str]:
-        """FIXED: Create environment files that get packaged with the code"""
+    def create_env_files_for_packaging(self, env_vars: Dict[str, str], profile: Optional[str] = None,
+                                       target_dir: Optional[str] = None) -> Dict[str, str]:
+        """FIXED: Create environment files in target_dir that get packaged with the code"""
         if not env_vars:
             return {}
-            
+
+        if target_dir is None:
+            target_dir = tempfile.mkdtemp(prefix="env_files_")
+
         files_created = {}
         
         # 1. Create executable shell script for sourcing
@@ -957,14 +960,14 @@ class EnvironmentHandler:
                 env_script_lines.append(f'export {key}="{escaped_value}"')
         
         env_script_content = "\n".join(env_script_lines)
-        
-        # Write to local file for packaging
-        env_script_path = ".env_injection.sh"
+
+        # Write to temp dir for packaging (arcname: .env_injection.sh)
+        env_script_path = os.path.join(target_dir, ".env_injection.sh")
         with open(env_script_path, "w") as f:
             f.write(env_script_content)
         os.chmod(env_script_path, 0o755)  # Make executable
-        
-        files_created[env_script_path] = env_script_content
+
+        files_created[".env_injection.sh"] = env_script_content
         
         # 2. Create .env file for applications that expect it
         env_file_lines = [
@@ -991,12 +994,12 @@ class EnvironmentHandler:
             env_file_lines.append("# The actual server-assigned task ID differs and can be found in container environment")
         
         env_file_content = "\n".join(env_file_lines)
-        env_file_path = ".env"
-        
+        env_file_path = os.path.join(target_dir, ".env")
+
         with open(env_file_path, "w") as f:
             f.write(env_file_content)
-        
-        files_created[env_file_path] = env_file_content
+
+        files_created[".env"] = env_file_content
         
         # 3. Create JSON file for programmatic access
         env_json = {
@@ -1017,11 +1020,11 @@ class EnvironmentHandler:
             }
         }
         
-        env_json_path = ".env_vars.json"
+        env_json_path = os.path.join(target_dir, ".env_vars.json")
         with open(env_json_path, "w") as f:
             json.dump(env_json, f, indent=2)
-        
-        files_created[env_json_path] = json.dumps(env_json, indent=2)
+
+        files_created[".env_vars.json"] = json.dumps(env_json, indent=2)
         
         print(f"✅ Created {len(files_created)} environment files for packaging:")
         for file_path in files_created.keys():
@@ -1652,14 +1655,14 @@ class ProxyRequestHandler:
         for header_name, header_value in add_headers.items():
             resolved_value = self._resolve_header_value(header_value)
             headers[header_name] = resolved_value
-            print(f"➕ Added header: {header_name}={resolved_value}")
-        
+            print(f"➕ Added header: {header_name}=***")
+
         # Replace headers
         replace_headers = mapping.get("replace_headers", {})
         for header_name, header_value in replace_headers.items():
             resolved_value = self._resolve_header_value(header_value)
             headers[header_name] = resolved_value
-            print(f"🔄 Replaced header: {header_name}={resolved_value}")
+            print(f"🔄 Replaced header: {header_name}=***")
         
         return headers
     
@@ -1767,7 +1770,7 @@ class ProxyRequestHandler:
                 kwargs["headers"] = headers
             
             # Make the request
-            response = requests.request(method, url, **kwargs)
+            response = _http_session.request(method, url, **kwargs)
             
             # Convert response
             response_headers = dict(response.headers)
@@ -1932,6 +1935,15 @@ class LocalProxyTestServer:
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # MCP BACK-CHANNEL CLASSES (Enhanced with Proxy Support)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+def _resolve_within_root(root_path: str, file_path: str) -> Optional[Path]:
+    """Resolve file_path inside root_path, rejecting traversal/symlink escapes."""
+    real = Path(root_path).resolve()
+    target = (real / file_path).resolve()
+    if not target.is_relative_to(real):
+        return None
+    return target
+
 
 class MCPBackChannelHandler:
     """Enhanced MCP handler with external server routing + built-in filesystem support"""
@@ -2108,12 +2120,12 @@ class MCPBackChannelHandler:
             file_path = request.get("arguments", {}).get("path", "")
             server_name = request.get("server", "filesystem")
             root_path = self.mcp_servers[server_name]["root_path"]
-            
+
             # Security: ensure path is within root
-            abs_path = os.path.abspath(os.path.join(root_path, file_path))
-            if not abs_path.startswith(root_path):
+            abs_path = _resolve_within_root(root_path, file_path)
+            if abs_path is None:
                 return {"error": "Path outside of allowed root directory"}
-            
+
             with open(abs_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
@@ -2134,15 +2146,15 @@ class MCPBackChannelHandler:
             content = args.get("content", "")
             server_name = request.get("server", "filesystem")
             root_path = self.mcp_servers[server_name]["root_path"]
-            
+
             # Security: ensure path is within root
-            abs_path = os.path.abspath(os.path.join(root_path, file_path))
-            if not abs_path.startswith(root_path):
+            abs_path = _resolve_within_root(root_path, file_path)
+            if abs_path is None:
                 return {"error": "Path outside of allowed root directory"}
-            
+
             # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            
+            os.makedirs(abs_path.parent, exist_ok=True)
+
             with open(abs_path, 'w', encoding='utf-8') as f:
                 f.write(content)
             
@@ -2161,12 +2173,12 @@ class MCPBackChannelHandler:
             dir_path = request.get("arguments", {}).get("path", ".")
             server_name = request.get("server", "filesystem")
             root_path = self.mcp_servers[server_name]["root_path"]
-            
+
             # Security: ensure path is within root
-            abs_path = os.path.abspath(os.path.join(root_path, dir_path))
-            if not abs_path.startswith(root_path):
+            abs_path = _resolve_within_root(root_path, dir_path)
+            if abs_path is None:
                 return {"error": "Path outside of allowed root directory"}
-            
+
             items = []
             for item in os.listdir(abs_path):
                 item_path = os.path.join(abs_path, item)
@@ -2191,12 +2203,12 @@ class MCPBackChannelHandler:
             dir_path = request.get("arguments", {}).get("path", "")
             server_name = request.get("server", "filesystem")
             root_path = self.mcp_servers[server_name]["root_path"]
-            
+
             # Security: ensure path is within root
-            abs_path = os.path.abspath(os.path.join(root_path, dir_path))
-            if not abs_path.startswith(root_path):
+            abs_path = _resolve_within_root(root_path, dir_path)
+            if abs_path is None:
                 return {"error": "Path outside of allowed root directory"}
-            
+
             os.makedirs(abs_path, exist_ok=True)
             
             return {
@@ -2250,9 +2262,23 @@ class OneStepPixiClient:
         self.task_id = None
         self.aes_key_bytes = None
         self._encryption_setup_done = False
-        self._processed_mcp_requests = set()  # Track processed MCP request hashes
-        self._processed_proxy_requests = set()  # Track processed proxy request hashes
+        self._processed_mcp_requests = OrderedDict()  # LRU of processed MCP request IDs
+        self._processed_proxy_requests = OrderedDict()  # LRU of processed proxy request IDs
         self._should_auto_exit = False  # Flag for auto-exit signaling
+
+    _DEDUP_CACHE_SIZE = 1024
+
+    def _is_duplicate_request(self, cache: OrderedDict, request_id: Optional[str]) -> bool:
+        """Dedup by request_id with a bounded LRU; requests without an ID are never deduped."""
+        if not request_id:
+            return False
+        if request_id in cache:
+            cache.move_to_end(request_id)
+            return True
+        cache[request_id] = True
+        if len(cache) > self._DEDUP_CACHE_SIZE:
+            cache.popitem(last=False)
+        return False
         
     def _setup_encryption(self) -> bool:
         """Setup AES encryption via handshake or key file (only once)"""
@@ -2416,7 +2442,12 @@ class OneStepPixiClient:
             print("  🌍 Environment variables to inject:")
             for key, value in list(env_vars.items())[:5]:  # Show first 5
                 # Hide sensitive values
-                display_value = value if len(value) < 50 and not any(secret in key.lower() for secret in ['password', 'secret', 'key', 'token']) else f"{value[:10]}..."
+                if any(secret in key.lower() for secret in ['password', 'secret', 'key', 'token']):
+                    display_value = "***"
+                elif len(value) < 50:
+                    display_value = value
+                else:
+                    display_value = f"{value[:10]}..."
                 print(f"    {key}={display_value}")
             if len(env_vars) > 5:
                 print(f"    ... and {len(env_vars) - 5} more variables")
@@ -2428,10 +2459,9 @@ class OneStepPixiClient:
         auto_approve_status = " + auto-approve" if self.auto_approve else ""
         print(f"📋 Step 3: Deploying task to remote server ({deployment_mode} mode{auto_approve_status})...")
         
-        # Create a custom _handle_obj to capture task ID during streaming
-        original_handle_obj = globals().get('_handle_obj')
+        # Capture task ID during streaming via callback
         task_id_holder = {"task_id": None}
-        
+
         def capture_task_id(obj: dict):
             if obj.get("task_id"):
                 task_id_holder["task_id"] = obj["task_id"]
@@ -2439,24 +2469,16 @@ class OneStepPixiClient:
                 # Update environment handler with real task ID
                 if self.environment_handler:
                     self.environment_handler.task_id = obj["task_id"]
-            if original_handle_obj:
-                original_handle_obj(obj)
-        
-        # Temporarily replace the global handler
-        globals()['_handle_obj'] = capture_task_id
-        
-        try:
-            # ENHANCED: Pass offline mode and auto-approve to packaging function
-            pkg = _package_dir(env_handler=self.environment_handler, 
-                              env_profile=self.env_profile,
-                              offline_mode=offline_mode,
-                              auto_approve=self.auto_approve)
-            _upload_and_run(pkg, task_name, self.auth_headers, self.environment_handler)
-        finally:
-            # Restore original handler
-            if original_handle_obj:
-                globals()['_handle_obj'] = original_handle_obj
-        
+            _handle_obj(obj)
+
+        # ENHANCED: Pass offline mode and auto-approve to packaging function
+        pkg = _package_dir(env_handler=self.environment_handler,
+                          env_profile=self.env_profile,
+                          offline_mode=offline_mode,
+                          auto_approve=self.auto_approve)
+        _upload_and_run(pkg, task_name, self.auth_headers, self.environment_handler,
+                        on_obj=capture_task_id)
+
         # Use captured task ID or fallback
         self.task_id = task_id_holder["task_id"] or current_task_id or f"{task_name}-{int(time.time())}"
         
@@ -2595,7 +2617,7 @@ class OneStepPixiClient:
         while True:
             try:
                 # Get task output to look for requests
-                response = requests.get(f"{self.server_url}/task/{self.task_id}", headers=self.auth_headers)
+                response = _http("GET", f"{self.server_url}/task/{self.task_id}", headers=self.auth_headers)
                 if response.status_code == 200:
                     task_info = response.json()
                     
@@ -2680,22 +2702,14 @@ class OneStepPixiClient:
             
             encryption_status = "🔐 encrypted" if self.aes_key_bytes else "⚠️ unencrypted"
             print(f"🔍 Found MCP request ({encryption_status}): {json_str[:100]}...")
-            
-            # Create a unique identifier for this request based on content
-            # This prevents processing the same request multiple times
-            request_content = json.dumps(request, sort_keys=True)
-            request_hash = hash(request_content)
-            
-            # Check if we've already processed this exact request
-            if request_hash in self._processed_mcp_requests:
-                print(f"🔄 Skipping duplicate MCP request (hash: {request_hash})")
+
+            # Check if we've already processed this request (by request_id)
+            if self._is_duplicate_request(self._processed_mcp_requests, request.get("request_id")):
+                print(f"🔄 Skipping duplicate MCP request (request_id: {request['request_id']})")
                 return  # Skip silently - already processed
-            
+
             print(f"🔧 Processing MCP request: {request.get('action', 'unknown')}")
-            
-            # Mark as processed before handling
-            self._processed_mcp_requests.add(request_hash)
-            
+
             # Generate a request ID for tracking if not present
             if "request_id" not in request:
                 request["request_id"] = f"client_generated_{int(time.time() * 1000)}"
@@ -2705,7 +2719,7 @@ class OneStepPixiClient:
             print(f"🔧 MCP response generated: {response}")
             
             # Send encrypted response back to task
-            await self._send_mcp_response(response)
+            await self._send_backchannel_response("mcp", response)
             
         except json.JSONDecodeError as e:
             print(f"❌ Invalid MCP request JSON: {e}")
@@ -2726,23 +2740,16 @@ class OneStepPixiClient:
             
             encryption_status = "🔐 encrypted" if self.aes_key_bytes else "⚠️ unencrypted"
             print(f"🌐 Found HTTP proxy request ({encryption_status}): {json_str[:100]}...")
-            
-            # Create a unique identifier for this request based on content
-            request_content = json.dumps(request, sort_keys=True)
-            request_hash = hash(request_content)
-            
-            # Check if we've already processed this exact request
-            if request_hash in self._processed_proxy_requests:
-                print(f"🔄 Skipping duplicate HTTP proxy request (hash: {request_hash})")
+
+            # Check if we've already processed this request (by request_id)
+            if self._is_duplicate_request(self._processed_proxy_requests, request.get("request_id")):
+                print(f"🔄 Skipping duplicate HTTP proxy request (request_id: {request['request_id']})")
                 return  # Skip silently - already processed
-            
+
             method = request.get("method", "GET")
             path = request.get("path", "/")
             print(f"🌐 Processing HTTP proxy request: {method} {path}")
-            
-            # Mark as processed before handling
-            self._processed_proxy_requests.add(request_hash)
-            
+
             # Generate a request ID for tracking if not present
             if "request_id" not in request:
                 request["request_id"] = f"proxy_{int(time.time() * 1000)}"
@@ -2761,7 +2768,7 @@ class OneStepPixiClient:
                 }
             
             # Send response back to task
-            await self._send_proxy_response(response)
+            await self._send_backchannel_response("proxy", response)
             
         except json.JSONDecodeError as e:
             print(f"❌ Invalid HTTP proxy request JSON: {e}")
@@ -2801,153 +2808,88 @@ class OneStepPixiClient:
                 "error": f"MCP handler error: {str(e)}"
             }
     
-    async def _send_mcp_response(self, response: Dict[str, Any]):
-        """Send MCP response back to remote task via encrypted channel (existing logic)"""
+    async def _send_backchannel_response(self, kind: str, response: Dict[str, Any]):
+        """Send MCP or HTTP proxy response back to remote task via encrypted channel"""
+        label, response_type = {
+            "mcp": ("MCP", "mcp_response"),
+            "proxy": ("HTTP proxy", "http_response"),
+        }[kind]
+
         try:
             # First check if the task is still running
-            task_check = requests.get(f"{self.server_url}/task/{self.task_id}", headers=self.auth_headers)
+            task_check = _http("GET", f"{self.server_url}/task/{self.task_id}", headers=self.auth_headers)
             if task_check.status_code == 200:
                 task_info = task_check.json()
                 task_status = task_info.get("status", "unknown")
-                
+
                 if task_status in ["completed", "failed"]:
-                    print(f"📤 Task already {task_status}, skipping MCP response send")
+                    print(f"📤 Task already {task_status}, skipping {label} response send")
                     return
             elif task_check.status_code == 404:
-                print(f"📤 Task not found, skipping MCP response send")
+                print(f"📤 Task not found, skipping {label} response send")
                 return
-            
-            # ENCRYPT MCP RESPONSE if encryption is enabled
+
+            # ENCRYPT RESPONSE if encryption is enabled
             response_data = {
-                "type": "mcp_response",
+                "type": response_type,
                 "data": response
             }
-            
+
             # Serialize the response
             response_json = json.dumps(response_data)
-            
+
             if self.aes_key_bytes:
-                # ENCRYPT the MCP response using the same AES key as other communications
-                print(f"🔐 Encrypting MCP response with AES-256...")
-                
+                # ENCRYPT the response using the same AES key as other communications
+                print(f"🔐 Encrypting {label} response with AES-256...")
+
                 # Use the same encryption format as the rest of the system
                 nonce = os.urandom(NONCE_LEN)
                 aesgcm = AESGCM(self.aes_key_bytes)
                 encrypted_data = aesgcm.encrypt(nonce, response_json.encode('utf-8'), None)
-                
+
                 # Combine nonce + encrypted data (same format as streaming)
                 encrypted_payload = nonce + encrypted_data
-                
+
                 # Send encrypted payload
-                response_obj = requests.post(
+                response_obj = _http(
+                    "POST",
                     f"{self.server_url}/task/{self.task_id}/input",
                     headers={**self.auth_headers, "Content-Type": "application/octet-stream"},
                     data=encrypted_payload,
                     timeout=10
                 )
-                
-                print(f"🔐 MCP response encrypted and sent ({len(encrypted_payload)} bytes)")
+
+                print(f"🔐 {label} response encrypted and sent ({len(encrypted_payload)} bytes)")
             else:
                 # Send unencrypted (fallback for when no encryption is configured)
-                print(f"⚠️ Sending UNENCRYPTED MCP response (no AES key available)")
-                
-                response_obj = requests.post(
+                print(f"⚠️ Sending UNENCRYPTED {label} response (no AES key available)")
+
+                response_obj = _http(
+                    "POST",
                     f"{self.server_url}/task/{self.task_id}/input",
                     headers={**self.auth_headers, "Content-Type": "application/json"},
                     json=response_data,
                     timeout=10
                 )
-            
+
             if response_obj.status_code == 200:
                 server_response = response_obj.json() if response_obj.text else {}
                 encryption_status = "🔐 encrypted" if self.aes_key_bytes else "⚠️ unencrypted"
-                print(f"✅ MCP response sent successfully ({encryption_status}): {server_response}")
+                print(f"✅ {label} response sent successfully ({encryption_status}): {server_response}")
             else:
-                print(f"❌ Server rejected MCP response: {response_obj.status_code} - {response_obj.text}")
-            
-            print(f"✅ Sent MCP response for action: {response.get('action', 'unknown')}")
-            
+                print(f"❌ Server rejected {label} response: {response_obj.status_code} - {response_obj.text}")
+
+            if kind == "mcp":
+                print(f"✅ Sent MCP response for action: {response.get('action', 'unknown')}")
+            else:
+                print(f"✅ Sent HTTP proxy response: {response.get('status', 'unknown')}")
+
         except requests.exceptions.Timeout:
-            print(f"❌ Timeout sending MCP response")
+            print(f"❌ Timeout sending {label} response")
         except requests.exceptions.RequestException as e:
-            print(f"❌ Request error sending MCP response: {e}")
+            print(f"❌ Request error sending {label} response: {e}")
         except Exception as e:
-            print(f"❌ Failed to send MCP response: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    async def _send_proxy_response(self, response: Dict[str, Any]):
-        """Send HTTP proxy response back to remote task via encrypted channel"""
-        try:
-            # First check if the task is still running
-            task_check = requests.get(f"{self.server_url}/task/{self.task_id}", headers=self.auth_headers)
-            if task_check.status_code == 200:
-                task_info = task_check.json()
-                task_status = task_info.get("status", "unknown")
-                
-                if task_status in ["completed", "failed"]:
-                    print(f"📤 Task already {task_status}, skipping proxy response send")
-                    return
-            elif task_check.status_code == 404:
-                print(f"📤 Task not found, skipping proxy response send")
-                return
-            
-            # ENCRYPT HTTP PROXY RESPONSE if encryption is enabled
-            response_data = {
-                "type": "http_response",
-                "data": response
-            }
-            
-            # Serialize the response
-            response_json = json.dumps(response_data)
-            
-            if self.aes_key_bytes:
-                # ENCRYPT the proxy response using the same AES key as other communications
-                print(f"🔐 Encrypting HTTP proxy response with AES-256...")
-                
-                # Use the same encryption format as the rest of the system
-                nonce = os.urandom(NONCE_LEN)
-                aesgcm = AESGCM(self.aes_key_bytes)
-                encrypted_data = aesgcm.encrypt(nonce, response_json.encode('utf-8'), None)
-                
-                # Combine nonce + encrypted data (same format as streaming)
-                encrypted_payload = nonce + encrypted_data
-                
-                # Send encrypted payload
-                response_obj = requests.post(
-                    f"{self.server_url}/task/{self.task_id}/input",
-                    headers={**self.auth_headers, "Content-Type": "application/octet-stream"},
-                    data=encrypted_payload,
-                    timeout=10
-                )
-                
-                print(f"🔐 HTTP proxy response encrypted and sent ({len(encrypted_payload)} bytes)")
-            else:
-                # Send unencrypted (fallback for when no encryption is configured)
-                print(f"⚠️ Sending UNENCRYPTED HTTP proxy response (no AES key available)")
-                
-                response_obj = requests.post(
-                    f"{self.server_url}/task/{self.task_id}/input",
-                    headers={**self.auth_headers, "Content-Type": "application/json"},
-                    json=response_data,
-                    timeout=10
-                )
-            
-            if response_obj.status_code == 200:
-                server_response = response_obj.json() if response_obj.text else {}
-                encryption_status = "🔐 encrypted" if self.aes_key_bytes else "⚠️ unencrypted"
-                print(f"✅ HTTP proxy response sent successfully ({encryption_status}): {server_response}")
-            else:
-                print(f"❌ Server rejected HTTP proxy response: {response_obj.status_code} - {response_obj.text}")
-            
-            print(f"✅ Sent HTTP proxy response: {response.get('status', 'unknown')}")
-            
-        except requests.exceptions.Timeout:
-            print(f"❌ Timeout sending HTTP proxy response")
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Request error sending HTTP proxy response: {e}")
-        except Exception as e:
-            print(f"❌ Failed to send HTTP proxy response: {e}")
+            print(f"❌ Failed to send {label} response: {e}")
             import traceback
             traceback.print_exc()
     
@@ -3081,6 +3023,8 @@ def main():
     # Core arguments (matching original client.py)
     # Do not set a default here; we resolve precedence after parsing
     parser.add_argument("--server", default=None, help="Pixi server URL")
+    parser.add_argument("--server-from-token", action="store_true",
+                       help="Allow deriving the server URL from bearer token claims (off by default)")
     parser.add_argument("--task", default="foobar", help="Task name to deploy")  
     parser.add_argument("--attach", help="Attach to existing task ID")
     parser.add_argument("--attach-history", help="Attach to task with full history")
@@ -3134,13 +3078,14 @@ def main():
     
     args = parser.parse_args()
 
-    # Resolve server URL with precedence: CLI > env > config > token claim
-    server_url_resolved, server_source = _resolve_server_url(args.server, cfg, args.bearer_token)
+    # Resolve server URL with precedence: CLI > env > config > token claim (opt-in)
+    server_url_resolved, server_source = _resolve_server_url(args.server, cfg, args.bearer_token,
+                                                             allow_token_url=args.server_from_token)
     server_url = server_url_resolved
 
     # Quick preflight: validate URL and check TCP reachability before doing anything heavy
-    # Allow --show-config or --skip-offline-check to bypass reachability requirement
-    if not (args.show_config or args.skip_offline_check):
+    # Allow --show-config, --show-package-size or --skip-offline-check to bypass reachability requirement
+    if not (args.show_config or args.show_package_size or args.skip_offline_check):
         if not _is_valid_url(server_url):
             print(f"❌ Invalid server URL: {server_url}")
             print("💡 Set a valid URL via --server or PIXI_SERVER_URL")
@@ -3239,7 +3184,42 @@ def main():
         print("📋 Current Configuration (pixi_remote_config.toml):")
         print(json.dumps(cfg, indent=2))
         return 0
-    
+
+    # NEW: Build the package, show its size breakdown, and exit
+    if args.show_package_size:
+        deployment_config = cfg.get("deployment", {})
+        offline_mode = args.offline_mode or deployment_config.get("offline_mode", False)
+
+        print("📦 Building package to measure size...")
+        pkg = _package_dir(offline_mode=offline_mode, auto_approve=auto_approve)
+        try:
+            total_size = os.path.getsize(pkg)
+            print(f"\n📦 Package Size Breakdown:")
+            print(f"  Mode: {'offline (dependencies included)' if offline_mode else 'online'}")
+            print(f"  Package file size: {total_size / (1024 * 1024):.2f} MB")
+
+            entry_sizes = {}
+            if pkg.endswith(".lz4"):
+                import lz4.frame
+                src = lz4.frame.open(pkg, "rb")
+            else:
+                src = open(pkg, "rb")
+            with src, tarfile.open(fileobj=src, mode="r|") as tar:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    top = member.name.split("/", 1)[0]
+                    entry_sizes[top] = entry_sizes.get(top, 0) + member.size
+
+            uncompressed = sum(entry_sizes.values())
+            print(f"  Uncompressed size: {uncompressed / (1024 * 1024):.2f} MB")
+            print(f"  Top-level entries:")
+            for name, size in sorted(entry_sizes.items(), key=lambda kv: kv[1], reverse=True):
+                print(f"    {name}: {size / (1024 * 1024):.2f} MB")
+        finally:
+            os.unlink(pkg)
+        return 0
+
     # NEW: Show MCP server configuration
     if args.show_mcp:
         print("🔧 MCP Server Configuration:")
@@ -3427,7 +3407,7 @@ actions = ["sql_*", "schema_*"]
                 for key, value in sorted(env_vars.items()):
                     # Hide sensitive values in preview
                     if any(secret in key.lower() for secret in ['password', 'secret', 'key', 'token']):
-                        display_value = f"{value[:5]}***"
+                        display_value = "***"
                     else:
                         display_value = value
                     print(f"  {key}={display_value}")

@@ -1,0 +1,10 @@
+# Lean baseline: syntax errors (E9) and pyflakes (F) only.
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E9", "F"]
+# Cosmetic/cleanup rules the current codebase does not yet pass; correctness
+# checks (undefined names, redefinitions, ...) remain enforced. Remove these
+# as the code is tidied up.
+ignore = ["F401", "F541", "F841"]

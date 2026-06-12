@@ -16,9 +16,11 @@ Features:
 import asyncio
 import argparse
 import base64
+import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -162,7 +164,12 @@ def create_default_config() -> Dict[str, Any]:
         },
         "cache_max_size": 1000,
         "cache_ttl_seconds": 3600,
-        "cors_origins": ["*"],
+        "cors_origins": [
+            "http://localhost:3000",
+            "http://localhost:8080",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:8080"
+        ],
         "aes_key": None,
         "auth_headers": {
             # Default auth headers for server communication
@@ -636,13 +643,12 @@ class RemoteChannel:
                 # Get request data
                 method = request.method
                 query_params = dict(request.query_params)
-                headers = dict(request.headers)
-                
-                # Remove hop-by-hop headers
-                hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate', 
-                             'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade'}
-                headers = {k: v for k, v in headers.items() if k.lower() not in hop_by_hop}
-                
+
+                # Only forward a safe whitelist of client headers; never forward
+                # client auth headers (Authorization, cookies, x-api-key, ...)
+                allowed_headers = {'content-type', 'accept', 'user-agent', 'x-request-id'}
+                headers = {k: v for k, v in request.headers.items() if k.lower() in allowed_headers}
+
                 # Add auth headers
                 headers.update(self.auth_headers)
                 
@@ -1463,20 +1469,46 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
     )
     
     # Add CORS middleware
+    cors_origins = config.get("cors_origins") or [
+        "http://localhost:3000",
+        "http://localhost:8080",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8080"
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=config.get("cors_origins", ["*"]),
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials="*" not in cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    
+
     # Initialize proxy server
     proxy = ProxyServer(config)
-    
+
+    # ─────────────── API Key Authentication ─────────────────
+
+    auth_config = config.get("authentication", {})
+    require_api_key = auth_config.get("require_api_key", False)
+    configured_api_key = auth_config.get("api_key")
+
+    async def verify_api_key(request: Request):
+        if not require_api_key:
+            return True
+        if not configured_api_key:
+            raise HTTPException(status_code=503, detail="API key required but not configured")
+        provided = request.headers.get("x-api-key")
+        if not provided:
+            authorization = request.headers.get("authorization", "")
+            if authorization.lower().startswith("bearer "):
+                provided = authorization[7:].strip()
+        if not provided or not hmac.compare_digest(provided.encode("utf-8"), configured_api_key.encode("utf-8")):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        return True
+
     # ─────────────── OpenAI API Routes ─────────────────
     
-    @app.post("/v1/chat/completions")
+    @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
     async def openai_chat_completions(request: OpenAIChatRequest):
         """OpenAI Chat Completions API"""
         request_dict = request.model_dump()  # Fixed Pydantic v2 deprecation
@@ -1491,7 +1523,7 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
         else:
             return await proxy.handle_request(request_dict, "openai")
     
-    @app.post("/v1/responses")
+    @app.post("/v1/responses", dependencies=[Depends(verify_api_key)])
     async def openai_responses(request: OpenAIResponseRequest):
         """OpenAI Responses API"""
         request_dict = request.model_dump()  # Fixed Pydantic v2 deprecation
@@ -1508,7 +1540,7 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
     
     # ─────────────── Anthropic API Routes ─────────────────
     
-    @app.post("/v1/messages")
+    @app.post("/v1/messages", dependencies=[Depends(verify_api_key)])
     async def anthropic_messages(request: AnthropicRequest):
         """Anthropic Messages API"""
         request_dict = request.model_dump()  # Fixed Pydantic v2 deprecation
@@ -1525,7 +1557,7 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
     
     # ─────────────── Ollama API Routes ─────────────────
     
-    @app.post("/api/generate")
+    @app.post("/api/generate", dependencies=[Depends(verify_api_key)])
     async def ollama_generate(request: OllamaGenerateRequest):
         """Ollama Generate API"""
         request_dict = request.model_dump()  # Fixed Pydantic v2 deprecation
@@ -1540,7 +1572,7 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
         else:
             return await proxy.handle_request(request_dict, "ollama_generate")
     
-    @app.post("/api/chat")
+    @app.post("/api/chat", dependencies=[Depends(verify_api_key)])
     async def ollama_chat(request: OllamaChatRequest):
         """Ollama Chat API"""
         request_dict = request.model_dump()  # Fixed Pydantic v2 deprecation
@@ -1557,9 +1589,11 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
     
     # ─────────────── Task-Specific HTTP Passthrough Routes ─────────────────
     
-    @app.api_route("/{task_id}/proxy/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+    @app.api_route("/{task_id}/proxy/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"], dependencies=[Depends(verify_api_key)])
     async def task_specific_http_passthrough(request: Request, task_id: str, path: str):
         """Task-specific HTTP passthrough to backend services"""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", task_id):
+            raise HTTPException(status_code=400, detail="Invalid task_id format")
         if not proxy.channels:
             raise HTTPException(status_code=503, detail="No backends available")
         
@@ -1587,7 +1621,7 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
             logger.error(f"Task HTTP passthrough error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
     
-    @app.api_route("/proxy/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+    @app.api_route("/proxy/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"], dependencies=[Depends(verify_api_key)])
     async def generic_http_passthrough(request: Request, path: str):
         """Generic HTTP passthrough to backend services (uses default task)"""
         if not proxy.channels:
@@ -1617,13 +1651,13 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
             logger.error(f"HTTP passthrough error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
     
-    @app.post("/api/generate-generic")
+    @app.post("/api/generate-generic", dependencies=[Depends(verify_api_key)])
     async def generic_generate(request: GenericRequest):
         """Generic/Passthrough API"""
         request_dict = request.model_dump()  # Fixed Pydantic v2 deprecation
         return await proxy.handle_request(request_dict, "generic")
     
-    @app.post("/api/v1/generate")
+    @app.post("/api/v1/generate", dependencies=[Depends(verify_api_key)])
     async def generic_generate_v1(request: GenericRequest):
         """Generic API v1 (alternative endpoint)"""
         request_dict = request.model_dump()  # Fixed Pydantic v2 deprecation

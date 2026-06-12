@@ -1,144 +1,130 @@
-# test_clean_architecture.py - Test the clean architecture
+# test_clean_architecture.py - Tests for the configurable MCP agent
 import asyncio
-import sys
 from pathlib import Path
 
-# Add current directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+import pytest
 
-async def test_clean_architecture():
-    """Test the clean, modular architecture"""
-    print("🧪 Testing Clean MCP Architecture")
-    print("=" * 50)
-    
-    # Test 1: Pure MCP Manager
-    print("\n📋 Test 1: Pure MCP Manager")
-    try:
-        from mcp_manager import MCPManager, create_server_config
-        
-        manager = MCPManager()
-        await manager.start()
-        
-        # Create server config
-        fs_config = create_server_config("test_fs", "filesystem", root_path="/tmp")
-        search_config = create_server_config("test_search", "web_search")
-        
-        # Register and start
-        await manager.register_server(fs_config)
-        await manager.register_server(search_config)
-        
-        fs_started = await manager.start_server("test_fs")
-        search_started = await manager.start_server("test_search")
-        
-        print(f"   Filesystem server: {'✅' if fs_started else '❌'}")
-        print(f"   Search server: {'✅' if search_started else '❌'}")
-        
-        # Test tool calls
-        if fs_started:
-            result = await manager.call_tool("write_file", {"path": "/tmp/test.txt", "content": "Hello!"})
-            print(f"   File write: {'✅' if result['success'] else '❌'}")
-        
-        if search_started:
-            result = await manager.call_tool("web_search", {"query": "test"})
-            print(f"   Web search: {'✅' if result['success'] else '❌'}")
-        
-        await manager.stop()
-        print("   ✅ Pure MCP Manager test passed")
-        
-    except Exception as e:
-        print(f"   ❌ MCP Manager test failed: {e}")
-    
-    # Test 2: Configuration Loading
-    print("\n📋 Test 2: Configuration Loading")
-    try:
-        import yaml
-        
-        # Test config parsing
-        sample_config = {
-            "agent": {"name": "TestAgent"},
-            "mcp": {
-                "servers": [
-                    {
-                        "name": "test_server",
-                        "command": ["python", "-m", "test"],
-                        "tools": ["test_tool"]
-                    }
-                ]
-            },
-            "generation": {
-                "default": {
-                    "prompt_template": "Test prompt for {topic}",
-                    "post_processors": [
-                        {"type": "truncate", "max_length": 100}
-                    ]
-                }
+yaml = pytest.importorskip("yaml")
+mcp_agent = pytest.importorskip("mcp_agent")
+
+from mcp_agent import ConfigurableMCPAgent, create_agent_from_config
+from mcp_manager import load_server_configs_from_dict
+
+AGENT_DIR = Path(__file__).resolve().parent.parent
+
+
+class MockChannel:
+    server_url = "mock://test"
+    task_id = "test-task"
+
+
+@pytest.fixture
+def agent():
+    config = {
+        "generation": {
+            "default": {
+                "prompt_template": "Write about {topic}",
+                "post_processors": [{"type": "truncate", "max_length": 50}],
             }
         }
-        
-        # Save test config
-        with open("test_config.yaml", "w") as f:
-            yaml.dump(sample_config, f)
-        
-        # Load it back
-        from mcp_manager import load_server_configs_from_dict
-        server_configs = load_server_configs_from_dict(sample_config["mcp"])
-        
-        print(f"   Config loading: {'✅' if len(server_configs) == 1 else '❌'}")
-        print(f"   Server name: {server_configs[0].name}")
-        print(f"   Server tools: {server_configs[0].tools}")
-        
-        # Cleanup
-        Path("test_config.yaml").unlink(missing_ok=True)
-        print("   ✅ Configuration loading test passed")
-        
-    except Exception as e:
-        print(f"   ❌ Configuration test failed: {e}")
-    
-    # Test 3: Generic Agent (without actual remote connection)
-    print("\n📋 Test 3: Generic Agent Structure")
-    try:
-        from mcp_agent import ConfigurableMCPAgent
-        
-        # Mock channel for testing
-        class MockChannel:
-            def __init__(self):
-                self.server_url = "mock://test"
-                self.task_id = "test-task"
-        
-        mock_channel = MockChannel()
-        
-        # Create agent with test config
-        test_config = {
-            "generation": {
-                "default": {
-                    "prompt_template": "Write about {topic}",
-                    "post_processors": [
-                        {"type": "truncate", "max_length": 50}
-                    ]
-                }
-            }
-        }
-        
-        agent = ConfigurableMCPAgent(mock_channel, test_config)
-        
-        print(f"   Agent creation: ✅")
-        print(f"   Config loaded: {'✅' if agent.config else '❌'}")
-        print(f"   MCP manager: {'✅' if agent.mcp_manager else '❌'}")
-        
-        # Test prompt building
-        context = {"topic": "nature"}
-        generation_config = test_config["generation"]["default"]
-        prompt = agent._build_prompt_from_config(context, generation_config)
-        
-        print(f"   Prompt building: {'✅' if 'nature' in prompt else '❌'}")
-        print("   ✅ Generic agent test passed")
-        
-    except Exception as e:
-        print(f"   ❌ Generic agent test failed: {e}")
-    
-    print("\n🎉 Clean Architecture Tests Complete!")
-    print("=" * 50)
+    }
+    return ConfigurableMCPAgent(MockChannel(), config)
 
-if __name__ == "__main__":
-    asyncio.run(test_clean_architecture())
 
+def test_agent_creation(agent):
+    assert agent.config["generation"]["default"]["prompt_template"] == "Write about {topic}"
+    assert agent.mcp_manager is not None
+    assert agent._mcp_started is False
+
+
+def test_create_agent_from_config_factory():
+    agent = create_agent_from_config(MockChannel(), {"agent": {"name": "X"}})
+    assert isinstance(agent, ConfigurableMCPAgent)
+    assert agent.config["agent"]["name"] == "X"
+
+
+def test_use_tool_requires_initialization(agent):
+    with pytest.raises(RuntimeError):
+        asyncio.run(agent.use_tool("read_file", path="x.txt"))
+
+
+def test_has_tool_false_before_initialization(agent):
+    assert asyncio.run(agent.has_tool("read_file")) is False
+
+
+def test_get_available_tools_empty_before_initialization(agent):
+    assert asyncio.run(agent.get_available_tools()) == {}
+
+
+def test_build_prompt_substitutes_context(agent):
+    generation_config = agent.config["generation"]["default"]
+    prompt = agent._build_prompt_from_config({"topic": "nature"}, generation_config)
+    assert "Write about nature" in prompt
+
+
+def test_build_prompt_handles_missing_context_key(agent):
+    generation_config = {"prompt_template": "About {missing_key}"}
+    prompt = agent._build_prompt_from_config({"topic": "nature"}, generation_config)
+    assert "{missing_key}" in prompt
+
+
+def test_build_prompt_includes_constraints_and_instructions(agent):
+    generation_config = {
+        "prompt_template": "{topic}",
+        "format_instructions": "Be brief.",
+        "constraints": ["Three lines only"],
+    }
+    prompt = agent._build_prompt_from_config({"topic": "rain"}, generation_config)
+    assert "Be brief." in prompt
+    assert "- Three lines only" in prompt
+    assert "rain" in prompt
+
+
+def test_process_response_truncate(agent):
+    config = {"post_processors": [{"type": "truncate", "max_length": 10}]}
+    result = agent._process_response_from_config("a" * 100, config)
+    assert len(result) <= 10
+
+
+def test_process_response_extract_lines(agent):
+    config = {"post_processors": [{"type": "extract_lines", "max_lines": 2}]}
+    result = agent._process_response_from_config("one\ntwo\nthree\nfour", config)
+    assert result == "one\ntwo"
+
+
+def test_process_response_filter_patterns(agent):
+    config = {"post_processors": [{"type": "filter_patterns", "patterns": ["example"]}]}
+    result = agent._process_response_from_config("keep this\nExample: drop this", config)
+    assert result == "keep this"
+
+
+def test_resolve_params_from_context(agent):
+    params = {"query": "${topic}", "static": "fixed"}
+    resolved = agent._resolve_params_from_context(params, {"topic": "rivers"}, {})
+    assert resolved == {"query": "rivers", "static": "fixed"}
+
+
+def test_resolve_params_from_step_results(agent):
+    params = {"content": "${research}"}
+    resolved = agent._resolve_params_from_context(
+        params, {}, {"research": {"result": "findings"}}
+    )
+    assert resolved == {"content": "findings"}
+
+
+def test_agent_config_yaml_loads_and_produces_server_configs():
+    config_path = AGENT_DIR / "agent_config.yaml"
+    with open(config_path) as f:
+        documents = list(yaml.safe_load_all(f))
+    assert documents, "agent_config.yaml should contain at least one document"
+
+    main_config = documents[0]
+    assert "mcp" in main_config
+    server_configs = load_server_configs_from_dict(main_config["mcp"])
+    assert len(server_configs) == len(main_config["mcp"]["servers"])
+    names = {c.name for c in server_configs}
+    assert "filesystem" in names
+
+    assert "workflows" in main_config
+    for workflow in main_config["workflows"].values():
+        assert "steps" in workflow

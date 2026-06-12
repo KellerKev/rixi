@@ -50,7 +50,7 @@ rixi/
 │   └── pixi.toml             # Client dependencies
 ├── agent/               # Agent framework, tools & inference
 │   ├── ai_agent_framework.py # Base agent/channel abstractions
-│   ├── agent.py / client.py  # Core agent + client utilities
+│   ├── client.py             # Standalone agent client utility
 │   ├── mcp_agent.py          # Config-driven MCP agent with workflows
 │   ├── mcp_manager.py        # MCP server lifecycle manager
 │   ├── mcp_filesystem.py     # Filesystem tool server
@@ -63,10 +63,14 @@ rixi/
 │   ├── start_agent.py        # Agent entry point
 │   ├── start_agent_mcp.py    # MCP agent entry point
 │   ├── *.yaml                # Sample configs (see Configuration)
-│   ├── examples/             # Standalone demo scripts
-│   ├── tests/                # Test scripts
+│   ├── examples/             # Standalone demo scripts (flask_service, main, …)
+│   ├── tests/                # pytest suite (run with `pixi run test`)
 │   └── pixi.toml             # Agent dependencies
+├── examples/
+│   └── hello/               # Minimal Pixi task used by the quickstart
 ├── install-rixi.sh      # One-command remote installer (Linux/macOS over SSH)
+├── CONTRIBUTING.md      # Dev setup, tests, linting
+├── SECURITY.md          # Vulnerability reporting & hardening guide
 └── README.md
 ```
 
@@ -90,13 +94,13 @@ rixi/
 
 ### Prerequisites
 
-- Python 3.13 (managed automatically by Pixi)
+- Python — resolved per-project by Pixi (server ≥ 3.12, agent ≥ 3.13); no system Python needed
 - [Pixi](https://pixi.sh/) package manager (recommended) or pip
 - _(optional)_ an LLM backend for inference — local or remote
 
 ### Quickstart (local)
 
-Start a server on `localhost` — no auth or keys required by default:
+Start a server on loopback — no auth or keys required by default:
 
 ```bash
 cd server && pixi install
@@ -109,16 +113,20 @@ Verify it's up:
 curl http://localhost:9000/health
 ```
 
-Then connect from another terminal. The full client packages the current directory, ships it
-to the server to execute, streams output back, and opens an interactive menu:
+Then connect from another terminal. Package the bundled `examples/hello` Pixi project, ship it
+to the server to execute, and stream the output back:
 
 ```bash
 cd clients && pixi install
-pixi run python rixi_client.py --server http://localhost:9000 --task hello
+cd ../examples/hello
+pixi run --manifest-path ../../clients/pixi.toml \
+  python ../../clients/rixi_client.py --server http://localhost:9000 --task hello --auto-exit
 ```
 
-The server runs **without** JWT auth or AES encryption by default (convenient for local dev);
-enable them with `--public-key` / `--aes-key` for remote or production use.
+By default the server binds **`127.0.0.1`** and runs **without** JWT auth or AES encryption
+(convenient for local dev). To listen on a public interface you must enable auth
+(`--public-key` / `--jwks-url`) or explicitly pass `--insecure`; binding a non-loopback host
+with auth disabled is refused otherwise. Add `--aes-key` for encryption in production.
 
 ### Server Setup
 
@@ -128,7 +136,7 @@ pixi install
 pixi run python rixi_server.py --port 9000
 ```
 
-The server starts a FastAPI application that manages task execution, authentication, and encrypted communication. It listens on `0.0.0.0:<port>`; common flags: `--public-key` / `--jwks-url` (JWT auth), `--aes-key` (encryption), `--log-level`.
+The server starts a FastAPI application that manages task execution, authentication, and encrypted communication. It listens on `127.0.0.1:<port>` by default; common flags: `--host` (bind address), `--insecure` (allow non-loopback bind without auth), `--public-key` / `--jwks-url` (JWT auth), `--aes-key` (encryption), `--max-upload-mb` (upload size cap), `--log-level`. Secrets can be supplied out-of-band via the `RIXI_KEY_SECRET` and `RIXI_AES_KEY` environment variables instead of CLI flags, so they don't appear in `ps` or shell history.
 
 ### Remote Install (one command)
 
@@ -142,8 +150,12 @@ The server starts a FastAPI application that manages task execution, authenticat
 ./install-rixi.sh --host root@box --ask-pass --rixi-port 8443
 
 # Forward any rixi_server.py flags after "--"
-./install-rixi.sh --host me@host --key ~/.ssh/id_rsa -- --log-level DEBUG --key-secret s3cr3t
+./install-rixi.sh --host me@host --key ~/.ssh/id_rsa -- --log-level DEBUG
 ```
+
+Secrets like `--key-secret` / `--aes-key` are detected among the forwarded args and written to a
+mode-`600` env file on the target (referenced via `EnvironmentFile=` / launchd `EnvironmentVariables`)
+rather than baked into the service definition, so they stay out of `ps` and world-readable unit files.
 
 | Option | Purpose |
 |--------|---------|
@@ -166,12 +178,17 @@ Run `./install-rixi.sh --help` for the full list. Password auth requires `sshpas
 cd clients
 pixi install
 
-# Full-featured client with interactive menu
+# Full-featured client with interactive menu (run from the Pixi project you want to ship)
 pixi run python rixi_client.py --server http://localhost:9000 --task my_task
 
 # Lightweight client
 pixi run python rixi_simple_client.py --server http://localhost:9000
 ```
+
+The full client packages the **current directory** (which must be a Pixi project) and runs the
+named `--task` from its `pixi.toml` on the server. The CrewAI/LangChain showcase (`main.py`)
+lives in an optional `crewai` Pixi environment — install it with `pixi install -e crewai` — and
+isn't required for normal client use.
 
 ### Agent Setup
 
@@ -217,10 +234,15 @@ giving fully air-gapped, reproducible execution on disconnected hosts.
 ## Security
 
 - **AES-256-GCM** encryption for data in transit (12-byte nonce + ciphertext)
-- **JWT** token authentication with configurable verification
-- **Key rotation** via handshake protocol
+- **JWT** token authentication with a pinned algorithm allow-list (no header-driven `alg`)
+- **Key rotation** via handshake protocol (constant-time secret comparison)
 - **Subprocess isolation** for task execution
-- Sensitive files (`*.secret`, `*.key`) are excluded from version control
+- **Loopback-by-default** bind; non-loopback requires auth or an explicit `--insecure` opt-in
+- **Hardened extraction**: uploaded archives are unpacked with path-traversal/symlink filtering, and task names are validated before reaching a shell
+- **Upload caps** on both transferred and decompressed bytes (`--max-upload-mb`)
+- Sensitive files (`*.secret`, `*.key`, `*.pem`, `logs/`) are excluded from version control; secrets can be passed via `RIXI_KEY_SECRET` / `RIXI_AES_KEY` env vars
+
+See [SECURITY.md](SECURITY.md) for the vulnerability-reporting process and a deployment-hardening checklist.
 
 ## Deployment Modes
 

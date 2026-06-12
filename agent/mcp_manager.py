@@ -260,24 +260,15 @@ class MCPManager:
         # FIXED: Always try real implementation first for filesystem operations
         if tool_name in ["read_file", "write_file", "list_directory", "create_directory"]:
             if instance.is_real or instance.config.mode == "real":
-                try:
-                    result = await self._call_real_filesystem_tool(tool_name, params, instance)
-                    print(f"✅ Real filesystem operation successful")
-                    return result
-                except Exception as e:
-                    print(f"❌ Real filesystem operation failed: {e}, falling back to simulation")
-                    return await self._call_simulated_tool(tool_name, params, instance)
+                result = await self._call_real_filesystem_tool(tool_name, params, instance)
+                print(f"📊 Real filesystem operation completed")
+                return result
             else:
                 return await self._call_simulated_tool(tool_name, params, instance)
-        
-        # For other tools, try real server process or simulation
+
+        # For other tools, use the real server process or simulation
         if instance.is_real and instance.process:
-            try:
-                result = await self._call_real_process_tool(tool_name, params, instance)
-                return result
-            except Exception as e:
-                print(f"❌ Real process tool failed: {e}, falling back to simulation")
-                return await self._call_simulated_tool(tool_name, params, instance)
+            return await self._call_real_process_tool(tool_name, params, instance)
         else:
             return await self._call_simulated_tool(tool_name, params, instance)
 

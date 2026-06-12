@@ -11,6 +11,14 @@ rotation.secret
 .env.*
 # Runtime-generated client artifacts
 mcp_info.json
+.offline_metadata.json
+
+# Logs
+logs/
+*.log
+
+# Certificates / private keys
+*.pem
 
 # Python
 __pycache__/

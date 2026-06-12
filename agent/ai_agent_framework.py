@@ -67,7 +67,6 @@ class RemoteChannel:
         return nonce + AESGCM(self.aes_key).encrypt(nonce, json_str.encode('utf-8'), None)
 
     def _decrypt(self, data):
-        print(f"DEBUG: Decrypting with key (first 8 bytes): {self.aes_key[:8].hex()}")
         plaintext = AESGCM(self.aes_key).decrypt(data[:self.NONCE_LEN], data[self.NONCE_LEN:], None)
         return plaintext.decode('utf-8')
 

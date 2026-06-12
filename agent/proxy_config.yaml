@@ -37,13 +37,11 @@ cors_origins:
   - "https://api.your-company.com"
 
 # Available Models
+# List only models the backend actually serves. The names below are
+# placeholders — replace them with your deployed model identifiers.
 available_models:
   - "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-  - "gpt-3.5-turbo"
-  - "gpt-4"
-  - "claude-3-sonnet"
-  - "llama2:7b"
-  - "llama2:13b"
+  - "your-org/your-deployed-model"
 
 # Encryption (if using AES)
 aes_key_file: "aes.key"
