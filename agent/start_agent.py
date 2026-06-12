@@ -332,7 +332,7 @@ async def main():
     parser.add_argument("--aes-key", help="AES key file path")
     
     # Core parameters - completely generic
-    parser.add_argument("--config", default="agent_config.yaml", help="Configuration file path")
+    parser.add_argument("--config", default="agent_config.example.yaml", help="Configuration file path")
     parser.add_argument("--workflow", help="Specific workflow to execute")
     parser.add_argument("--generation-type", help="Generation type from config")
     parser.add_argument("--context", help="Additional context as JSON string")

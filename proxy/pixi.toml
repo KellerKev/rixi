@@ -1,0 +1,21 @@
+[project]
+name = "rixi-proxy"
+version = "0.1.0"
+description = "RIXI API-compatibility proxy (OpenAI / Anthropic / Ollama surfaces over a RIXI backend)"
+authors = ["Kevin Keller <kellerkev@gmail.com>"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+
+[dependencies]
+python = ">=3.10"
+fastapi = ">=0.115"
+uvicorn = ">=0.34"
+aiohttp = ">=3.9"
+requests = ">=2.32"
+pyjwt = ">=2.10"
+cryptography = ">=44"
+pyyaml = ">=6"
+python-multipart = ">=0.0.20"
+
+[tasks]
+proxy = "python proxy.py"

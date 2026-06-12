@@ -1,0 +1,77 @@
+# agent_config.example.yaml - Template configuration for start_agent.py
+#
+# Copy this file, adjust the MCP servers and workflows for your use case, and pass it
+# with `--config <file>`. A fully-populated multi-workflow example lives in
+# examples/agent-demos/agent_config.yaml.
+
+agent:
+  name: "ConfigurableAgent"
+  description: "Generic MCP-enhanced agent"
+  version: "1.0"
+
+# MCP servers the agent can call tools on.
+mcp:
+  servers:
+    - name: "filesystem"
+      command: ["python", "-m", "mcp_filesystem", "/workspace"]
+      working_dir: null
+      env_vars: {}
+      tools: ["read_file", "write_file", "list_directory", "create_directory"]
+      description: "Filesystem access server"
+
+    - name: "web_search"
+      command: ["python", "-m", "mcp_web_search"]
+      working_dir: null
+      env_vars:
+        API_KEY: "${SEARCH_API_KEY}"   # injected at deploy time; never commit a real key
+      tools: ["web_search"]
+      description: "Web search capabilities"
+
+# Named generation profiles referenced by workflow steps.
+generation:
+  default:
+    prompt_template: "Write about {topic}."
+    format_instructions: "Write clear, well-structured prose."
+    post_processors:
+      - type: "truncate"
+        max_length: 500
+
+# Workflows are ordered lists of steps (tool_call / generate).
+workflows:
+  simple_generation:
+    name: "Simple Content Generation"
+    context:
+      topic: "${TOPIC}"
+    steps:
+      - name: "generate_content"
+        type: "generate"
+        context:
+          topic: "${TOPIC}"
+        generation:
+          prompt_template: "{generation_config[prompt_template]}"
+          format_instructions: "{generation_config[format_instructions]}"
+          post_processors: "{generation_config[post_processors]}"
+
+  research_workflow:
+    name: "Research-Enhanced Generation"
+    context:
+      topic: "${TOPIC}"
+    steps:
+      - name: "research"
+        type: "tool_call"
+        tool: "web_search"
+        params:
+          query: "${topic} background"
+        update_context: "research_data"
+
+      - name: "generate_content"
+        type: "generate"
+        context:
+          topic: "${topic}"
+          research_context: "${research_data}"
+        generation:
+          prompt_template: "Based on this research: {research_context}\n\nWrite about {topic}."
+          format_instructions: "Write clear, well-structured prose."
+          post_processors:
+            - type: "truncate"
+              max_length: 800

@@ -37,7 +37,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Compile all Python sources
-        run: python -m compileall -q -x '\.pixi' server clients agent examples
+        run: python -m compileall -q -x '\.pixi' server clients agent proxy inference-server examples
 
   test:
     name: Agent tests (best effort)

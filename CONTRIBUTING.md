@@ -5,11 +5,11 @@ Thanks for your interest in contributing!
 ## Development Setup
 
 RIXI is split into independent [Pixi](https://pixi.sh) projects — `server/`,
-`clients/`, and `agent/` each have their own `pixi.toml`. Set up only the
-component you are working on:
+`clients/`, `agent/`, `proxy/`, and `inference-server/` each have their own
+`pixi.toml`. Set up only the component you are working on:
 
 ```bash
-cd server   # or clients/ or agent/
+cd server   # or clients/ · agent/ · proxy/ · inference-server/
 pixi install
 ```
 

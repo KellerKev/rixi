@@ -9,21 +9,24 @@ A cloud-native AI agent framework for secure, remote execution of AI workloads. 
 ## Architecture
 
 ```
-CLIENT LAYER                  SERVER LAYER              AGENT LAYER
-────────────                  ────────────              ───────────
+CLIENT LAYER                  SERVER LAYER              COMPUTE COMPONENTS
+────────────                  ────────────              ──────────────────
 ┌──────────────┐              ┌──────────────┐          ┌──────────────────┐
-│ rixi_client  │──HTTP/AES───▶│ rixi_server  │◀─────────│ inference_server │
+│ rixi_client  │──HTTP/AES───▶│ rixi_server  │◀─────────│ inference-server │
 │ (full CLI,   │              │ (FastAPI)    │          │ (LLM backend)    │
 │  MCP-capable)│              │              │          └──────────────────┘
 └──────────────┘              │ - JWT Auth   │          ┌──────────────────┐
-┌──────────────┐              │ - AES-256    │          │ proxy.py         │
+┌──────────────┐              │ - AES-256    │          │ proxy            │
 │ simple_client│──Encrypted──▶│ - Task Mgmt  │          │ (API-compat layer)│
 │ (lightweight)│   Channel    │ - Streaming  │          └──────────────────┘
 └──────────────┘              │ - Compression│          ┌──────────────────┐
-                              │ - MCP Support│          │ crewai_integration│
-                              └──────────────┘          │ (multi-agent)    │
+                              │ - MCP Support│          │ agent            │
+                              └──────────────┘          │ (multi-agent eng)│
                                                         └──────────────────┘
 ```
+
+The **agent**, **proxy**, and **inference-server** are independent components, each its own Pixi
+project; mix and match them (or none of them) with the server + clients core.
 
 **Workflow:** Client authenticates (JWT) -> optional AES handshake -> packages code (tar + LZ4) -> uploads to server -> server executes in isolated subprocess -> real-time output streaming back to client.
 
@@ -48,7 +51,7 @@ rixi/
 │   ├── rixi_simple_client.py # Lightweight client
 │   ├── rixi_transport.py     # Shared transport (encryption, streaming, handshake)
 │   └── pixi.toml             # Client dependencies
-├── agent/               # Agent framework, tools & inference
+├── agent/               # Multi-agent engine: framework, MCP tools & workflows
 │   ├── ai_agent_framework.py # Base agent/channel abstractions
 │   ├── remote_channel.py     # Sync streaming channel to the server
 │   ├── aesgcm.py             # AES-GCM encrypt/decrypt helpers
@@ -57,19 +60,23 @@ rixi/
 │   ├── mcp_manager.py        # MCP server lifecycle manager
 │   ├── mcp_filesystem.py     # Filesystem tool server
 │   ├── mcp_web_search.py     # Web search tool server
-│   ├── inference_server.py   # Pluggable LLM inference backend
-│   ├── proxy.py              # API-compatibility proxy (OpenAI/Anthropic/Ollama)
-│   ├── api_formats.py        # Request/response format conversion used by the proxy
 │   ├── crewai_integration.py # CrewAI + MCP bridge
 │   ├── start_agent.py        # Single agent entry point / runner
-│   ├── *.yaml                # Sample configs (see Configuration)
+│   ├── agent_config.example.yaml # Config template (see Configuration)
 │   ├── tests/                # pytest suite (run with `pixi run test`)
 │   └── pixi.toml             # Agent dependencies
+├── proxy/               # API-compatibility layer (OpenAI/Anthropic/Ollama → RIXI backend)
+│   ├── proxy.py · api_formats.py
+│   ├── proxy_config.example.yaml
+│   └── pixi.toml
+├── inference-server/    # Pluggable LLM inference backend (HuggingFace / Ollama)
+│   ├── inference_server.py
+│   └── pixi.toml
 ├── examples/            # Runnable demos (see examples/README.md)
 │   ├── hello/                # Minimal Pixi task used by the quickstart
 │   ├── crewai-showcase/      # Optional CrewAI + Ollama multi-agent showcase
 │   ├── http-backends/        # Example HTTP services for use behind the proxy
-│   └── agent-demos/          # Agent-framework launcher & comparison demos
+│   └── agent-demos/          # Agent-framework demos + their populated configs
 ├── install-rixi.sh      # One-command remote installer (Linux/macOS over SSH)
 ├── CONTRIBUTING.md      # Dev setup, tests, linting
 ├── SECURITY.md          # Vulnerability reporting & hardening guide
@@ -192,26 +199,33 @@ named `--task` from its `pixi.toml` on the server. The CrewAI/LangChain showcase
 required for normal client use — it lives as a standalone, optional demo in
 [`examples/crewai-showcase/`](examples/crewai-showcase/).
 
-### Agent Setup
+### Agent, Proxy & Inference Setup
+
+The agent engine, the API-compatibility proxy, and the inference backend are three independent
+Pixi projects — install whichever you need:
 
 ```bash
-cd agent
-pixi install
+# Multi-agent engine (single entry point; defaults to agent_config.example.yaml)
+cd agent && pixi install && pixi run agent
 
-# Run the agent (single entry point; defaults to agent_config.yaml)
-pixi run python start_agent.py
+# API-compatibility proxy (OpenAI/Anthropic/Ollama → RIXI backend)
+cd proxy && pixi install && pixi run proxy -- --config proxy_config.example.yaml
 
-# Run the API-compatibility proxy
-pixi run proxy
+# Inference backend (HuggingFace / Ollama)
+cd inference-server && pixi install && pixi run start
 ```
 
 ### Configuration
 
-Agent behavior is driven by YAML configuration files in `agent/`:
+Each component ships a small **`*.example.yaml` template** next to its code; copy it and fill in
+real values:
 
-- **`agent_config.yaml`** - MCP servers, workflows, and tool definitions (default for `start_agent.py`)
-- **`haiku_config.yaml`** - Haiku generation prompts and post-processors
-- **`proxy_config.yaml`** - Proxy backends, model mapping, and deployment settings
+- **`agent/agent_config.example.yaml`** - MCP servers, workflows, and tool definitions (default for `start_agent.py`)
+- **`proxy/proxy_config.example.yaml`** - Proxy backends, model mapping, and deployment settings
+
+Fully-populated demo configs (multiple workflows, the haiku pipeline) live with the demos that
+use them in [`examples/agent-demos/`](examples/agent-demos/). The inference server is configured
+entirely by environment variables (see [`inference-server/README.md`](inference-server/README.md)).
 
 Clients read a `pixi_remote_config.toml` from the working directory for the server URL and
 bearer token; copy [`agent/pixi_remote_config.toml.example`](agent/pixi_remote_config.toml.example)
@@ -267,10 +281,11 @@ See [SECURITY.md](SECURITY.md) for the vulnerability-reporting process and a dep
 - **LZ4** - Compression
 - **PyYAML / tomli** - Configuration
 
-**Optional** (agent integrations, not required by the server or core clients):
+**Optional** (separate components, not required by the server or core clients):
 
-- **CrewAI** - multi-agent orchestration (used by the CrewAI integration/showcase only)
-- **transformers / PyTorch / accelerate** - local model inference
+- **FastAPI / aiohttp** - the `proxy/` API-compatibility layer
+- **transformers / PyTorch / accelerate** - the `inference-server/` model backend
+- **CrewAI** - multi-agent orchestration (the `agent/` engine + the CrewAI showcase)
 
 ## License
 

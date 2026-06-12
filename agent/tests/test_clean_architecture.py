@@ -113,10 +113,10 @@ def test_resolve_params_from_step_results(agent):
 
 
 def test_agent_config_yaml_loads_and_produces_server_configs():
-    config_path = AGENT_DIR / "agent_config.yaml"
+    config_path = AGENT_DIR / "agent_config.example.yaml"
     with open(config_path) as f:
         documents = list(yaml.safe_load_all(f))
-    assert documents, "agent_config.yaml should contain at least one document"
+    assert documents, "agent_config.example.yaml should contain at least one document"
 
     main_config = documents[0]
     assert "mcp" in main_config
