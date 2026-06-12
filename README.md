@@ -16,7 +16,7 @@ CLIENT LAYER                  SERVER LAYER              AGENT LAYER
 │ (full CLI,   │              │ (FastAPI)    │          │ (LLM backend)    │
 │  MCP-capable)│              │              │          └──────────────────┘
 └──────────────┘              │ - JWT Auth   │          ┌──────────────────┐
-┌──────────────┐              │ - AES-256    │          │ proxy_server     │
+┌──────────────┐              │ - AES-256    │          │ proxy.py         │
 │ simple_client│──Encrypted──▶│ - Task Mgmt  │          │ (API-compat layer)│
 │ (lightweight)│   Channel    │ - Streaming  │          └──────────────────┘
 └──────────────┘              │ - Compression│          ┌──────────────────┐
@@ -43,31 +43,33 @@ rixi/
 ├── server/              # FastAPI task execution server
 │   ├── rixi_server.py   # Main server: auth, encryption, task management
 │   └── pixi.toml        # Server dependencies
-├── clients/             # Client implementations
+├── clients/             # Runner clients
 │   ├── rixi_client.py        # Full-featured CLI client (MCP-capable)
 │   ├── rixi_simple_client.py # Lightweight client
-│   ├── main.py               # CrewAI showcase client
+│   ├── rixi_transport.py     # Shared transport (encryption, streaming, handshake)
 │   └── pixi.toml             # Client dependencies
 ├── agent/               # Agent framework, tools & inference
 │   ├── ai_agent_framework.py # Base agent/channel abstractions
-│   ├── client.py             # Standalone agent client utility
+│   ├── remote_channel.py     # Sync streaming channel to the server
+│   ├── aesgcm.py             # AES-GCM encrypt/decrypt helpers
 │   ├── mcp_agent.py          # Config-driven MCP agent with workflows
+│   ├── simple_agent.py       # Single-purpose agent
 │   ├── mcp_manager.py        # MCP server lifecycle manager
 │   ├── mcp_filesystem.py     # Filesystem tool server
 │   ├── mcp_web_search.py     # Web search tool server
 │   ├── inference_server.py   # Pluggable LLM inference backend
-│   ├── proxy_server.py       # API-compatibility proxy
-│   ├── enhanced_proxy_wrapper.py # Extended proxy with metrics
+│   ├── proxy.py              # API-compatibility proxy (OpenAI/Anthropic/Ollama)
+│   ├── api_formats.py        # Request/response format conversion used by the proxy
 │   ├── crewai_integration.py # CrewAI + MCP bridge
-│   ├── simple_agent.py       # Single-purpose agent
-│   ├── start_agent.py        # Agent entry point
-│   ├── start_agent_mcp.py    # MCP agent entry point
+│   ├── start_agent.py        # Single agent entry point / runner
 │   ├── *.yaml                # Sample configs (see Configuration)
-│   ├── examples/             # Standalone demo scripts (flask_service, main, …)
 │   ├── tests/                # pytest suite (run with `pixi run test`)
 │   └── pixi.toml             # Agent dependencies
-├── examples/
-│   └── hello/               # Minimal Pixi task used by the quickstart
+├── examples/            # Runnable demos (see examples/README.md)
+│   ├── hello/                # Minimal Pixi task used by the quickstart
+│   ├── crewai-showcase/      # Optional CrewAI + Ollama multi-agent showcase
+│   ├── http-backends/        # Example HTTP services for use behind the proxy
+│   └── agent-demos/          # Agent-framework launcher & comparison demos
 ├── install-rixi.sh      # One-command remote installer (Linux/macOS over SSH)
 ├── CONTRIBUTING.md      # Dev setup, tests, linting
 ├── SECURITY.md          # Vulnerability reporting & hardening guide
@@ -186,9 +188,9 @@ pixi run python rixi_simple_client.py --server http://localhost:9000
 ```
 
 The full client packages the **current directory** (which must be a Pixi project) and runs the
-named `--task` from its `pixi.toml` on the server. The CrewAI/LangChain showcase (`main.py`)
-lives in an optional `crewai` Pixi environment — install it with `pixi install -e crewai` — and
-isn't required for normal client use.
+named `--task` from its `pixi.toml` on the server. The CrewAI/LangChain showcase is **not**
+required for normal client use — it lives as a standalone, optional demo in
+[`examples/crewai-showcase/`](examples/crewai-showcase/).
 
 ### Agent Setup
 
@@ -196,21 +198,24 @@ isn't required for normal client use.
 cd agent
 pixi install
 
-# Start MCP-enabled agent
-pixi run python start_agent_mcp.py
-
-# Start basic agent
+# Run the agent (single entry point; defaults to agent_config.yaml)
 pixi run python start_agent.py
+
+# Run the API-compatibility proxy
+pixi run proxy
 ```
 
 ### Configuration
 
-Agent behavior is driven by YAML configuration files:
+Agent behavior is driven by YAML configuration files in `agent/`:
 
-- **`agent_config.yaml`** - MCP servers, workflows, and tool definitions
+- **`agent_config.yaml`** - MCP servers, workflows, and tool definitions (default for `start_agent.py`)
 - **`haiku_config.yaml`** - Haiku generation prompts and post-processors
-- **`mcp_config.yaml`** - MCP feature toggles
-- **`proxy_config.yaml`** - Enterprise proxy deployment templates
+- **`proxy_config.yaml`** - Proxy backends, model mapping, and deployment settings
+
+Clients read a `pixi_remote_config.toml` from the working directory for the server URL and
+bearer token; copy [`agent/pixi_remote_config.toml.example`](agent/pixi_remote_config.toml.example)
+and fill in real values (never commit them).
 
 ## Air-gapped / Offline Deployment
 

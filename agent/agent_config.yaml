@@ -165,7 +165,7 @@ workflows:
               max_lines: 5
 
 ---
-# haiku_agent_config.yaml - Haiku-specific configuration  
+# Second document: Haiku-specific configuration (same file, loaded via yaml.safe_load_all)
 agent:
   name: "HaikuAgent"
   description: "Specialized haiku generation agent"

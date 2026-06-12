@@ -3,8 +3,16 @@
 
 import asyncio
 import base64
+import os
+import sys
 import time
 from pathlib import Path
+
+# This demo drives the agent framework, which lives in agent/ and uses bare imports.
+_AGENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "agent")
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
+_HAIKU_CONFIG = os.path.join(_AGENT_DIR, "haiku_config.yaml")
 
 async def demo_your_native_platform(task_id: str, aes_key: bytes):
     """Demonstrate your native platform capabilities"""
@@ -23,7 +31,7 @@ async def demo_your_native_platform(task_id: str, aes_key: bytes):
         
         # Test with real MCP tools
         result = await runner.run_with_config(
-            "haiku_config.yaml",
+            _HAIKU_CONFIG,
             {
                 "topic": "quantum computing",
                 "output_file": "native_quantum_haiku.txt",

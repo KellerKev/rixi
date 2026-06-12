@@ -13,6 +13,15 @@ cd server   # or clients/ or agent/
 pixi install
 ```
 
+The three components have **no cross-directory imports** and each is deployed on its own.
+Modules within `agent/` and `clients/` import their siblings **bare** (e.g.
+`from mcp_manager import ...`) and run with the working directory set to the component dir —
+keep new modules in the same directory and importable that way; do not introduce packages or
+relative imports.
+
+Runnable demos live under [`examples/`](examples/) (one subdirectory per demo, several with
+their own `pixi.toml`); see [`examples/README.md`](examples/README.md).
+
 ## Tests
 
 Tests live in `agent/tests/` and use pytest:

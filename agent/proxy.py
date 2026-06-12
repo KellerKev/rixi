@@ -31,6 +31,7 @@ import statistics
 import uvicorn
 import jwt
 import yaml  # Use YAML instead of TOML
+from api_formats import to_internal, from_internal
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -877,269 +878,11 @@ class ProxyServer:
     
     def _convert_to_internal_format(self, request_data: Dict[str, Any], api_format: str) -> Dict[str, Any]:
         """Convert API format to internal format"""
-        if api_format == "openai":
-            messages = request_data.get("messages", [])
-            if messages:
-                prompt_parts = []
-                for msg in messages:
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    if role == "system":
-                        prompt_parts.append(f"System: {content}")
-                    elif role == "user":
-                        prompt_parts.append(f"User: {content}")
-                    elif role == "assistant":
-                        prompt_parts.append(f"Assistant: {content}")
-                
-                prompt = "\n".join(prompt_parts)
-                if not prompt.endswith("Assistant:"):
-                    prompt += "\nAssistant:"
-            else:
-                prompt = "User: Hello\nAssistant:"
-            
-            # Map model name
-            requested_model = request_data.get("model", "gpt-3.5-turbo")
-            mapped_model, is_available = self.map_model_name(requested_model)
-            
-            return {
-                "command": "generate",
-                "prompt": prompt,
-                "model": mapped_model,
-                "model_available": is_available,
-                "original_model": requested_model,
-                "temperature": request_data.get("temperature", 0.7),
-                "max_tokens": request_data.get("max_tokens"),
-                "stream": request_data.get("stream", False)
-            }
-        
-        elif api_format == "openai_responses":
-            # OpenAI Responses API format
-            requested_model = request_data.get("model", "gpt-3.5-turbo")
-            mapped_model, is_available = self.map_model_name(requested_model)
-            
-            # Handle input field
-            input_text = request_data.get("input", "Hello")
-            prompt = f"User: {input_text}\nAssistant:"
-            
-            return {
-                "command": "generate",
-                "prompt": prompt,
-                "model": mapped_model,
-                "model_available": is_available,
-                "original_model": requested_model,
-                "temperature": request_data.get("temperature", 0.7),
-                "max_tokens": request_data.get("max_tokens"),
-                "stream": request_data.get("stream", False),
-                "previous_response_id": request_data.get("previous_response_id"),
-                "tools": request_data.get("tools", [])
-            }
-        
-        elif api_format == "anthropic":
-            messages = request_data.get("messages", [])
-            if messages:
-                prompt_parts = []
-                for msg in messages:
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        prompt_parts.append(f"Human: {content}")
-                    elif role == "assistant":
-                        prompt_parts.append(f"Assistant: {content}")
-                
-                prompt = "\n".join(prompt_parts)
-                if not prompt.endswith("Assistant:"):
-                    prompt += "\nAssistant:"
-            else:
-                prompt = "Human: Hello\nAssistant:"
-            
-            requested_model = request_data.get("model", "claude-3-sonnet-20240229")
-            mapped_model, is_available = self.map_model_name(requested_model)
-            
-            return {
-                "command": "generate",
-                "prompt": prompt,
-                "model": mapped_model,
-                "model_available": is_available,
-                "original_model": requested_model,
-                "temperature": request_data.get("temperature", 0.7),
-                "max_tokens": request_data.get("max_tokens", 1000),
-                "stream": request_data.get("stream", False)
-            }
-        
-        elif api_format == "ollama_generate":
-            # Ollama Generate API format
-            requested_model = request_data.get("model", "llama2")
-            mapped_model, is_available = self.map_model_name(requested_model)
-            
-            prompt = request_data.get("prompt", "Hello")
-            system_msg = request_data.get("system")
-            
-            # Add system message if present
-            if system_msg:
-                prompt = f"System: {system_msg}\nUser: {prompt}\nAssistant:"
-            else:
-                prompt = f"User: {prompt}\nAssistant:"
-            
-            return {
-                "command": "generate",
-                "prompt": prompt,
-                "model": mapped_model,
-                "model_available": is_available,
-                "original_model": requested_model,
-                "suffix": request_data.get("suffix"),
-                "system": system_msg,
-                "template": request_data.get("template"),
-                "options": request_data.get("options", {}),
-                "stream": request_data.get("stream", True),
-                "raw": request_data.get("raw", False),
-                "keep_alive": request_data.get("keep_alive", "5m")
-            }
-        
-        elif api_format == "ollama_chat":
-            # Ollama Chat API format
-            messages = request_data.get("messages", [])
-            requested_model = request_data.get("model", "llama2")
-            mapped_model, is_available = self.map_model_name(requested_model)
-            
-            if messages:
-                prompt_parts = []
-                for msg in messages:
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    if role == "system":
-                        prompt_parts.append(f"System: {content}")
-                    elif role == "user":
-                        prompt_parts.append(f"User: {content}")
-                    elif role == "assistant":
-                        prompt_parts.append(f"Assistant: {content}")
-                
-                prompt = "\n".join(prompt_parts)
-                if not prompt.endswith("Assistant:"):
-                    prompt += "\nAssistant:"
-            else:
-                prompt = "User: Hello\nAssistant:"
-            
-            return {
-                "command": "generate",
-                "prompt": prompt,
-                "model": mapped_model,
-                "model_available": is_available,
-                "original_model": requested_model,
-                "options": request_data.get("options", {}),
-                "stream": request_data.get("stream", True),
-                "tools": request_data.get("tools", []),
-                "keep_alive": request_data.get("keep_alive", "5m")
-            }
-        
-        else:  # generic/passthrough
-            requested_model = request_data.get("model", "default")
-            mapped_model, is_available = self.map_model_name(requested_model)
-            
-            return {
-                "command": "generate",
-                "prompt": request_data.get("prompt", "Hello"),
-                "model": mapped_model,
-                "model_available": is_available,
-                "original_model": requested_model,
-                **(request_data.get("parameters", {}))
-            }
-    
+        return to_internal(request_data, api_format, map_model=self.map_model_name)
+
     def _convert_from_internal_format(self, response_data: Dict[str, Any], api_format: str) -> Dict[str, Any]:
         """Convert internal response to API format"""
-        content = response_data.get("response", "")
-        
-        if api_format == "openai":
-            return {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": response_data.get("original_model", "gpt-3.5-turbo"),
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
-                }
-            }
-        
-        elif api_format == "openai_responses":
-            # OpenAI Responses API format
-            return {
-                "id": f"resp_{uuid.uuid4().hex[:24]}",
-                "object": "response",
-                "created": int(time.time()),
-                "model": response_data.get("original_model", "gpt-3.5-turbo"),
-                "status": "completed",
-                "output": [{"type": "text", "text": content}],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
-                }
-            }
-        
-        elif api_format == "anthropic":
-            return {
-                "id": f"msg_{uuid.uuid4().hex[:8]}",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": content}],
-                "model": response_data.get("original_model", "claude-3-sonnet"),
-                "stop_reason": "end_turn",
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0
-                }
-            }
-        
-        elif api_format == "ollama_generate":
-            return {
-                "model": response_data.get("original_model", "llama2"),
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.%fZ", time.gmtime()),
-                "response": content,
-                "done": True,
-                "done_reason": "stop",
-                "context": [],
-                "total_duration": 0,
-                "load_duration": 0,
-                "prompt_eval_count": 0,
-                "prompt_eval_duration": 0,
-                "eval_count": 0,
-                "eval_duration": 0
-            }
-        
-        elif api_format == "ollama_chat":
-            return {
-                "model": response_data.get("original_model", "llama2"),
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.%fZ", time.gmtime()),
-                "message": {
-                    "role": "assistant",
-                    "content": content
-                },
-                "done": True,
-                "done_reason": "stop",
-                "total_duration": 0,
-                "load_duration": 0,
-                "prompt_eval_count": 0,
-                "prompt_eval_duration": 0,
-                "eval_count": 0,
-                "eval_duration": 0
-            }
-        
-        else:  # generic
-            return {
-                "response": content,
-                "model": response_data.get("original_model", "default"),
-                "timestamp": time.time()
-            }
+        return from_internal(response_data, api_format)
     
     async def handle_request(self, request_data: Dict[str, Any], api_format: str) -> Dict[str, Any]:
         """Handle non-streaming request"""
@@ -1831,7 +1574,122 @@ proxy_available_models {len(proxy.available_models)}
                 }
             }
         }
-    
+
+    # ─────────────── Static Compatibility Routes ─────────────────
+
+    @app.get("/v1/models")
+    async def openai_list_models():
+        """OpenAI Models API"""
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": "gpt-3.5-turbo",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "proxy-server"
+                },
+                {
+                    "id": "gpt-4",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "proxy-server"
+                }
+            ]
+        }
+
+    @app.get("/v1/responses/{response_id}")
+    async def openai_responses_retrieve(response_id: str):
+        """OpenAI Responses API - Retrieve Response"""
+        return JSONResponse({
+            "id": response_id,
+            "object": "response",
+            "created": int(time.time()),
+            "model": "gpt-3.5-turbo",
+            "status": "completed",
+            "output": [{"type": "text", "text": "Retrieved response content"}],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
+        })
+
+    @app.delete("/v1/responses/{response_id}")
+    async def openai_responses_delete(response_id: str):
+        """OpenAI Responses API - Delete Response"""
+        return JSONResponse({
+            "id": response_id,
+            "object": "response.deleted",
+            "deleted": True
+        })
+
+    @app.get("/api/tags")
+    async def ollama_list_models():
+        """Ollama List Models API"""
+        return {
+            "models": [
+                {
+                    "name": "llama2:latest",
+                    "modified_at": "2024-01-01T00:00:00.000000000Z",
+                    "size": 3825819519,
+                    "digest": "sha256:abc123def456",
+                    "details": {
+                        "format": "gguf",
+                        "family": "llama",
+                        "parameter_size": "7B",
+                        "quantization_level": "Q4_0"
+                    }
+                },
+                {
+                    "name": "llama2:13b",
+                    "modified_at": "2024-01-01T00:00:00.000000000Z",
+                    "size": 7365960935,
+                    "digest": "sha256:def456ghi789",
+                    "details": {
+                        "format": "gguf",
+                        "family": "llama",
+                        "parameter_size": "13B",
+                        "quantization_level": "Q4_0"
+                    }
+                }
+            ]
+        }
+
+    @app.post("/api/show")
+    async def ollama_show_model(request: Dict[str, str]):
+        """Ollama Show Model API"""
+        model_name = request.get("name", "llama2")
+        return {
+            "license": "LLAMA 2 COMMUNITY LICENSE AGREEMENT",
+            "modelfile": f"# Modelfile generated by Ollama\nFROM /path/to/{model_name}\n",
+            "parameters": "num_ctx 2048\nstop \"<|im_end|>\"\nstop \"<|im_start|>\"",
+            "template": "{{ if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{ end }}{{ if .Prompt }}<|im_start|>user\n{{ .Prompt }}<|im_end|>\n{{ end }}<|im_start|>assistant\n",
+            "details": {
+                "format": "gguf",
+                "family": "llama",
+                "families": ["llama"],
+                "parameter_size": "7B",
+                "quantization_level": "Q4_0"
+            }
+        }
+
+    @app.post("/generate", dependencies=[Depends(verify_api_key)])
+    async def generic_generate_short(request: GenericRequest):
+        """Generic generation endpoint"""
+        request_dict = request.model_dump()
+        return await proxy.handle_request(request_dict, "generic")
+
+    @app.post("/stream", dependencies=[Depends(verify_api_key)])
+    async def generic_stream(request: GenericRequest):
+        """Generic streaming endpoint"""
+        request_dict = request.model_dump()
+        return StreamingResponse(
+            proxy.handle_streaming_request(request_dict, "generic"),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"}
+        )
+
     return app
 
 # ─────────────────────────── Main Function ──────────────────────────────────
@@ -1847,7 +1705,14 @@ def main():
     parser.add_argument("--backend", help="Backend URL")
     parser.add_argument("--api-key", help="Required API key for authentication")
     parser.add_argument("--aes-key", help="AES key file path for encryption")
-    
+
+    # Single-backend shorthand (build a one-backend config when --config absent)
+    parser.add_argument("--inference-task", help="Remote inference task ID")
+    parser.add_argument("--server", default="http://localhost:9000", help="Pixi runner server URL")
+    parser.add_argument("--auth-token", help="Authentication token for backend communication")
+    parser.add_argument("--mode", choices=["openai", "anthropic", "generic"],
+                       help="API compatibility mode (accepted for compatibility; all APIs are served)")
+
     # NEW: Response handling options
     parser.add_argument("--no-decrypt", action="store_true", 
                        help="Disable automatic decryption of AES-encrypted responses")
@@ -1868,16 +1733,28 @@ def main():
     else:
         config = create_default_config()
         logger.info("Using default configuration")
-    
+
+    if args.mode:
+        logger.info(f"Mode '{args.mode}' requested; all API formats are served regardless")
+
     # Apply command line overrides
-    if args.backend:
+    backend_url = args.backend
+    if not backend_url and args.inference_task:
+        backend_url = f"{args.server.rstrip('/')}/task/{args.inference_task}"
+
+    if backend_url:
         config["backends"] = [{
             "id": "backend1",
-            "url": args.backend,
+            "url": backend_url,
             "weight": 1
         }]
-        logger.info(f"Using backend: {args.backend}")
-    
+        logger.info(f"Using backend: {backend_url}")
+
+    if args.auth_token:
+        config["auth_headers"] = dict(config.get("auth_headers") or {})
+        config["auth_headers"]["Authorization"] = f"Bearer {args.auth_token}"
+        logger.info("Backend auth token configured")
+
     if args.api_key:
         config["authentication"]["require_api_key"] = True
         config["authentication"]["api_key"] = args.api_key

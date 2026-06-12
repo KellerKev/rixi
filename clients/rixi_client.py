@@ -41,9 +41,12 @@ from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
 
 # Cryptography imports
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from rixi_transport import (
+    Transport, NONCE_LEN, STREAM_TIMEOUT, _http, _http_session, _hdrs,
+    _write_secret_file,
+)
 
 # Optional aiohttp import for external MCP servers
 try:
@@ -54,31 +57,8 @@ except ImportError:
     print("⚠️ aiohttp not available - external MCP server routing will be disabled")
     print("💡 Install with: pip install aiohttp")
 
-# Global state (matching original client.py)
-NONCE_LEN = 12
-current_task_id: Optional[str] = None
-server_url: str = "http://localhost:9000"
-aes_key: Optional[bytes] = None
-_auth_headers: Dict[str, str] = {}
-
-# HTTP defaults: (connect timeout, read timeout); streaming reads may block indefinitely
-CONNECT_TIMEOUT = 10
-DEFAULT_TIMEOUT = (CONNECT_TIMEOUT, 30)
-STREAM_TIMEOUT = (CONNECT_TIMEOUT, None)
-
-_http_session = requests.Session()
-
-
-def _http(method: str, url: str, *, timeout=DEFAULT_TIMEOUT, **kwargs):
-    """Issue an HTTP request through the shared session with a default timeout."""
-    return _http_session.request(method, url, timeout=timeout, **kwargs)
-
-
-def _write_secret_file(path: str, data: str):
-    """Write a secret file with owner-only permissions (0600)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(data)
+# Shared connection state used by the transport layer and signal handler
+transport = Transport()
 
 
 def load_pixi_config() -> Dict[str, Any]:
@@ -106,14 +86,6 @@ def load_pixi_config() -> Dict[str, Any]:
     except Exception as e:
         print(f"⚠️ Could not load config: {e}")
         return {}
-
-
-def _hdrs(bearer: str|None, snowflake: str|None) -> Dict[str, str]:
-    """Create authentication headers (matching original)"""
-    h: Dict[str, str] = {}
-    if snowflake: h["Authorization"] = f'Snowflake Token="{snowflake}"'
-    elif bearer:  h["Authorization"] = f"Bearer {bearer}"
-    return h
 
 
 def _get_env_server_url() -> Optional[str]:
@@ -504,164 +476,34 @@ def _show_package_stats(package_stats: dict, offline_mode: bool, package_path: s
         print(f"  🌐 Mode: Online (dependencies will be downloaded)")
 
 
-def _dec(chunk: bytes) -> str:
-    """Decrypt chunk if AES key available (matching original)"""
-    if aes_key is None:
-        return chunk.decode("utf-8", "ignore")
-    return AESGCM(aes_key).decrypt(chunk[:NONCE_LEN], chunk[NONCE_LEN:], None).decode(
-        "utf-8", "ignore"
-    )
-
-
-# JSON processing (matching original)
-_decoder = json.JSONDecoder()
-
-def _push_buffer(text: str, on_obj=None):
-    """Pull one JSON object from the beginning of text and handle it"""
-    text = text.lstrip()
-    if not text:
-        return ""
-    try:
-        obj, idx = _decoder.raw_decode(text)
-    except json.JSONDecodeError:
-        return text            # need more bytes
-    (on_obj or _handle_obj)(obj)
-    return text[idx:]          # remainder
-
-
 def _handle_obj(obj: dict):
-    """Handle JSON object from server response (matching original)"""
-    global current_task_id
-    if obj.get("task_id") and obj["task_id"] != current_task_id:
-        current_task_id = obj["task_id"]
-        print(f"\nTask ID: {current_task_id}\n")
-    if "status" in obj:  print("Status:", obj["status"])
-    if "output" in obj:  print(obj["output"], end="")
-    if "stderr" in obj:  print(obj["stderr"], end="")
-    if "error"  in obj:  print("Error:", obj["error"])
-
-
-def _consume_stream(resp, on_obj=None):
-    """Consume streaming response with frame decryption (matching original)"""
-    buf = b""
-    need = None
-
-    for chunk in resp.iter_content(chunk_size=4096):
-        buf += chunk
-        while True:
-            if need is None:
-                if len(buf) < 4:
-                    break
-                need = int.from_bytes(buf[:4], "big")
-                buf = buf[4:]
-            if len(buf) < need:
-                break
-
-            enc, buf = buf[:need], buf[need:]
-            need = None
-            try:
-                plain = _dec(enc)
-            except Exception as exc:
-                print("Decrypt error:", exc)
-                continue
-
-            # push through JSON peeler
-            plain_buf = plain
-            while plain_buf:
-                plain_buf = _push_buffer(plain_buf, on_obj)
+    """Handle JSON object from server response (delegates to shared transport)"""
+    transport._handle_obj(obj)
 
 
 def _upload_and_run(pkg, task, headers, env_handler=None, on_obj=None):
-    """FIXED: Upload package and run task with environment support"""
-    try:
-        with open(pkg, "rb") as fh:
-            files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
-            data  = {"task_name": task, "keep_alive": "true"}
-            with _http("POST", f"{server_url}/upload", files=files, data=data, headers=headers,
-                       stream=True, timeout=STREAM_TIMEOUT) as r:
-                if r.status_code != 200:
-                    print("Error:", r.status_code, r.text)
-                    return
-                _consume_stream(r, on_obj)
-    finally:
-        os.unlink(pkg)
+    """Upload package and run task (delegates to shared transport)"""
+    transport._upload_and_run(pkg, task, headers, on_obj=on_obj)
 
 
 def _attach_stream_only(tid: str, headers):
-    """Attach to running task - live stream only (no duplicate recent_output)"""
-    with _http(
-        "GET", f"{server_url}/task/{tid}/stream", headers=headers, stream=True, timeout=STREAM_TIMEOUT
-    ) as resp:
-        if resp.status_code != 200:
-            print("Error:", resp.status_code, resp.text)
-            return
-        _consume_stream(resp)
+    """Attach to running task - live stream only (delegates to shared transport)"""
+    transport._attach_stream_only(tid, headers)
 
 
 def _attach(tid: str, headers):
-    """Attach to running task - stream only to avoid duplicated backlog output"""
-    _attach_stream_only(tid, headers)
+    """Attach to running task - stream only (delegates to shared transport)"""
+    transport._attach(tid, headers)
 
 
 def _attach_history(tid: str, headers):
-    """Attach with full history - print backlog once, then live-stream"""
-    # ➊ backlog
-    r = _http("GET", f"{server_url}/task/{tid}", headers=headers)
-    if r.status_code == 200:
-        info = r.json()
-        for entry in info.get("recent_output", []):
-            if entry["type"] in {"output", "stderr"}:
-                print(entry["content"], end="")
-            elif entry["type"] == "error":
-                print("Error:", entry["content"])
-            elif entry["type"] == "status":
-                print("Status:", entry["content"])
-
-    # ➋ live follow
-    _attach_stream_only(tid, headers)
+    """Attach with full history (delegates to shared transport)"""
+    transport._attach_history(tid, headers)
 
 
 def perform_handshake(secret: str, rotate: bool):
-    """Perform handshake to get AES key (matching original)"""
-    data = {"secret": secret, "rotate": rotate}
-    r = _http("POST", f"{server_url}/handshake", json=data, headers=_auth_headers)
-    if r.status_code != 200:
-        # Better error handling for handshake limits
-        if r.status_code == 403:
-            error_msg = r.json().get("error", r.text) if r.text else "Forbidden"
-            if "limit" in error_msg.lower():
-                print(f"❌ Handshake failed: {error_msg}")
-                print("💡 Try again later or use existing aes.key file")
-                sys.exit(1)
-        print("Handshake step-1 failed:", r.text)
-        sys.exit(1)
-    pub_pem = r.json()["public_key"]
-
-    # generate AES key + new rotation secret
-    new_aes = os.urandom(32)
-    new_rot = os.urandom(32)
-
-    pub_key = serialization.load_pem_public_key(pub_pem.encode())
-    blob = new_aes + new_rot
-    cipher = base64.b64encode(
-        pub_key.encrypt(
-            blob,
-            padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),
-                         algorithm=hashes.SHA256(), label=None)
-        )
-    ).decode()
-
-    r2 = _http("POST", f"{server_url}/handshake/finish", json={"cipher": cipher},
-               headers=_auth_headers)
-    if r2.status_code != 200:
-        print("Handshake step-2 failed:", r2.text)
-        sys.exit(1)
-
-    # persist to local file (owner-only permissions)
-    _write_secret_file("aes.key", base64.b64encode(new_aes).decode())
-    _write_secret_file("rotation.secret", base64.b64encode(new_rot).decode())
-    print("Handshake successful – AES key saved (base64)")
-    return new_aes, new_rot
+    """Perform handshake to get AES key (delegates to shared transport)"""
+    return transport.perform_handshake(secret, rotate)
 
 
 def get_auto_approve_setting(cli_auto_approve: bool, config: Dict[str, Any]) -> bool:
@@ -687,9 +529,8 @@ def get_auto_approve_setting(cli_auto_approve: bool, config: Dict[str, Any]) -> 
 # ───────────────────────── Ctrl-C menu (MATCHING ORIGINAL) ────────────────────────────────────
 def _signal_handler(sig, frame):
     """Interactive signal handler with full menu (matching original)"""
-    global current_task_id
-    if current_task_id is None:
-        print("\nExiting..."); 
+    if transport.task_id is None:
+        print("\nExiting...");
         sys.exit(0)
 
     print("\nInterrupted! Choose:")
@@ -705,18 +546,18 @@ def _signal_handler(sig, frame):
         print("\nExiting.")
         sys.exit(0)
 
-    hdr = _auth_headers
+    hdr = transport.auth_headers
     if choice == "1":
-        _http("DELETE", f"{server_url}/task/{current_task_id}", headers=hdr)
+        _http("DELETE", f"{transport.server_url}/task/{transport.task_id}", headers=hdr)
         print("Task terminated.")
         sys.exit(0)
 
     if choice == "2":
-        print(f"Task {current_task_id} left running.")
+        print(f"Task {transport.task_id} left running.")
         sys.exit(0)
 
     if choice == "3":
-        _http("POST", f"{server_url}/task/{current_task_id}/restart", headers=hdr)
+        _http("POST", f"{transport.server_url}/task/{transport.task_id}/restart", headers=hdr)
         print("Task restarted.")
         sys.exit(0)
 
@@ -725,16 +566,16 @@ def _signal_handler(sig, frame):
         try:
             with open(pkg, "rb") as fh:
                 files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
-                _http("POST", f"{server_url}/task/{current_task_id}/redeploy", headers=hdr, files=files)
+                _http("POST", f"{transport.server_url}/task/{transport.task_id}/redeploy", headers=hdr, files=files)
         finally:
             os.unlink(pkg)
         print("Task redeployed.")
         sys.exit(0)
 
     if choice == "6":
-        _http("POST", f"{server_url}/task/{current_task_id}/restart", headers=hdr)
+        _http("POST", f"{transport.server_url}/task/{transport.task_id}/restart", headers=hdr)
         print("Task restarting...")
-        _attach(current_task_id, _auth_headers)
+        _attach(transport.task_id, transport.auth_headers)
         return
 
     print("Continuing...")  # choice == "5"
@@ -2282,33 +2123,31 @@ class OneStepPixiClient:
         
     def _setup_encryption(self) -> bool:
         """Setup AES encryption via handshake or key file (only once)"""
-        global aes_key  # Update global for signal handler compatibility
-        
         if self._encryption_setup_done:
             print("🔐 Encryption already configured")
             return True
-            
+
         print("📋 Step 0: Setting up encryption...")
-        
-        # Check if encryption was already set up in main() via global aes_key
-        if aes_key is not None:
+
+        # Check if encryption was already set up in main() via transport.aes_key
+        if transport.aes_key is not None:
             print("✅ Using AES key from previous handshake/setup")
-            self.aes_key_bytes = aes_key
+            self.aes_key_bytes = transport.aes_key
             self._encryption_setup_done = True
             return True
-        
+
         # Option 1: Handshake (preferred) - only if not already done
         if self.handshake_secret:
             try:
                 self.aes_key_bytes, _ = perform_handshake(self.handshake_secret, rotate=False)
-                aes_key = self.aes_key_bytes  # Update global
+                transport.aes_key = self.aes_key_bytes  # Update shared state
                 print("✅ AES key obtained via handshake")
                 self._encryption_setup_done = True
                 return True
             except Exception as e:
                 print(f"❌ Handshake failed: {e}")
                 return False
-        
+
         # Option 2: Key file
         if self.aes_key_file:
             try:
@@ -2320,8 +2159,8 @@ class OneStepPixiClient:
                     self.aes_key_bytes = raw
                 if len(self.aes_key_bytes) != 32:
                     raise ValueError(f"Invalid AES key length: {len(self.aes_key_bytes)}")
-                    
-                aes_key = self.aes_key_bytes  # Update global
+
+                transport.aes_key = self.aes_key_bytes  # Update shared state
                 print("✅ AES key loaded from file")
                 self._encryption_setup_done = True
                 return True
@@ -2336,12 +2175,10 @@ class OneStepPixiClient:
     
     def deploy_task_with_full_features(self, task_name: str, full_config: Dict[str, Any], offline_mode: bool = False) -> str:
         """Deploy task with MCP + Proxy + Environment + Offline + Auto-approve support"""
-        global current_task_id, server_url, _auth_headers
-        
-        # Update globals for signal handler compatibility
-        server_url = self.server_url
-        _auth_headers = self.auth_headers
-        
+        # Update shared state for signal handler compatibility
+        transport.server_url = self.server_url
+        transport.auth_headers = self.auth_headers
+
         # Step 0: Setup encryption (only once)
         if not self._setup_encryption():
             raise Exception("Failed to setup encryption")
@@ -2480,7 +2317,7 @@ class OneStepPixiClient:
                         on_obj=capture_task_id)
 
         # Use captured task ID or fallback
-        self.task_id = task_id_holder["task_id"] or current_task_id or f"{task_name}-{int(time.time())}"
+        self.task_id = task_id_holder["task_id"] or transport.task_id or f"{task_name}-{int(time.time())}"
         
         # Step 4: Start MCP + Proxy listener with automation support
         print("📋 Step 4: Starting MCP back-channel + HTTP proxy listener...")
@@ -2501,12 +2338,10 @@ class OneStepPixiClient:
     
     def deploy_task_standard(self, task_name: str, full_config: Dict[str, Any], offline_mode: bool = False) -> str:
         """Deploy task without MCP/Proxy but with environment injection, offline support, and auto-approve"""
-        global current_task_id, server_url, _auth_headers
-        
-        # Update globals for signal handler compatibility
-        server_url = self.server_url
-        _auth_headers = self.auth_headers
-        
+        # Update shared state for signal handler compatibility
+        transport.server_url = self.server_url
+        transport.auth_headers = self.auth_headers
+
         # Setup encryption (only once)
         if not self._setup_encryption():
             raise Exception("Failed to setup encryption")
@@ -2535,8 +2370,8 @@ class OneStepPixiClient:
                           offline_mode=offline_mode,
                           auto_approve=self.auto_approve)
         _upload_and_run(pkg, task_name, self.auth_headers, self.environment_handler)
-        
-        self.task_id = current_task_id
+
+        self.task_id = transport.task_id
         return self.task_id or f"{task_name}-{int(time.time())}"
     
     def _create_mcp_config(self, full_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -3013,8 +2848,8 @@ class OneStepPixiClient:
 
 def main():
     """Enhanced main function with full feature parity + HTTP Proxy + FIXED AUTO-EXIT + FIXED Environment Injection + Config-based Test Server Control + OFFLINE DEPLOYMENT + AUTO-APPROVE"""
-    global server_url, aes_key, _auth_headers
-    
+    aes_key: Optional[bytes] = None
+
     # Load configuration from pixi_remote_config.toml (matching original)
     cfg = load_pixi_config()
     
@@ -3082,6 +2917,7 @@ def main():
     server_url_resolved, server_source = _resolve_server_url(args.server, cfg, args.bearer_token,
                                                              allow_token_url=args.server_from_token)
     server_url = server_url_resolved
+    transport.server_url = server_url
 
     # Quick preflight: validate URL and check TCP reachability before doing anything heavy
     # Allow --show-config, --show-package-size or --skip-offline-check to bypass reachability requirement
@@ -3126,7 +2962,8 @@ def main():
     )
 
     _auth_headers = _hdrs(bearer_token, snowflake_token)
-    
+    transport.auth_headers = _auth_headers
+
     if args.help_proxy:
         print("🌐 HTTP Proxy Help")
         print("=" * 50)
@@ -3458,7 +3295,10 @@ actions = ["sql_*", "schema_*"]
     # ➌ Final fallback for other key files without handshake
     elif aes_key is None and args.aes_key:
         print(f"⚠️ AES key file {args.aes_key} not found - no encryption available")
-    
+
+    # Sync resolved key into shared state for the transport + signal handler
+    transport.aes_key = aes_key
+
     # ─── run / attach as normal (matching original) ─────────────────────────────────────────
     if args.attach_history:
         _attach_history(args.attach_history, _auth_headers)

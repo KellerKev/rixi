@@ -24,6 +24,11 @@ import base64
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+# This demo drives the agent framework, which lives in agent/ and uses bare imports.
+_AGENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "agent")
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
+
 # Platform availability checks
 PLATFORM_AVAILABLE = {
     "crewai": False,

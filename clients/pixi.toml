@@ -1,13 +1,13 @@
 [project]
 name = "rixi-clients"
 version = "0.1.0"
-description = "RIXI client implementations (CLI clients + CrewAI showcase)"
+description = "RIXI runner clients (full + lightweight CLI)"
 authors = ["Kevin Keller <kellerkev@gmail.com>"]
-channels = ["conda-forge", "pytorch"]
+channels = ["conda-forge"]
 platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
 
 [dependencies]
-python = ">=3.9"
+python = ">=3.10"
 pip = "*"
 requests = "*"
 pyyaml = "*"
@@ -16,34 +16,3 @@ cryptography = "*"
 pydantic = ">=2.0"
 lz4 = ">=4.4.4,<5"
 pyjwt = "*"
-
-[feature.crewai.dependencies]
-python = ">=3.10,<3.13"
-
-[feature.crewai.pypi-dependencies]
-crewai = "*"
-ollama = "*"
-langchain = "*"
-langchain-community = "*"
-langchain-ollama = "*"
-
-[environments]
-crewai = ["crewai"]
-
-[tasks]
-# Development tasks
-test = "python -m pytest tests/ -v"
-
-[feature.crewai.tasks]
-dev = "python main.py"
-
-# Demo tasks for showcasing different capabilities
-demo-research = "python main.py --task research --topic 'artificial intelligence trends'"
-demo-content = "python main.py --task content --topic 'sustainable technology'"
-demo-analysis = "python main.py --task analysis --file data.txt"
-
-# Server execution tasks
-run-research = "python main.py --task research --topic 'quantum computing' --output results.txt"
-run-content = "python main.py --task content --topic 'AI ethics' --output content.md"
-run-analysis = "python main.py --task analysis --file input.csv --output analysis.json"
-demo-research-mcp = "python main.py --task research --topic 'artificial intelligence trends' --output research_with_mcp.md"

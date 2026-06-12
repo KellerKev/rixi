@@ -1,0 +1,33 @@
+[project]
+name = "rixi-crewai-showcase"
+version = "0.1.0"
+description = "Optional CrewAI + Ollama multi-agent showcase (not required by the core RIXI clients)"
+authors = ["Kevin Keller <kellerkev@gmail.com>"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+
+[dependencies]
+python = ">=3.10,<3.13"
+requests = "*"
+pyyaml = "*"
+
+[pypi-dependencies]
+crewai = "*"
+ollama = "*"
+langchain = "*"
+langchain-community = "*"
+langchain-ollama = "*"
+
+[tasks]
+dev = "python showcase.py"
+
+# Demo tasks for showcasing different capabilities
+demo-research = "python showcase.py --task research --topic 'artificial intelligence trends'"
+demo-content = "python showcase.py --task content --topic 'sustainable technology'"
+demo-analysis = "python showcase.py --task analysis --file data.txt"
+
+# Server execution tasks
+run-research = "python showcase.py --task research --topic 'quantum computing' --output results.txt"
+run-content = "python showcase.py --task content --topic 'AI ethics' --output content.md"
+run-analysis = "python showcase.py --task analysis --file input.csv --output analysis.json"
+demo-research-mcp = "python showcase.py --task research --topic 'artificial intelligence trends' --output research_with_mcp.md"
