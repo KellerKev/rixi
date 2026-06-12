@@ -1,0 +1,68 @@
+# ============================================================================
+# PRODUCTION DEPLOYMENT CONFIGURATIONS
+# Complete enterprise-ready deployment templates
+# ============================================================================
+
+# proxy_config.yaml - Enhanced Proxy Server Configuration
+---
+version: "2.0.0"
+description: "Enterprise Inference Proxy Configuration"
+
+# Backend Configuration
+backends:
+  - id: "primary_inference"
+    url: "http://inference-server-1:9000/task/inference-primary"
+    weight: 3
+    description: "Primary inference backend with high-end hardware"
+  
+  - id: "secondary_inference"
+    url: "http://inference-server-2:9000/task/inference-secondary"
+    weight: 2
+    description: "Secondary inference backend"
+  
+  - id: "fallback_inference"
+    url: "http://inference-server-3:9000/task/inference-fallback"
+    weight: 1
+    description: "Fallback inference backend"
+
+# Caching Configuration
+cache_max_size: 10000
+cache_ttl_seconds: 7200  # 2 hours
+
+# Security Configuration
+require_api_key: true
+api_key: "${PROXY_API_KEY}"  # Set via environment variable
+cors_origins:
+  - "https://your-frontend-domain.com"
+  - "https://api.your-company.com"
+
+# Available Models
+available_models:
+  - "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  - "gpt-3.5-turbo"
+  - "gpt-4"
+  - "claude-3-sonnet"
+  - "llama2:7b"
+  - "llama2:13b"
+
+# Encryption (if using AES)
+aes_key_file: "aes.key"
+
+# Authentication headers for backend communication
+auth_headers:
+  Authorization: "Bearer ${BACKEND_API_KEY}"
+  X-Proxy-Version: "2.0.0"
+
+# Logging and Monitoring
+logging:
+  level: "INFO"
+  file: "/var/log/proxy/proxy.log"
+  max_size_mb: 100
+  backup_count: 5
+
+monitoring:
+  enable_metrics: true
+  metrics_port: 9090
+  health_check_interval: 30
+  enable_tracing: true
+

@@ -1,0 +1,6 @@
+[config]
+#server-url = "http://localhost:9000"
+server-url = "http://YOUR_SERVER_HOST:9000"
+# Auth token — DO NOT commit real values. Provide via env var or a local,
+# gitignored override file. Example below uses a placeholder only.
+bearertoken = "${RIXI_BEARER_TOKEN}"

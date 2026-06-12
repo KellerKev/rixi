@@ -1,0 +1,44 @@
+# Secrets and keys
+*.secret
+*.key
+aes.key
+rotation.secret
+# Local credential/config overrides (never commit real tokens)
+*.local.toml
+*.local.yaml
+*.local.yml
+.env
+.env.*
+# Runtime-generated client artifacts
+mcp_info.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Pixi
+.pixi/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

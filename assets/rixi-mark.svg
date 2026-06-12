@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="RIXI mark">
+  <title>RIXI</title>
+  <!-- Isometric block dissolving into pixels: a code+env bundle shipped to remote compute.
+       Gold-on-geometric motif nods to the Pixi (prefix.dev) aesthetic; original artwork. -->
+  <g>
+    <!-- cube: top / left / right faces in graduated pixi-gold -->
+    <polygon points="28,14 46,23 28,32 10,23" fill="#fcd006"/>
+    <polygon points="10,23 28,32 28,52 10,43" fill="#e09a0b"/>
+    <polygon points="46,23 28,32 28,52 46,43" fill="#c8860a"/>
+    <!-- crisp top edge highlight -->
+    <polygon points="28,14 46,23 28,32 10,23" fill="none" stroke="#fff0a8" stroke-width="0.8" opacity="0.5"/>
+    <!-- pixels streaming off the top-right corner -->
+    <rect x="48" y="9"  width="7"   height="7"   fill="#fcd006"/>
+    <rect x="57" y="4"  width="4.6" height="4.6" fill="#fab10b"/>
+    <rect x="53" y="18" width="3"   height="3"   fill="#fcd006" opacity="0.85"/>
+  </g>
+</svg>

@@ -1,0 +1,23 @@
+# mcp_config.yaml - Example MCP configuration
+mcp:
+  enabled: true
+  servers:
+    - name: "filesystem"
+      type: "filesystem"
+      root_path: "/workspace"
+      tools:
+        - read_file
+        - write_file
+        - list_directory
+    
+    - name: "search"
+      type: "web_search"
+      tools:
+        - web_search
+        - search_documents
+
+features:
+  research_enabled: true
+  auto_save: true
+  tool_logging: true
+

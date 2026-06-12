@@ -1,0 +1,213 @@
+# haiku_config.yaml - FINAL VERSION with improved prompts and processing
+agent:
+  name: "HaikuAgent"
+  description: "Traditional haiku generation with real MCP enhancement"
+  version: "2.0"
+
+execution_mode: "workflow"
+
+mcp:
+  prefer_real_servers: true
+  servers:
+    - name: "workspace"
+      command: ["python", "-m", "mcp_filesystem", "."]
+      mode: "real"
+      working_dir: null
+      env_vars: {}
+      tools: ["read_file", "write_file", "list_directory", "create_directory"]
+      description: "Real workspace file operations"
+
+    - name: "poetry_search"
+      command: ["python", "-m", "mcp_web_search"]
+      mode: "simulation"
+      working_dir: null
+      env_vars:
+        SEARCH_API_KEY: "${SEARCH_API_KEY}"
+      tools: ["web_search", "search_documents"]
+      description: "Poetry and nature inspiration search"
+
+generation:
+  haiku:
+    prompt_template: |
+      Write a traditional haiku about {topic}.
+      
+      Output ONLY the three lines of the haiku, nothing else.
+      No explanations, no syllable counts, no extra text.
+    format_instructions: |
+      REQUIREMENTS:
+      - Exactly 3 lines
+      - 5-7-5 syllable pattern
+      - Nature imagery
+      - No extra text or explanations
+    post_processors:
+      - type: "clean_haiku"
+        max_lines: 3
+      - type: "filter_patterns"
+        patterns: ["syllable", "first line", "second line", "third line", "requirements", "[", "]", "haiku:", "line:"]
+
+  research_haiku:
+    prompt_template: |
+      Inspiration: {research_context}
+      
+      Write a traditional haiku about {topic}.
+      
+      Return ONLY the three haiku lines, no extra text.
+    format_instructions: |
+      REQUIREMENTS:
+      - Exactly 3 lines in 5-7-5 syllable pattern
+      - Use nature imagery 
+      - Output only the haiku lines
+    post_processors:
+      - type: "clean_haiku"
+        max_lines: 3
+      - type: "filter_patterns"
+        patterns: ["syllable", "first line", "second line", "third line", "requirements", "[", "]", "haiku:", "line:", "inspiration:"]
+
+workflows:
+  simple:
+    name: "Simple Haiku Generation"
+    description: "Generate clean haiku and save to real file"
+    context:
+      topic: "${topic}"
+    steps:
+      - name: "generate_haiku"
+        type: "generate"
+        context:
+          topic: "${topic}"
+        generation:
+          prompt_template: |
+            Write a haiku about {topic}.
+            
+            Output format:
+            Line 1 (5 syllables)
+            Line 2 (7 syllables) 
+            Line 3 (5 syllables)
+            
+            Write ONLY the three lines, nothing else.
+          post_processors:
+            - type: "clean_haiku"
+              max_lines: 3
+            - type: "filter_patterns"
+              patterns: ["output format", "syllable", "line 1", "line 2", "line 3", "write only"]
+
+      - name: "save_haiku"
+        type: "tool_call"
+        tool: "write_file"
+        params:
+          path: "${output_file}"
+          content: "${generate_haiku}"
+
+  research:
+    name: "Research-Enhanced Haiku"
+    description: "Generate haiku with web research and save to real file"
+    context:
+      topic: "${topic}"
+    steps:
+      - name: "research_topic"
+        type: "tool_call"
+        tool: "web_search"
+        params:
+          query: "${topic} haiku nature poetry inspiration"
+        update_context: "research_data"
+
+      - name: "generate_haiku"
+        type: "generate"
+        context:
+          topic: "${topic}"
+          research_context: "${research_data}"
+        generation:
+          prompt_template: |
+            Topic: {topic}
+            Research inspiration: {research_context}
+            
+            Write a traditional haiku about {topic} inspired by the research.
+            
+            Return exactly 3 lines in 5-7-5 syllable pattern.
+            Use nature imagery. Output ONLY the haiku lines.
+          post_processors:
+            - type: "clean_haiku"
+              max_lines: 3
+            - type: "filter_patterns"
+              patterns: ["topic:", "research inspiration:", "write a", "return exactly", "use nature", "output only", "syllable", "pattern"]
+
+      - name: "save_haiku"
+        type: "tool_call"
+        tool: "write_file"
+        params:
+          path: "${output_file}"
+          content: "${generate_haiku}"
+
+      - name: "confirm_save"
+        type: "tool_call"
+        tool: "read_file"
+        params:
+          path: "${output_file}"
+
+  advanced:
+    name: "Advanced Haiku Collection"
+    description: "Create haiku collection with organized file structure"
+    context:
+      topic: "${topic}"
+    steps:
+      - name: "create_haiku_directory"
+        type: "tool_call"
+        tool: "create_directory"
+        params:
+          path: "haiku_collection"
+
+      - name: "research_topic"
+        type: "tool_call"
+        tool: "web_search"
+        params:
+          query: "${topic} haiku inspiration nature themes"
+        update_context: "research_data"
+
+      - name: "generate_haiku"
+        type: "generate"
+        context:
+          topic: "${topic}"
+          research_context: "${research_data}"
+        generation:
+          prompt_template: |
+            Create a haiku about {topic}.
+            
+            Output exactly 3 lines:
+            - Line 1: 5 syllables
+            - Line 2: 7 syllables  
+            - Line 3: 5 syllables
+            
+            Write only the haiku lines, no explanations.
+          post_processors:
+            - type: "clean_haiku"
+              max_lines: 3
+
+      - name: "save_to_collection"
+        type: "tool_call"
+        tool: "write_file"
+        params:
+          path: "haiku_collection/${topic}_haiku.txt"
+          content: |
+            Haiku about ${topic}
+            ====================
+            
+            ${generate_haiku}
+            
+            Created: $(date)
+
+      - name: "list_collection"
+        type: "tool_call"
+        tool: "list_directory"
+        params:
+          path: "haiku_collection"
+
+default_workflow: "research"
+
+output_format:
+  type: "simple"
+  show_metrics: true
+  save_automatically: true
+
+fallback:
+  type: "original_agent"
+  agent_type: "haiku"
+  description: "Use original HaikuAgent when MCP not available"

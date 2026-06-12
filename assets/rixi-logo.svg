@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 72" width="240" height="72" role="img" aria-label="RIXI">
+  <title>RIXI</title>
+  <defs>
+    <linearGradient id="navy" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2e47"/>
+      <stop offset="1" stop-color="#101e33"/>
+    </linearGradient>
+  </defs>
+
+  <!-- self-contained badge so the logo reads the same on light or dark backgrounds -->
+  <rect x="2" y="2" width="236" height="68" rx="18" fill="url(#navy)"/>
+  <rect x="2.5" y="2.5" width="235" height="67" rx="17.5" fill="none" stroke="#fcd006" stroke-opacity="0.18"/>
+
+  <!-- isometric block + streaming pixels (see rixi-mark.svg) -->
+  <g>
+    <polygon points="37,18 54,26.5 37,35 20,26.5" fill="#fcd006"/>
+    <polygon points="20,26.5 37,35 37,54 20,45.5" fill="#e09a0b"/>
+    <polygon points="54,26.5 37,35 37,54 54,45.5" fill="#c8860a"/>
+    <polygon points="37,18 54,26.5 37,35 20,26.5" fill="none" stroke="#fff0a8" stroke-width="0.8" opacity="0.5"/>
+    <rect x="56" y="12" width="7"   height="7"   fill="#fcd006"/>
+    <rect x="66" y="6"  width="4.8" height="4.8" fill="#fab10b"/>
+    <rect x="72" y="2"  width="3"   height="3"   fill="#fcd006" opacity="0.85"/>
+  </g>
+
+  <!-- wordmark: R + IXI (the "IXI" shared with pIXI, in pixi-gold) -->
+  <text x="92" y="48" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="34" font-weight="800" letter-spacing="3">
+    <tspan fill="#eef2f9">R</tspan><tspan fill="#fcd006">IXI</tspan>
+  </text>
+</svg>

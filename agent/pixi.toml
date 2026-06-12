@@ -1,0 +1,55 @@
+[workspace]
+channels = ["conda-forge"]
+name = "rixi-agent"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+start = "python inference_server.py"
+# Main HTTP service task
+http-service = "python main.py"
+
+# Simple HTTP server only (no proxy)
+http-server = "python -c 'from main import run_simple_http_server; run_simple_http_server()'"
+
+# Flask variant (if flask is installed)
+flask-service = {  cmd = "python flask_service.py" }
+
+# FastAPI variant (if fastapi is installed)
+fastapi-service = { depends-on = ["install-fastapi"], cmd = "python fastapi_service.py" }
+
+[tasks.install-flask]
+cmd = "pip install flask"
+
+[tasks.install-fastapi]
+cmd = "pip install fastapi uvicorn"
+
+#[feature.web.dependencies]
+#flask = ">=2.0"
+#fastapi = ">=0.68"
+#uvicorn = ">=0.15"
+
+#[feature.dev.dependencies]
+#pytest = "*"
+#requests = "*"
+
+
+
+[dependencies]
+python = ">=3.13.3,<3.14"
+flask = ">=3.1.0,<4"
+lz4 = ">=4.4.4,<5"
+requests = ">=2.32.3,<3"
+tqdm = ">=4.67.1,<5"
+tomli = ">=2.2.1,<3"
+pyjwt = ">=2.10.1,<3"
+cryptography = ">=44.0.3,<45"
+pathlib = ">=1.0.1,<2"
+transformers = ">=4.52.1,<5"
+pytorch = ">=2.7.0,<3"
+accelerate = ">=1.9.0,<2"
+python-multipart = ">=0.0.20,<0.0.21"
+
+[pypi-dependencies]
+crewai = "*"
+#mindsdb-cli= "*"

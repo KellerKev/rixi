@@ -1,0 +1,296 @@
+# agent_config.yaml - Main agent configuration
+agent:
+  name: "ConfigurableAgent"
+  description: "Generic MCP-enhanced agent"
+  version: "1.0"
+
+# MCP server configurations
+mcp:
+  servers:
+    - name: "filesystem"
+      command: ["python", "-m", "mcp_filesystem", "/workspace"]
+      working_dir: null
+      env_vars: {}
+      tools: ["read_file", "write_file", "list_directory", "create_directory"]
+      description: "Filesystem access server"
+    
+    - name: "web_search"
+      command: ["python", "-m", "mcp_web_search"]
+      working_dir: null
+      env_vars:
+        API_KEY: "${SEARCH_API_KEY}"
+      tools: ["web_search", "search_documents", "search_images"]
+      description: "Web search capabilities"
+    
+    - name: "database"
+      command: ["python", "-m", "mcp_database"]
+      working_dir: null
+      env_vars: {}
+      tools: ["execute_query", "get_schema", "insert_data"]
+      description: "Database access"
+
+# Content generation configurations
+generation:
+  # Haiku generation
+  haiku:
+    prompt_template: "Write a traditional haiku about {topic}."
+    format_instructions: |
+      Create exactly one haiku with the following requirements:
+      - Exactly 3 lines
+      - 5-7-5 syllable pattern
+      - Focus on nature imagery and emotions
+      - No explanations or additional text
+    constraints:
+      - "Use exactly 3 lines"
+      - "Follow 5-7-5 syllable pattern"
+      - "Include nature imagery"
+      - "End after the third line"
+    post_processors:
+      - type: "filter_patterns"
+        patterns: ["inspired by", "example", "poetry", "haiku about", "these are"]
+      - type: "extract_lines"
+        max_lines: 3
+      - type: "clean_formatting"
+        max_line_length: 60
+
+  # Paragraph generation  
+  paragraph:
+    prompt_template: "Write a descriptive paragraph about {topic}."
+    format_instructions: "Write exactly one paragraph with clear, descriptive language."
+    constraints:
+      - "Single paragraph only"
+      - "No bullet points or lists"
+      - "Descriptive and engaging"
+    post_processors:
+      - type: "filter_patterns"
+        patterns: ["1.", "2.", "3.", "-", "*"]
+      - type: "truncate"
+        max_length: 500
+
+  # List generation
+  list:
+    prompt_template: "Create a list about {topic}."
+    format_instructions: "Create a clear, organized list."
+    constraints:
+      - "Use bullet points or numbers"
+      - "Keep items concise"
+      - "Maximum 10 items"
+    post_processors:
+      - type: "extract_lines"
+        max_lines: 10
+
+# Workflow configurations
+workflows:
+  # Simple generation workflow
+  simple_generation:
+    name: "Simple Content Generation"
+    context:
+      topic: "${TOPIC}"
+    steps:
+      - name: "generate_content"
+        type: "generate"
+        context:
+          topic: "${TOPIC}"
+        generation:
+          prompt_template: "{generation_config[prompt_template]}"
+          format_instructions: "{generation_config[format_instructions]}"
+          constraints: "{generation_config[constraints]}"
+          post_processors: "{generation_config[post_processors]}"
+
+  # Research-enhanced workflow
+  research_workflow:
+    name: "Research-Enhanced Generation"
+    context:
+      topic: "${TOPIC}"
+      content_type: "${CONTENT_TYPE}"
+    steps:
+      - name: "research"
+        type: "tool_call"
+        tool: "web_search"
+        params:
+          query: "${topic} ${content_type} inspiration"
+        update_context: "research_data"
+      
+      - name: "generate_content"
+        type: "generate"
+        context:
+          topic: "${topic}"
+          research_context: "${research_data}"
+        generation:
+          prompt_template: "Based on this research: {research_context}\n\nWrite about {topic}."
+          format_instructions: "{generation_config[format_instructions]}"
+          post_processors: "{generation_config[post_processors]}"
+      
+      - name: "save_content"
+        type: "tool_call"
+        tool: "write_file"
+        params:
+          path: "${topic}_${content_type}.txt"
+          content: "${generate_content}"
+
+  # Multi-step analysis workflow
+  analysis_workflow:
+    name: "Multi-Step Analysis"
+    context:
+      topic: "${TOPIC}"
+    steps:
+      - name: "gather_data"
+        type: "tool_call"
+        tool: "web_search"
+        params:
+          query: "${topic} analysis data"
+        update_context: "raw_data"
+      
+      - name: "analyze_data"
+        type: "generate"
+        context:
+          data: "${raw_data}"
+        generation:
+          prompt_template: "Analyze this data: {data}"
+          format_instructions: "Provide a clear analysis"
+          post_processors:
+            - type: "truncate"
+              max_length: 1000
+        context_key: "analysis"
+      
+      - name: "create_summary"
+        type: "generate"
+        context:
+          analysis: "${analysis}"
+        generation:
+          prompt_template: "Summarize this analysis: {analysis}"
+          format_instructions: "Create a concise summary"
+          post_processors:
+            - type: "extract_lines"
+              max_lines: 5
+
+---
+# haiku_agent_config.yaml - Haiku-specific configuration  
+agent:
+  name: "HaikuAgent"
+  description: "Specialized haiku generation agent"
+  extends: "ConfigurableAgent"
+
+# Haiku-specific MCP servers
+mcp:
+  servers:
+    - name: "filesystem"
+      command: ["python", "-m", "mcp_filesystem", "/workspace"]
+      tools: ["read_file", "write_file", "list_directory"]
+      description: "File operations for haiku storage"
+    
+    - name: "poetry_search"
+      command: ["python", "-m", "mcp_web_search"]
+      tools: ["web_search"]
+      description: "Poetry and nature inspiration search"
+
+# Haiku-specific generation
+generation:
+  default:
+    prompt_template: "Write a traditional haiku about {topic}."
+    format_instructions: |
+      HAIKU REQUIREMENTS:
+      - Exactly 3 lines
+      - 5-7-5 syllable pattern
+      - Nature imagery and emotion
+      - No numbering or explanations
+      - End after the third line
+    
+    constraints:
+      - "Exactly 3 lines"
+      - "5-7-5 syllable structure"
+      - "Include nature elements"
+      - "Evoke emotion or mood"
+      - "No additional commentary"
+    
+    post_processors:
+      - type: "filter_patterns"
+        patterns: ["1.", "2.", "3.", "inspired by", "example", "haiku about"]
+      - type: "extract_lines"
+        max_lines: 3
+      - type: "clean_formatting"
+        max_line_length: 60
+
+# Haiku workflows
+workflows:
+  simple_haiku:
+    name: "Simple Haiku Generation"
+    context:
+      topic: "${TOPIC}"
+    steps:
+      - name: "generate_haiku"
+        type: "generate"
+        generation:
+          prompt_template: "Write a traditional haiku about {topic}."
+          format_instructions: |
+            HAIKU REQUIREMENTS:
+            - Exactly 3 lines
+            - 5-7-5 syllable pattern
+            - Focus on nature and emotion
+          post_processors:
+            - type: "extract_lines"
+              max_lines: 3
+      
+      - name: "save_haiku"
+        type: "tool_call"
+        tool: "write_file"
+        params:
+          path: "haiku.txt"
+          content: "${generate_haiku}"
+
+  research_haiku:
+    name: "Research-Enhanced Haiku"
+    context:
+      topic: "${TOPIC}"
+    steps:
+      - name: "research_inspiration"
+        type: "tool_call"
+        tool: "web_search"
+        params:
+          query: "${topic} haiku nature poetry inspiration"
+        update_context: "inspiration"
+      
+      - name: "generate_haiku"
+        type: "generate"
+        context:
+          inspiration: "${inspiration}"
+        generation:
+          prompt_template: |
+            Drawing inspiration from: {inspiration}
+            
+            Write a traditional haiku about {topic}.
+          format_instructions: |
+            HAIKU REQUIREMENTS:
+            - Exactly 3 lines
+            - 5-7-5 syllable pattern
+            - Nature imagery and emotional depth
+          post_processors:
+            - type: "filter_patterns"
+              patterns: ["inspired by", "drawing from"]
+            - type: "extract_lines"
+              max_lines: 3
+      
+      - name: "save_haiku"
+        type: "tool_call"
+        tool: "write_file"
+        params:
+          path: "research_haiku.txt"
+          content: "${generate_haiku}"
+
+---
+# simple_config.yaml - Minimal configuration for basic usage
+agent:
+  name: "SimpleAgent"
+  
+mcp:
+  servers:
+    - name: "basic_fs"
+      command: ["python", "-m", "mcp_filesystem"]
+      tools: ["read_file", "write_file"]
+
+generation:
+  default:
+    prompt_template: "{topic}"
+    post_processors:
+      - type: "truncate"
+        max_length: 200
