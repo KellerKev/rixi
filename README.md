@@ -27,6 +27,15 @@ CLIENT LAYER                  SERVER LAYER              AGENT LAYER
 
 **Workflow:** Client authenticates (JWT) -> optional AES handshake -> packages code (tar + LZ4) -> uploads to server -> server executes in isolated subprocess -> real-time output streaming back to client.
 
+## Built on Pixi
+
+RIXI is a remote runner for [Pixi](https://pixi.sh/) projects — the name is a nod to it. A task
+is just a directory with a `pixi.toml`: the client packages it, the server unpacks it and runs
+`pixi run <task>` in an isolated subprocess, streaming the output back. Because Pixi resolves a
+project's complete environment into a local `.pixi/` folder, that same environment can be shipped
+*with* the code — which is what makes [air-gapped deployment](#air-gapped--offline-deployment)
+possible.
+
 ## Directory Structure
 
 ```
@@ -70,6 +79,8 @@ rixi/
 | **Task Lifecycle** | Upload, execute, monitor, stream, restart, terminate, redeploy |
 | **Real-time Streaming** | Length-prefixed encrypted frames for live output |
 | **MCP Integration** | Extensible tool access (filesystem, web search, custom) |
+| **Pixi-native** | Tasks are Pixi projects; the server runs `pixi run <task>` in an isolated subprocess |
+| **Air-gapped / Offline** | Bundle the resolved `.pixi/` environment with the code for dependency-free execution on disconnected hosts |
 | **Pluggable agents** | Pluggable inference backend with optional CrewAI multi-agent integration |
 | **API Compatibility** | API-compatible proxy layer for routing to external providers |
 | **LZ4 Compression** | Efficient code packaging and transfer |
@@ -184,6 +195,25 @@ Agent behavior is driven by YAML configuration files:
 - **`mcp_config.yaml`** - MCP feature toggles
 - **`proxy_config.yaml`** - Enterprise proxy deployment templates
 
+## Air-gapped / Offline Deployment
+
+For targets with no internet access, the client can bundle the project's **resolved Pixi
+environment** (`.pixi/`) into the upload, so the server runs the task without fetching or
+solving any dependencies:
+
+```bash
+# package the .pixi environment together with the code, then deploy
+pixi run python rixi_client.py --server https://host:9000 --task mytask --offline-mode
+
+# inspect before sending
+pixi run python rixi_client.py ... --validate-dependencies   # check .pixi is present & valid
+pixi run python rixi_client.py ... --show-package-size       # size breakdown of the bundle
+```
+
+The bundle is tagged with an `.offline_metadata.json` marker; the server **auto-detects** offline
+packages (by that marker or a bundled `.pixi/` folder) and skips dependency resolution entirely —
+giving fully air-gapped, reproducible execution on disconnected hosts.
+
 ## Security
 
 - **AES-256-GCM** encryption for data in transit (12-byte nonce + ciphertext)
@@ -199,6 +229,7 @@ Agent behavior is driven by YAML configuration files:
 3. **Encrypted** - AES-256 + JWT for production
 4. **Hybrid** - Local MCP tools + remote inference compute
 5. **Multi-provider** - Route to different LLM backends
+6. **Air-gapped / Offline** - Dependencies bundled with the code; runs on hosts with no internet
 
 ## Dependencies
 
