@@ -24,7 +24,7 @@ Copy [`proxy_config.example.yaml`](proxy_config.example.yaml) and edit it for a 
 |------|---------|
 | `--config PATH` | YAML/JSON config (backends, model map, auth, CORS) |
 | `--backend URL` / `--inference-task ID` / `--server URL` | Single-backend shorthand (used when `--config` is absent) |
-| `--port` / `--host` | Listen address (default `0.0.0.0:8002`) |
+| `--port` / `--host` | Listen address (default `127.0.0.1:8002`; pass `--host 0.0.0.0` to expose it) |
 | `--api-key` | Require this key on `/v1/*`, `/api/*`, passthrough routes (`/health` stays open) |
 | `--aes-key PATH` / `--no-decrypt` | Decrypt encrypted backend responses |
 | `--mode {openai,anthropic,generic}` | Default API surface hint |

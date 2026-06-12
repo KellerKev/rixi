@@ -1698,7 +1698,7 @@ def main():
     parser = argparse.ArgumentParser(description="Enhanced Universal Inference Proxy")
     parser.add_argument("--config", help="Configuration file path (YAML or JSON)")
     parser.add_argument("--port", type=int, default=8002, help="Server port")
-    parser.add_argument("--host", default="0.0.0.0", help="Server host")
+    parser.add_argument("--host", default="127.0.0.1", help="Server host (use 0.0.0.0 to listen on all interfaces)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     # Quick setup options (override config file)
