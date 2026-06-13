@@ -13,14 +13,14 @@ agent:
 mcp:
   servers:
     - name: "filesystem"
-      command: ["python", "-m", "mcp_filesystem", "/workspace"]
+      command: ["python", "-m", "mcp_servers", "filesystem", "/workspace"]
       working_dir: null
       env_vars: {}
       tools: ["read_file", "write_file", "list_directory", "create_directory"]
       description: "Filesystem access server"
 
     - name: "web_search"
-      command: ["python", "-m", "mcp_web_search"]
+      command: ["python", "-m", "mcp_servers", "web_search"]
       working_dir: null
       env_vars:
         API_KEY: "${SEARCH_API_KEY}"   # injected at deploy time; never commit a real key

@@ -24,9 +24,15 @@ import uuid
 import time
 import yaml
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 import requests
+
+# This demo drives the agent framework, which lives in agent/ and uses bare imports.
+_AGENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "agent")
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
 
 from ai_agent_framework import RemoteChannel, read_pixi_config, create_auth_headers
 

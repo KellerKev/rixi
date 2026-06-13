@@ -10,7 +10,7 @@ mcp:
   prefer_real_servers: true
   servers:
     - name: "workspace"
-      command: ["python", "-m", "mcp_filesystem", "."]
+      command: ["python", "-m", "mcp_servers", "filesystem", "."]
       mode: "real"
       working_dir: null
       env_vars: {}
@@ -18,7 +18,7 @@ mcp:
       description: "Real workspace file operations"
 
     - name: "poetry_search"
-      command: ["python", "-m", "mcp_web_search"]
+      command: ["python", "-m", "mcp_servers", "web_search"]
       mode: "simulation"
       working_dir: null
       env_vars:

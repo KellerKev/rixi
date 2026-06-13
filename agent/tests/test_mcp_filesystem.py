@@ -4,7 +4,7 @@ import pathlib
 
 import pytest
 
-from mcp_filesystem import FilesystemMCPServer, MCPFilesystemHandler
+from mcp_servers import FilesystemMCPServer, MCPFilesystemHandler
 
 
 def test_ensure_safe_path_accepts_paths_inside_root(tmp_path):

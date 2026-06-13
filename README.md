@@ -52,18 +52,14 @@ rixi/
 │   ├── rixi_transport.py     # Shared transport (encryption, streaming, handshake)
 │   └── pixi.toml             # Client dependencies
 ├── agent/               # Multi-agent engine: framework, MCP tools & workflows
-│   ├── ai_agent_framework.py # Base agent/channel abstractions
-│   ├── remote_channel.py     # Sync streaming channel to the server
-│   ├── aesgcm.py             # AES-GCM encrypt/decrypt helpers
-│   ├── mcp_agent.py          # Config-driven MCP agent with workflows
-│   ├── simple_agent.py       # Single-purpose agent
-│   ├── mcp_manager.py        # MCP server lifecycle manager
-│   ├── mcp_filesystem.py     # Filesystem tool server
-│   ├── mcp_web_search.py     # Web search tool server
-│   ├── crewai_integration.py # CrewAI + MCP bridge
+│   ├── ai_agent_framework.py # Core: crypto, RemoteChannel, Agent base classes
+│   ├── mcp_manager.py        # MCP server lifecycle, tool dispatch, config loader
+│   ├── mcp_servers.py        # MCP tool servers (filesystem + web search)
+│   ├── mcp_agent.py          # ConfigurableMCPAgent: the workflow engine
 │   ├── start_agent.py        # Single agent entry point / runner
 │   ├── agent_config.example.yaml # Config template (see Configuration)
 │   ├── tests/                # pytest suite (run with `pixi run test`)
+│   ├── README.md             # Agent engine guide
 │   └── pixi.toml             # Agent dependencies
 ├── proxy/               # API-compatibility layer (OpenAI/Anthropic/Ollama → RIXI backend)
 │   ├── proxy.py · api_formats.py
@@ -82,6 +78,17 @@ rixi/
 ├── SECURITY.md          # Vulnerability reporting & hardening guide
 └── README.md
 ```
+
+## Documentation
+
+Each component has its own guide, and the examples have a walkthrough:
+
+- [`server/README.md`](server/README.md) — the task-execution server, flags, secure defaults
+- [`clients/README.md`](clients/README.md) — the runner clients + shared transport
+- [`agent/README.md`](agent/README.md) — the multi-agent engine + MCP tool servers
+- [`proxy/README.md`](proxy/README.md) — the API-compatibility proxy
+- [`inference-server/README.md`](inference-server/README.md) — the LLM inference backend
+- [`examples/README.md`](examples/README.md) — **how to run every example** (`hello`, `crewai-showcase`, `http-backends`, `agent-demos`)
 
 ## Key Features
 

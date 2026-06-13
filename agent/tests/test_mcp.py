@@ -15,7 +15,7 @@ from mcp_manager import (
 def test_create_filesystem_server_config():
     config = create_filesystem_server_config("workspace", "/data")
     assert config.name == "workspace"
-    assert config.command == ["python", "-m", "mcp_filesystem", "/data"]
+    assert config.command == ["python", "-m", "mcp_servers", "filesystem", "/data"]
     assert "read_file" in config.tools
     assert config.mode == "real"
 

@@ -130,13 +130,13 @@ class UniversalAgentLauncher:
             "servers": [
                 {
                     "name": "workspace",
-                    "command": ["python", "-m", "mcp_filesystem", "."],
+                    "command": ["python", "-m", "mcp_servers", "filesystem", "."],
                     "mode": "real",
                     "tools": ["read_file", "write_file", "list_directory", "create_directory"]
                 },
                 {
                     "name": "research",
-                    "command": ["python", "-m", "mcp_web_search"],
+                    "command": ["python", "-m", "mcp_servers", "web_search"],
                     "mode": "simulation",  # Change to "real" when web search is implemented
                     "tools": ["web_search", "search_documents"]
                 }

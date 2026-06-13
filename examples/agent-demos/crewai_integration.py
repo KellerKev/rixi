@@ -4,7 +4,14 @@ from crewai.tools import BaseTool
 from typing import Dict, List, Any, Optional, Type
 from pydantic import BaseModel, Field
 import asyncio
+import os
+import sys
 from dataclasses import dataclass
+
+# This demo drives the agent framework, which lives in agent/ and uses bare imports.
+_AGENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "agent")
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
 
 from ai_agent_framework import RemoteChannel
 from mcp_manager import MCPManager, MCPServerConfig

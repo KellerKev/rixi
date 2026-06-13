@@ -280,19 +280,17 @@ class MCPManager:
     
         # Import the real filesystem handler
         try:
-            from mcp_filesystem import MCPFilesystemHandler
+            from mcp_servers import MCPFilesystemHandler
         except ImportError as e:
-            raise Exception(f"Cannot import mcp_filesystem: {e}")
-    
-        # FIXED: Get root path correctly from command args
+            raise Exception(f"Cannot import mcp_servers: {e}")
+
+        # Get root path from command args. Command is
+        # ["python", "-m", "mcp_servers", "filesystem", "<root>"]; the trailing
+        # element is the root unless it's the dispatch keyword itself.
         root_path = "."  # Default to current directory
-    
-        # Parse command properly - command is ["python", "-m", "mcp_filesystem", "."]
-        if len(instance.config.command) > 3:
-            root_path = instance.config.command[3]  # FIXED: index 3, not 2
-        elif len(instance.config.command) > 2 and instance.config.command[2] not in ["mcp_filesystem"]:
-            root_path = instance.config.command[2]
-    
+        if instance.config.command and instance.config.command[-1] not in ("mcp_servers", "filesystem"):
+            root_path = instance.config.command[-1]
+
         print(f"🔧 Filesystem root path: {root_path}")
     
         handler = MCPFilesystemHandler(root_path)
@@ -400,7 +398,7 @@ def create_filesystem_server_config(name: str, root_path: str = ".", mode: str =
     """Create filesystem server config"""
     return MCPServerConfig(
         name=name,
-        command=["python", "-m", "mcp_filesystem", root_path],
+        command=["python", "-m", "mcp_servers", "filesystem", root_path],
         tools=["read_file", "write_file", "list_directory", "create_directory"],
         description=f"Filesystem server for {root_path}",
         mode=mode
@@ -410,7 +408,7 @@ def create_web_search_server_config(name: str, api_key: str = "", mode: str = "r
     """Create web search server config"""
     return MCPServerConfig(
         name=name,
-        command=["python", "-m", "mcp_web_search"],
+        command=["python", "-m", "mcp_servers", "web_search"],
         env_vars={"API_KEY": api_key} if api_key else {},
         tools=["web_search", "search_documents", "search_images"],
         description="Web search server",
