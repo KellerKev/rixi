@@ -4,6 +4,23 @@ The agent engine: a configuration-driven agent that calls MCP tools and routes g
 remote inference backend over the RIXI channel. It runs as a task payload (or locally against a
 server) and is independent of the [proxy](../proxy/) and [inference-server](../inference-server/).
 
+## Architecture
+
+A workflow step either calls a **local MCP tool** (filesystem, web search) to gather context, or
+sends a generation request to a **remote model task** over the RIXI channel and reads the reply.
+
+```
+   ┌──────────────────────────┐
+   │      start_agent.py      │   loads a workflow config, runs each step
+   │  (ConfigurableMCPAgent)  │
+   └──────────────────────────┘
+   each step does one of:
+     • call a local MCP tool (mcp_servers) to gather context, then
+     • generate remotely:  POST /task/{id}/input   {"command":"generate",…}
+                           GET  /task/{id}/stream  ◀ {"response":…,"request_id":…}
+   …and the result feeds the next step.
+```
+
 ## Modules
 
 | File | Responsibility |
@@ -22,7 +39,14 @@ pixi run agent            # = python start_agent.py (defaults to agent_config.ex
 pixi run test             # pytest tests/
 ```
 
-`start_agent.py` takes `--task-id`, `--aes-key`, `--config`, `--workflow`, `--topic`, etc.
+`start_agent.py` takes `--task-id`, `--aes-key`, `--config`, `--workflow`, `--topic`, etc. To run
+against a model serving in a keep-alive task, pass that task's id:
+
+```console
+$ pixi run python start_agent.py \
+    --server https://gpu-box:9000 --task-id 1ce0-inference \
+    --config agent_config.example.yaml --workflow research_workflow --topic "fusion energy"
+```
 
 ## MCP tool servers
 

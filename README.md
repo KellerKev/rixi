@@ -44,6 +44,160 @@ core. Mix and match them, or use none:
 → uploads to the server → server executes it in an isolated subprocess → real-time output streams
 back to the client.
 
+## How the components fit together
+
+A task started with `--keep-alive` stays addressable by its **task id**. Anything that knows the
+id can attach to it: the client (to follow or manage it), the proxy (to feed it API requests), or
+the agent (to drive a workflow against it). They all talk to the same task through the server.
+
+```
+          clients ──┐                            ┌── proxy
+          (deploy · │                            │   (/task/{id}/input
+           attach · ▼                            ▼    + poll /task/{id}))
+        ┌───────────────────────────────────────────┐
+        │                rixi_server                │
+        │          hosts a keep-alive task,         │
+        │         addressable by its task id        │
+        └───────────────────────────────────────────┘
+           manage) ▲                            ▲
+          agent ───┘                            └── attach later
+          (/input + /stream)                        (/task/{id}/stream)
+```
+
+- **clients** deploy a project and, with `--keep-alive`, hand you a task id to **attach to later**.
+- **proxy** points at a running inference task id and exposes OpenAI/Anthropic/Ollama endpoints.
+- **agent** points at a task id and runs a config-driven workflow, calling local MCP tools.
+- **inference-server** is what typically runs *inside* that keep-alive task as the model backend.
+
+See each component's README ([server](server/README.md), [clients](clients/README.md),
+[agent](agent/README.md), [proxy](proxy/README.md), [inference-server](inference-server/README.md))
+for its own architecture diagram and details.
+
+## Use cases
+
+RIXI ships a Pixi project — your code **and** its fully-resolved environment — to a remote host and
+runs it there, streaming output back. That one primitive covers a lot of ground. Each example
+below is a real command sequence (the client is invoked as `pixi run python rixi_client.py …`;
+shortened to `rixi-client` here for readability).
+
+```bash
+# For readability in the examples below:
+alias rixi-client='pixi run --manifest-path /path/to/rixi/clients/pixi.toml python /path/to/rixi/clients/rixi_client.py'
+```
+
+### 1. Deploy and run a project on a remote host (one command)
+
+Run the client from the project you want to ship; it packages the current directory and runs the
+named `pixi.toml` task on the server, streaming output back.
+
+```console
+$ cd ~/my-api
+$ rixi-client --server https://gpu-box:9000 --task serve --keep-alive
+
+📦 Package Statistics:
+  Code files: 24
+  Compressed package: 1.8 MB
+  🌐 Mode: Online (dependencies will be downloaded)
+
+Task ID: 7b3e1c90-2a4f-4d11-9c2a-1f6e8b0a5d33
+Status: Extracting to /tmp/tmp8_63uco4
+Status: Starting task - downloading dependencies
+✨ Pixi task (serve): uvicorn app:main --host 0.0.0.0 --port 8080
+INFO:     Uvicorn running on http://0.0.0.0:8080
+⏳ Back-channel active. Press Ctrl+C for options menu.
+```
+
+### 2. Air-gapped / offline deploy (dependencies bundled)
+
+`pixi install` once to resolve the environment into `.pixi/`, then deploy with `--offline-mode`:
+the client bundles `.pixi/` and tags the package with `.offline_metadata.json`, and the server
+auto-detects it and runs with `PIXI_OFFLINE=1` — no network on the target.
+
+```console
+$ pixi install                       # resolve the env into .pixi/
+$ rixi-client --server https://airgapped-host:9000 --task train --offline-mode --validate-dependencies
+
+🔍 Validating offline deployment prerequisites...
+✅ Offline prerequisites validated
+📁 .pixi folder size: 1924.7 MB
+
+📦 Package Statistics:
+  Code files: 31
+  Dependency files: 4120
+  Dependencies size: 1924.7 MB
+  Compressed package: 612.4 MB
+  🔒 Mode: Offline (dependencies included)
+
+Task ID: b1d2…   Status: Offline package: dependencies included
+Status: Starting task with offline dependencies
+```
+
+Inspect the bundle before sending with `--show-package-size` (builds the package, prints the size
+breakdown, and exits).
+
+### 3. Long job → detach → attach later
+
+Kick off a training run or a heavy data-crunching job, detach, and reattach from anywhere later.
+Press **Ctrl+C** for the options menu; choose **2** to leave the task running and exit.
+
+```console
+$ rixi-client --server https://gpu-box:9000 --task train --keep-alive
+Task ID: 9f0a…   Status: running
+epoch 1/50  loss=2.41
+^C
+Interrupted! Choose:
+1) Terminate remote task and exit
+2) Let task continue and exit
+3) Restart remote task and exit
+4) Redeploy current code to task
+5) Continue monitoring
+6) Restart task and keep monitoring
+Enter 1-6: 2
+Task 9f0a… left running.
+
+# …hours later, from your laptop — replay history, then follow live:
+$ rixi-client --server https://gpu-box:9000 --attach-history 9f0a…
+epoch 1/50  loss=2.41
+epoch 27/50 loss=0.38
+Status: Process completed
+```
+
+(`--attach` follows live only; `--attach-history` replays the captured output first, then follows.)
+
+### 4. Serve inference behind an OpenAI-compatible API
+
+Deploy the [inference-server](inference-server/) as a keep-alive task, then point the
+[proxy](proxy/) at its task id — now any OpenAI/Anthropic/Ollama client can call it.
+
+```console
+# 1) deploy the model backend as a long-lived task → note the task id
+$ cd inference-server
+$ rixi-client --server https://gpu-box:9000 --task start --keep-alive
+Task ID: 1ce0-inference   Status: running
+
+# 2) put the proxy in front of that task
+$ cd ../proxy
+$ pixi run proxy -- --backend https://gpu-box:9000 --inference-task 1ce0-inference --port 8002
+
+# 3) call it like any OpenAI endpoint
+$ curl http://localhost:8002/v1/chat/completions \
+    -H 'content-type: application/json' \
+    -d '{"model":"gpt-3.5-turbo","messages":[{"role":"user","content":"haiku about the sea"}]}'
+{"choices":[{"message":{"role":"assistant","content":"Salt wind on the waves…"}}], ...}
+```
+
+### 5. Drive an agentic workflow against a remote model
+
+The [agent](agent/) engine attaches to a task id and runs a config-driven workflow — calling local
+MCP tools (filesystem, web search) and routing generation to the remote model.
+
+```console
+$ cd agent
+$ pixi run python start_agent.py \
+    --server https://gpu-box:9000 --task-id 1ce0-inference \
+    --config agent_config.example.yaml --workflow research_workflow --topic "fusion energy"
+```
+
 ## Built on Pixi
 
 RIXI is a remote runner for [Pixi](https://pixi.sh/) projects — *Remote Interaction and Execution
