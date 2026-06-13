@@ -4,35 +4,50 @@
 
 # RIXI
 
-A cloud-native AI agent framework for secure, remote execution of AI workloads. RIXI provides encrypted, authenticated task execution with [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) integration for extensible tool access and a pluggable inference backend.
+**RIXI** — *Remote Interaction and Execution Implementation* — is a secure runner for [Pixi](https://pixi.sh/) projects: a client packages a project and ships it to the server over an encrypted, authenticated channel, and the server runs it as an isolated task and streams the output back. Optional components add a multi-agent engine, an API-compatibility proxy, and a pluggable inference backend, with [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for extensible tool access.
 
 ## Architecture
 
+At its core RIXI is a **client** and a **server**. A client packages a Pixi project and ships it
+to the server over an encrypted, authenticated channel; the server runs it as an isolated task
+and streams the output back.
+
 ```
-CLIENT LAYER                  SERVER LAYER              COMPUTE COMPONENTS
-────────────                  ────────────              ──────────────────
-┌──────────────┐              ┌──────────────┐          ┌──────────────────┐
-│ rixi_client  │──HTTP/AES───▶│ rixi_server  │◀─────────│ inference-server │
-│ (full CLI,   │              │ (FastAPI)    │          │ (LLM backend)    │
-│  MCP-capable)│              │              │          └──────────────────┘
-└──────────────┘              │ - JWT Auth   │          ┌──────────────────┐
-┌──────────────┐              │ - AES-256    │          │ proxy            │
-│ simple_client│──Encrypted──▶│ - Task Mgmt  │          │ (API-compat layer)│
-│ (lightweight)│   Channel    │ - Streaming  │          └──────────────────┘
-└──────────────┘              │ - Compression│          ┌──────────────────┐
-                              │ - MCP Support│          │ agent            │
-                              └──────────────┘          │ (multi-agent eng)│
-                                                        └──────────────────┘
+        ┌────────────────────┐
+        │       client       │   packages a Pixi project; streams output back
+        └─────────┬──────────┘
+                  │   upload (tar + LZ4) · HTTP · AES · JWT
+                  ▼
+        ┌────────────────────┐
+        │    rixi_server     │   authenticates, decrypts, manages the task,
+        │     (FastAPI)      │   streams stdout/stderr back to the client
+        └─────────┬──────────┘
+                  │   pixi run <task>
+                  ▼
+        ┌────────────────────┐
+        │    task payload    │   your code, in an isolated subprocess
+        └────────────────────┘
 ```
 
-The **agent**, **proxy**, and **inference-server** are independent components, each its own Pixi
-project; mix and match them (or none of them) with the server + clients core.
+Everything else is an **optional component** — each its own Pixi project — that plugs into this
+core. Mix and match them, or use none:
 
-**Workflow:** Client authenticates (JWT) -> optional AES handshake -> packages code (tar + LZ4) -> uploads to server -> server executes in isolated subprocess -> real-time output streaming back to client.
+| Component | Role | How it connects |
+|-----------|------|-----------------|
+| **clients** | Package a project, deploy it, stream output, manage the task lifecycle | → server, over HTTP (AES + JWT) |
+| **server** | Execute uploads as isolated tasks; auth, encryption, streaming, MCP | the core |
+| **agent** | Multi-agent engine — calls MCP tools and routes generation to a remote model | runs as a task; uses the server's MCP back-channel |
+| **inference-server** | LLM backend (HuggingFace / Ollama) | runs as a task payload; answers the agent's / proxy's generation requests |
+| **proxy** | API-compatibility front door (OpenAI / Anthropic / Ollama wire formats) | receives standard API calls, forwards them to a RIXI backend task |
+
+**Request flow:** client authenticates (JWT) → optional AES handshake → packages code (tar + LZ4)
+→ uploads to the server → server executes it in an isolated subprocess → real-time output streams
+back to the client.
 
 ## Built on Pixi
 
-RIXI is a remote runner for [Pixi](https://pixi.sh/) projects — the name is a nod to it. A task
+RIXI is a remote runner for [Pixi](https://pixi.sh/) projects — *Remote Interaction and Execution
+Implementation*, a name that also nods to Pixi. A task
 is just a directory with a `pixi.toml`: the client packages it, the server unpacks it and runs
 `pixi run <task>` in an isolated subprocess, streaming the output back. Because Pixi resolves a
 project's complete environment into a local `.pixi/` folder, that same environment can be shipped
