@@ -198,6 +198,37 @@ $ pixi run python start_agent.py \
     --config agent_config.example.yaml --workflow research_workflow --topic "fusion energy"
 ```
 
+### 6. Use it as a plain deployment tool (ship code + deps, then push updates)
+
+Forget the AI parts — RIXI is also just a one-command deploy tool. It ships your code **and** its
+resolved dependencies, lets Pixi install the environment, runs your app's task, and streams it so
+you watch it come up live. When you change the code, **push the update to the same running task**
+with Ctrl+C → `4` (repackage + `POST /task/{id}/redeploy`) — no re-uploading from scratch.
+
+```console
+# one command ships code + full Pixi env, installs, and runs the app — you watch it come up
+$ cd ~/my-api
+$ rixi-client --server https://prod-box:9000 --task serve --keep-alive
+Task ID: ab12c…   Status: running
+✨ Pixi task (serve): uvicorn app:main --host 0.0.0.0 --port 8080
+INFO:     Uvicorn running on http://0.0.0.0:8080         # live, and you're watching it
+
+# edited the code? push it to the SAME task — no teardown, no re-setup:
+^C
+Interrupted! Choose:
+1) Terminate remote task and exit
+2) Let task continue and exit
+3) Restart remote task and exit
+4) Redeploy current code to task
+5) Continue monitoring
+6) Restart task and keep monitoring
+Enter 1-6: 4
+Task redeployed.
+```
+
+Combine with `--offline-mode` (use case 2) to ship the same app — env and all — to a host with no
+internet at all.
+
 ## Built on Pixi
 
 RIXI is a remote runner for [Pixi](https://pixi.sh/) projects — *Remote Interaction and Execution
