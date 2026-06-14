@@ -16,3 +16,7 @@ cryptography = "*"
 pydantic = ">=2.0"
 lz4 = ">=4.4.4,<5"
 pyjwt = "*"
+pytest = ">=8"
+
+[tasks]
+test = "pytest tests/"

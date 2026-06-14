@@ -51,6 +51,35 @@ pixi run python rixi_simple_client.py --server http://localhost:9000
 | `--validate-dependencies` / `--show-package-size` | Inspect the bundle before sending |
 | `--with-mcp` / `--with-external-mcp` | Enable the MCP back-channel / external routing |
 | `--server-from-token` | (opt-in) derive the server URL from JWT claims |
+| `--header 'K: V'` / `--headers-file PATH` | Extra HTTP headers on every request (see below) |
+
+## Custom request headers
+
+Send arbitrary HTTP headers on **every** request to the server — handy when RIXI sits behind an
+auth proxy, API gateway, or load balancer that expects custom headers. Headers come from three
+sources (low→high precedence: config < file < CLI), and values support `${env:VAR}` and
+`${file:path}` expansion so external programs can supply secrets via the environment or a file
+without editing commands:
+
+```bash
+# 1) ad-hoc, repeatable
+pixi run python rixi_client.py --server … --task deploy \
+  --header 'X-Tenant: acme' --header "X-Trace-Id: $(uuidgen)"
+
+# 2) a JSON template an external program writes (auto-loaded if named rixi_headers.json)
+cp rixi_headers.example.json rixi_headers.json   # then your tooling fills it in
+#   { "X-Tenant": "acme", "Authorization": "Bearer ${env:RIXI_TOKEN}" }
+RIXI_TOKEN=… pixi run python rixi_client.py --server … --task deploy
+
+# 3) a [config.headers] table in pixi_remote_config.toml (see the .example)
+
+# preview what would be sent (secrets masked) without connecting:
+pixi run python rixi_client.py --show-headers
+```
+
+Per-request headers (the `Authorization` from `--bearer-token`, `Content-Type`) still take
+precedence, so this is purely additive. `rixi_headers.json` is gitignored (it may hold secrets);
+the lightweight client supports `--header` / `--headers-file` too.
 
 ## Deploy, detach, attach
 

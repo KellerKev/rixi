@@ -5,3 +5,11 @@ server-url = "http://YOUR_SERVER_HOST:9000"
 # so a real token must be injected here at deploy time (e.g. via templating or
 # a gitignored local override file). The value below is a placeholder only.
 bearer_token = "REPLACE_WITH_REAL_TOKEN_AT_DEPLOY_TIME"
+
+# Arbitrary HTTP headers sent on every request to the server (e.g. to pass an auth
+# proxy / API gateway in front of RIXI). Values support ${env:VAR} and ${file:path}
+# expansion (resolved by the client), so secrets can be injected from the environment.
+# CLI --header flags and a rixi_headers.json file override these.
+# [config.headers]
+# X-Tenant = "acme"
+# Authorization = "Bearer ${env:RIXI_TOKEN}"

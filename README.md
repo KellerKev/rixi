@@ -438,6 +438,10 @@ Clients read a `pixi_remote_config.toml` from the working directory for the serv
 bearer token; copy [`agent/pixi_remote_config.toml.example`](agent/pixi_remote_config.toml.example)
 and fill in real values (never commit them).
 
+To send arbitrary HTTP headers on every request (e.g. behind an auth proxy or API gateway), use
+`--header`, a `[config.headers]` table, or a JSON template — see
+[Custom request headers](clients/README.md#custom-request-headers).
+
 ## Air-gapped / Offline Deployment
 
 For targets with no internet access, the client can bundle the project's **resolved Pixi

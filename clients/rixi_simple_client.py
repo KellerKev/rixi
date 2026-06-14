@@ -6,7 +6,9 @@ import argparse, base64, os, pathlib, signal, sys, tarfile, tempfile
 from typing import Dict
 import shutil
 import lz4.frame
-from rixi_transport import Transport, _http, _hdrs
+from rixi_transport import (
+    Transport, _http, _hdrs, DEFAULT_HEADERS_FILE, build_custom_headers, set_default_headers,
+)
 
 # ───────────────────────── Globals ────────────────────────────────────────
 transport = Transport()
@@ -96,6 +98,10 @@ def main():
     ap.add_argument("--attach-history")
     ap.add_argument("--bearer-token",    default=cfg.get("bearer_token"))
     ap.add_argument("--snowflake-token", default=cfg.get("snowflake_token"))
+    ap.add_argument("--header", action="append", metavar="'Key: Value'",
+                    help="Extra HTTP header on every request (repeatable; supports ${env:VAR}/${file:path})")
+    ap.add_argument("--headers-file", default=None,
+                    help=f"JSON file of headers to send (default: {DEFAULT_HEADERS_FILE} if present)")
     ap.add_argument("--aes-key", help="Path to base64 AES key file")
     # NEW flags
     ap.add_argument("--handshake-secret", help="Do handshake then run/attach")
@@ -104,6 +110,7 @@ def main():
 
     transport.server_url = args.server
     transport.auth_headers = _hdrs(args.bearer_token, args.snowflake_token)
+    set_default_headers(build_custom_headers(args.header, args.headers_file, cfg.get("headers", {})))
     # ➊ optional handshake first
     if args.handshake_secret:
         transport.perform_handshake(args.handshake_secret, rotate=False)

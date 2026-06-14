@@ -12,6 +12,8 @@ rotation.secret
 # Runtime-generated client artifacts
 mcp_info.json
 .offline_metadata.json
+# Populated custom request headers (may contain secrets); keep the .example
+rixi_headers.json
 
 # Logs
 logs/

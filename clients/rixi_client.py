@@ -45,7 +45,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from rixi_transport import (
     Transport, NONCE_LEN, STREAM_TIMEOUT, _http, _http_session, _hdrs,
-    _write_secret_file,
+    _write_secret_file, DEFAULT_HEADERS_FILE, build_custom_headers,
+    set_default_headers, mask_header_value,
 )
 
 # Optional aiohttp import for external MCP servers
@@ -2866,7 +2867,14 @@ def main():
     # Leave tokens unset by default; resolve via precedence (CLI > env > config)
     parser.add_argument("--bearer-token", default=None, help="Bearer token")
     parser.add_argument("--snowflake-token", default=None, help="Snowflake token")
-    parser.add_argument("--aes-key", default="aes.key" if Path("aes.key").exists() else None, 
+    parser.add_argument("--header", action="append", metavar="'Key: Value'",
+                       help="Extra HTTP header to send on every request (repeatable). "
+                            "Values support ${env:VAR} and ${file:path}.")
+    parser.add_argument("--headers-file", default=None,
+                       help=f"JSON file of headers to send (default: {DEFAULT_HEADERS_FILE} if present)")
+    parser.add_argument("--show-headers", action="store_true",
+                       help="Show the custom headers that would be sent (secrets masked) and exit")
+    parser.add_argument("--aes-key", default="aes.key" if Path("aes.key").exists() else None,
                        help="Path to base64 AES key file")
     
     # Handshake support (matching original)
@@ -2963,6 +2971,18 @@ def main():
 
     _auth_headers = _hdrs(bearer_token, snowflake_token)
     transport.auth_headers = _auth_headers
+
+    # Arbitrary custom headers (config < file < CLI), applied to every request.
+    _custom_headers = build_custom_headers(args.header, args.headers_file, cfg.get("headers", {}))
+    if args.show_headers:
+        if _custom_headers:
+            print("📨 Custom request headers:")
+            for _k, _v in _custom_headers.items():
+                print(f"  {_k}: {mask_header_value(_k, _v)}")
+        else:
+            print("📨 No custom request headers configured.")
+        return
+    set_default_headers(_custom_headers)
 
     if args.help_proxy:
         print("🌐 HTTP Proxy Help")

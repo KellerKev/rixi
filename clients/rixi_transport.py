@@ -2,8 +2,9 @@
 """Shared transport/encryption logic for the pixi Remote Runner clients."""
 
 from __future__ import annotations
-import base64, json, os, sys
-from typing import Dict, Optional
+import base64, json, os, re, sys
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import requests
 from cryptography.hazmat.primitives import serialization, hashes
@@ -41,6 +42,106 @@ def _hdrs(bearer: str | None, snowflake: str | None) -> Dict[str, str]:
     if snowflake: h["Authorization"] = f'Snowflake Token="{snowflake}"'
     elif bearer:  h["Authorization"] = f"Bearer {bearer}"
     return h
+
+
+# ───────────────────── Custom request headers ─────────────────────────────
+# Arbitrary HTTP headers that the client sends to the server on every request.
+# Populated from (low→high precedence) a [config.headers] table, a JSON template
+# file, and repeatable --header CLI flags. Values support ${env:VAR} / ${file:path}
+# expansion so external programs can drop in secrets via the environment or a file.
+
+DEFAULT_HEADERS_FILE = "rixi_headers.json"
+
+
+def resolve_placeholders(value: str) -> str:
+    """Expand ${env:NAME} and ${file:path} placeholders in a header value."""
+    if not isinstance(value, str):
+        return value
+
+    def _env(m):
+        return os.getenv(m.group(1), "")
+
+    def _file(m):
+        try:
+            return Path(m.group(1)).read_text().strip()
+        except Exception:
+            return ""
+
+    value = re.sub(r"\$\{env:([^}]+)\}", _env, value)
+    value = re.sub(r"\$\{file:([^}]+)\}", _file, value)
+    return value
+
+
+def _parse_cli_header(item: str) -> Optional[tuple]:
+    """Parse a curl-style 'Key: Value' string into (key, value)."""
+    if not item or ":" not in item:
+        return None
+    key, val = item.split(":", 1)
+    key = key.strip()
+    return (key, val.strip()) if key else None
+
+
+def build_custom_headers(cli_headers: Optional[List[str]],
+                         headers_file: Optional[str],
+                         config_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Merge custom headers from config < file < CLI, resolving ${env:}/${file:} values.
+
+    Headers whose value resolves to empty are dropped. Returns {} when nothing is set,
+    so callers can apply it unconditionally without changing default behavior.
+    """
+    merged: Dict[str, str] = {}
+
+    if config_headers:
+        for k, v in config_headers.items():
+            if str(k).strip():
+                merged[str(k).strip()] = str(v)
+
+    path = headers_file or (DEFAULT_HEADERS_FILE if os.path.exists(DEFAULT_HEADERS_FILE) else None)
+    if path:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            for k, v in data.items():
+                k = str(k).strip()
+                # allow comment keys like "//" or "_comment" in the template
+                if k and not k.startswith(("//", "_")):
+                    merged[k] = str(v)
+        except FileNotFoundError:
+            if headers_file:  # explicit path that doesn't exist is worth flagging
+                print(f"⚠️ headers file not found: {path}")
+        except Exception as e:
+            print(f"⚠️ Could not load headers file {path}: {e}")
+
+    for item in (cli_headers or []):
+        parsed = _parse_cli_header(item)
+        if parsed:
+            merged[parsed[0]] = parsed[1]
+        else:
+            print(f"⚠️ Ignoring malformed --header (expected 'Key: Value'): {item!r}")
+
+    resolved: Dict[str, str] = {}
+    for k, v in merged.items():
+        rv = resolve_placeholders(v)
+        if rv != "":
+            resolved[k] = rv
+    return resolved
+
+
+def set_default_headers(headers: Optional[Dict[str, str]]):
+    """Apply default headers to every request made through the shared session.
+
+    requests merges Session.headers into each request, with per-request headers
+    overriding — so existing Authorization/Content-Type headers still take precedence.
+    """
+    if headers:
+        _http_session.headers.update(headers)
+
+
+def mask_header_value(key: str, value: str) -> str:
+    """Mask values for sensitive-looking header keys (for --show-headers previews)."""
+    if re.search(r"authorization|token|secret|key|cookie", key, re.IGNORECASE):
+        return "***"
+    return value
 
 
 class Transport:
