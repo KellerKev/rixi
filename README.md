@@ -438,9 +438,39 @@ Clients read a `pixi_remote_config.toml` from the working directory for the serv
 bearer token; copy [`agent/pixi_remote_config.toml.example`](agent/pixi_remote_config.toml.example)
 and fill in real values (never commit them).
 
-To send arbitrary HTTP headers on every request (e.g. behind an auth proxy or API gateway), use
-`--header`, a `[config.headers]` table, or a JSON template — see
-[Custom request headers](clients/README.md#custom-request-headers).
+### Custom request headers
+
+The clients can attach arbitrary HTTP headers to **every** request they make to the server — handy
+when RIXI sits behind an auth proxy, API gateway, or load balancer that expects custom headers.
+Headers come from three sources (precedence low→high: config < file < CLI), and values support
+`${env:VAR}` and `${file:path}` expansion so external programs can inject secrets via the
+environment or a file:
+
+```bash
+# 1) Ad-hoc on the command line (repeatable, curl-style)
+pixi run python rixi_client.py --server https://gw.example.com --task deploy \
+  --header 'X-Tenant: acme' --header "X-Trace-Id: $(uuidgen)"
+
+# 2) A JSON template an external program populates. Copy the example, fill it in,
+#    and it's picked up automatically when named rixi_headers.json (or pass --headers-file).
+cp clients/rixi_headers.example.json rixi_headers.json
+#    rixi_headers.json:
+#    { "X-Tenant": "acme", "Authorization": "Bearer ${env:RIXI_TOKEN}" }
+RIXI_TOKEN=sk-… pixi run python rixi_client.py --server https://gw.example.com --task deploy
+
+# 3) A [config.headers] table in pixi_remote_config.toml (see the .example):
+#    [config.headers]
+#    X-Tenant = "acme"
+#    Authorization = "Bearer ${env:RIXI_TOKEN}"
+
+# Preview exactly what would be sent (secrets masked) without connecting:
+pixi run python rixi_client.py --show-headers
+```
+
+This is purely additive: per-request headers (the `Authorization` from `--bearer-token`,
+`Content-Type`) still take precedence, and behavior is unchanged when no headers are set.
+`rixi_headers.json` is gitignored since it may hold secrets; both the full and lightweight clients
+support `--header` / `--headers-file`. More detail in [`clients/README.md`](clients/README.md#custom-request-headers).
 
 ## Air-gapped / Offline Deployment
 
