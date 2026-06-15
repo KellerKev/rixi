@@ -229,6 +229,77 @@ Task redeployed.
 Combine with `--offline-mode` (use case 2) to ship the same app — env and all — to a host with no
 internet at all.
 
+## Secure MCP (SMCP)
+
+rixi's agent speaks [MCP](https://modelcontextprotocol.io/) for tool access — and now also
+**SMCP** (Secure MCP), a hardened, network-native variant from the
+[**smcp** project](https://github.com/KellerKev/smcp). SMCP is added as a **second protocol on the
+same MCP interface**, in **both directions**:
+
+- **As a client**, rixi's agent connects out to an SMCP server (e.g. [malgra](https://github.com/KellerKev/malgra))
+  and its tools appear right alongside the agent's normal MCP tools.
+- **As a server**, rixi exposes its own tools (filesystem, web search) over SMCP so other agents
+  (e.g. [wolfgang](https://github.com/KellerKev/wolfgang)) can call them securely.
+
+### Why SMCP over plain MCP
+
+Standard MCP talks to a **local subprocess over stdio** with no built-in auth or encryption. SMCP
+keeps the same tool model but makes it safe to use **over a network and shared between agents**:
+
+| | Standard MCP | SMCP |
+|---|---|---|
+| Transport | local stdio subprocess | WebSocket (remote-capable, multi-agent) |
+| Encryption | none | Fernet (AES) on every payload after handshake |
+| Authentication | none | `api_key` → short-lived **JWT** session token |
+| Integrity | none | **HMAC-SHA256** signature on every message |
+| Identity / audit | n/a | per-agent API keys map to an agent identity |
+| Interop | — | one wire format across rixi, malgra, wolfgang |
+
+It's the same `transport` slot in your config — existing stdio MCP servers are untouched
+(`transport` defaults to `stdio`), so SMCP is purely additive.
+
+### Quickstart
+
+**Use a remote SMCP server's tools from the rixi agent** — add one entry to your agent config
+(`agent/agent_config.example.yaml`); the tools are discovered automatically:
+
+```yaml
+mcp:
+  servers:
+    - name: "malgra"
+      transport: "smcp"
+      url: "ws://localhost:8767"
+      api_key: "demo_key_123"
+      secret_key: "my_secret_key_2024"   # shared Fernet/HMAC secret (must match the server)
+```
+
+**Expose rixi's own tools over SMCP** for other agents to call:
+
+```bash
+cd agent
+RIXI_SMCP_SECRET=my_secret_key_2024 RIXI_SMCP_API_KEY=demo_key_123 \
+  pixi run smcp-serve -- --bind 127.0.0.1:8770 --root /workspace
+```
+
+**Verify it** with the bundled probe (handshake → auth → discover → invoke):
+
+```console
+$ cd examples/agent-demos
+$ SMCP_SECRET=my_secret_key_2024 SMCP_API_KEY=demo_key_123 python smcp_probe.py
+1-3. handshake + auth + discover ok; tools: ['read_file', 'write_file', 'list_directory', 'create_directory', 'web_search', 'search_documents']
+4. list_directory('.') → ['tests', 'README.md', 'agent_config.example.yaml', 'mcp_manager.py', 'smcp.py'] …
+
+SMCP INTEROP OK
+
+# a wrong key is rejected:
+$ SMCP_API_KEY=wrongkey python smcp_probe.py
+RuntimeError: smcp auth failed: {'error': 'Authentication failed'}
+```
+
+Details, config keys, and the server template are in
+[`agent/README.md`](agent/README.md#smcp-secure-mcp) and
+[`agent/smcp_config.example.toml`](agent/smcp_config.example.toml).
+
 ## Built on Pixi
 
 RIXI is a remote runner for [Pixi](https://pixi.sh/) projects — *Remote Interaction and Execution
@@ -299,6 +370,7 @@ Each component has its own guide, and the examples have a walkthrough:
 | **Task Lifecycle** | Upload, execute, monitor, stream, restart, terminate, redeploy |
 | **Real-time Streaming** | Length-prefixed encrypted frames for live output |
 | **MCP Integration** | Extensible tool access (filesystem, web search, custom) |
+| **SMCP (Secure MCP)** | Encrypted, authenticated, signed MCP over WebSocket — client & server ([smcp](https://github.com/KellerKev/smcp)) |
 | **Pixi-native** | Tasks are Pixi projects; the server runs `pixi run <task>` in an isolated subprocess |
 | **Air-gapped / Offline** | Bundle the resolved `.pixi/` environment with the code for dependency-free execution on disconnected hosts |
 | **Pluggable agents** | Pluggable inference backend with optional CrewAI multi-agent integration |
@@ -434,10 +506,8 @@ Fully-populated demo configs (multiple workflows, the haiku pipeline) live with 
 use them in [`examples/agent-demos/`](examples/agent-demos/). The inference server is configured
 entirely by environment variables (see [`inference-server/README.md`](inference-server/README.md)).
 
-The agent's MCP interface also speaks **SMCP** (Secure MCP) — both as a client (consume external
-secure tools) and a server (expose rixi's tools over an encrypted WebSocket), interoperating with
-the [smcp](https://github.com/KellerKev/smcp) ecosystem. See
-[`agent/README.md`](agent/README.md#smcp-secure-mcp).
+The agent's MCP interface also speaks **SMCP** (Secure MCP) as a second protocol — see
+[Secure MCP (SMCP)](#secure-mcp-smcp) above.
 
 Clients read a `pixi_remote_config.toml` from the working directory for the server URL and
 bearer token; copy [`agent/pixi_remote_config.toml.example`](agent/pixi_remote_config.toml.example)
