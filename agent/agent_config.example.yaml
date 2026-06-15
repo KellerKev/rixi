@@ -27,6 +27,15 @@ mcp:
       tools: ["web_search"]
       description: "Web search capabilities"
 
+    # SMCP (Secure MCP) server — another transport on the same interface. Connects over
+    # an encrypted WebSocket (handshake -> auth -> discover -> invoke); tools are discovered
+    # from the server. Interops with malgra's [smcp] server and wolfgang.
+    # - name: "malgra"
+    #   transport: "smcp"
+    #   url: "ws://localhost:8767"
+    #   api_key: "demo_key_123"
+    #   secret_key: "my_secret_key_2024"   # shared Fernet/HMAC secret (must match the server)
+
 # Named generation profiles referenced by workflow steps.
 generation:
   default:

@@ -434,6 +434,11 @@ Fully-populated demo configs (multiple workflows, the haiku pipeline) live with 
 use them in [`examples/agent-demos/`](examples/agent-demos/). The inference server is configured
 entirely by environment variables (see [`inference-server/README.md`](inference-server/README.md)).
 
+The agent's MCP interface also speaks **SMCP** (Secure MCP) — both as a client (consume external
+secure tools) and a server (expose rixi's tools over an encrypted WebSocket), interoperating with
+the [smcp](https://github.com/KellerKev/smcp) ecosystem. See
+[`agent/README.md`](agent/README.md#smcp-secure-mcp).
+
 Clients read a `pixi_remote_config.toml` from the working directory for the server URL and
 bearer token; copy [`agent/pixi_remote_config.toml.example`](agent/pixi_remote_config.toml.example)
 and fill in real values (never commit them).

@@ -60,6 +60,40 @@ python -m mcp_servers web_search              # DuckDuckGo/Searx/Google (honest 
 These command arrays appear in the `mcp.servers[].command` entries of the config files — keep
 them in sync with the module if you rename it.
 
+## SMCP (Secure MCP)
+
+The agent's MCP interface also speaks **SMCP** ([github.com/KellerKev/smcp](https://github.com/KellerKev/smcp))
+— a WebSocket MCP variant with a Fernet-encrypted, HMAC-signed envelope and a
+`handshake → auth → capability_discovery → tool_invoke` flow. It interoperates with the same
+ecosystem as malgra (server) and wolfgang (client). Both directions are supported, all in
+[`smcp.py`](smcp.py):
+
+**Client** — consume an external SMCP server's tools, as just another transport in the MCP manager.
+Add an `mcp.servers` entry with `transport: smcp` and the tools appear alongside your other MCP
+tools (existing `command`/stdio servers are unchanged — `transport` defaults to `stdio`):
+
+```yaml
+mcp:
+  servers:
+    - name: "malgra"
+      transport: "smcp"
+      url: "ws://localhost:8767"
+      api_key: "demo_key_123"
+      secret_key: "my_secret_key_2024"   # shared Fernet/HMAC secret (must match the server)
+```
+
+**Server** — expose rixi's own MCP tools (filesystem, web search) over SMCP so other agents can
+call them securely:
+
+```bash
+RIXI_SMCP_SECRET=my_secret_key_2024 RIXI_SMCP_API_KEY=demo_key_123 \
+  pixi run smcp-serve -- --bind 127.0.0.1:8770 --root /workspace
+```
+
+See [`smcp_config.example.toml`](smcp_config.example.toml) for the server config, and
+[`../examples/agent-demos/smcp_probe.py`](../examples/agent-demos/smcp_probe.py) for a
+handshake→auth→discover→invoke connectivity probe.
+
 ## Configuration
 
 `agent_config.example.yaml` is the in-place template (the default for `start_agent.py` and what

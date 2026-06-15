@@ -22,24 +22,33 @@ class MCPServerState(Enum):
 class MCPServerConfig:
     """MCP server configuration"""
     name: str
-    command: List[str]
+    command: List[str] = field(default_factory=list)
     working_dir: Optional[str] = None
     env_vars: Dict[str, str] = field(default_factory=dict)
     tools: List[str] = field(default_factory=list)
     description: str = ""
     mode: str = "real"  # "real" or "simulation"
+    # Transport: "stdio" (subprocess MCP, the default) or "smcp" (Secure MCP over WebSocket).
+    transport: str = "stdio"
+    url: Optional[str] = None          # ws://host:port for smcp
+    api_key: str = ""                  # smcp auth
+    secret_key: str = ""               # smcp Fernet/HMAC shared secret
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'MCPServerConfig':
         """Create config from dictionary (for YAML loading)"""
         return cls(
             name=config_dict['name'],
-            command=config_dict['command'],
+            command=config_dict.get('command', []),
             working_dir=config_dict.get('working_dir'),
             env_vars=config_dict.get('env_vars', {}),
             tools=config_dict.get('tools', []),
             description=config_dict.get('description', ''),
-            mode=config_dict.get('mode', 'real')
+            mode=config_dict.get('mode', 'real'),
+            transport=config_dict.get('transport', 'stdio'),
+            url=config_dict.get('url'),
+            api_key=config_dict.get('api_key', ''),
+            secret_key=config_dict.get('secret_key', ''),
         )
 
 @dataclass
@@ -52,6 +61,7 @@ class MCPServerInstance:
     available_tools: List[str] = field(default_factory=list)
     server_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     is_real: bool = True
+    smcp_client: Optional[Any] = None  # set for transport == "smcp"
 
 class MCPManager:
     """FIXED MCP manager that actually calls real servers"""
@@ -111,6 +121,18 @@ class MCPManager:
         try:
             instance.state = MCPServerState.STARTING
             instance.start_time = time.time()
+
+            # SMCP transport: connect over the secure WebSocket and discover tools.
+            if instance.config.transport == "smcp":
+                ok = await self._start_smcp_server(instance)
+                if not ok:
+                    instance.state = MCPServerState.ERROR
+                    return False
+                instance.state = MCPServerState.RUNNING
+                for tool in instance.available_tools:
+                    self.tool_registry[tool] = server_name
+                print(f"✅ Started SMCP server: {server_name} ({len(instance.available_tools)} tools)")
+                return True
 
             if instance.is_real and instance.config.mode != "simulation":
                 # For filesystem servers, we don't need a subprocess - use direct implementation
@@ -187,6 +209,33 @@ class MCPManager:
             print(f"❌ Failed to start real MCP server: {e}")
             return False
 
+    async def _start_smcp_server(self, instance: MCPServerInstance) -> bool:
+        """Connect to an SMCP (Secure MCP) server and discover its tools."""
+        try:
+            from smcp import SMCPClient, SMCPConfig
+        except Exception as e:
+            print(f"❌ SMCP client unavailable (need websockets + cryptography): {e}")
+            return False
+
+        cfg = SMCPConfig()
+        cfg.server_url = instance.config.url or ""
+        cfg.api_key = instance.config.api_key
+        cfg.secret_key = instance.config.secret_key
+        cfg.node_id = "rixi"
+        client = SMCPClient(cfg)
+        try:
+            await client.connect()
+        except Exception as e:
+            print(f"❌ SMCP connect failed for {instance.config.name}: {e}")
+            return False
+
+        instance.smcp_client = client
+        instance.is_real = True
+        # Prefer the server-advertised capabilities; fall back to configured tools.
+        instance.available_tools = list(client.capabilities.keys()) or list(instance.config.tools)
+        print(f"🔐 SMCP connected: {instance.config.name} → tools {instance.available_tools}")
+        return True
+
     async def _discover_real_tools(self, instance: MCPServerInstance) -> List[str]:
         """Discover tools from real MCP server"""
         # This would implement the actual MCP tool discovery protocol
@@ -223,6 +272,13 @@ class MCPManager:
             return True
 
         try:
+            if instance.smcp_client is not None:
+                try:
+                    await instance.smcp_client.disconnect()
+                except Exception:
+                    pass
+                instance.smcp_client = None
+
             if instance.process:
                 instance.process.terminate()
                 try:
@@ -256,6 +312,12 @@ class MCPManager:
             raise RuntimeError(f"Server '{server_name}' not running")
 
         print(f"🔧 Calling tool {tool_name} on server {server_name} (real={instance.is_real})")
+
+        # SMCP transport: invoke over the secure WebSocket session.
+        if instance.config.transport == "smcp" and instance.smcp_client is not None:
+            result = await instance.smcp_client.invoke_tool(tool_name, **(params or {}))
+            return {"success": True, "result": result, "tool_name": tool_name,
+                    "server_name": server_name, "server_mode": "smcp"}
 
         # FIXED: Always try real implementation first for filesystem operations
         if tool_name in ["read_file", "write_file", "list_directory", "create_directory"]:
@@ -413,6 +475,19 @@ def create_web_search_server_config(name: str, api_key: str = "", mode: str = "r
         tools=["web_search", "search_documents", "search_images"],
         description="Web search server",
         mode=mode
+    )
+
+def create_smcp_server_config(name: str, url: str, api_key: str = "", secret_key: str = "",
+                              tools: Optional[List[str]] = None) -> MCPServerConfig:
+    """Create an SMCP (Secure MCP) server config — connects over a Fernet/HMAC WebSocket."""
+    return MCPServerConfig(
+        name=name,
+        transport="smcp",
+        url=url,
+        api_key=api_key,
+        secret_key=secret_key,
+        tools=tools or [],
+        description=f"SMCP server at {url}",
     )
 
 def load_server_configs_from_dict(config_dict: Dict[str, Any]) -> List[MCPServerConfig]:

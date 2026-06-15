@@ -14,6 +14,8 @@ mcp_info.json
 .offline_metadata.json
 # Populated custom request headers (may contain secrets); keep the .example
 rixi_headers.json
+# Populated SMCP server config (may contain secrets); keep the .example
+smcp_config.toml
 
 # Logs
 logs/
