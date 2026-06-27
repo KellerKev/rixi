@@ -1,0 +1,20 @@
+[project]
+name = "rixi-tunnel"
+version = "0.1.0"
+description = "RIXI reverse tunnel — reach a firewalled rixi server over an outbound encrypted tunnel"
+authors = ["Kevin Keller <kellerkev@gmail.com>"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+
+[dependencies]
+python = ">=3.10"
+websockets = ">=12"
+cryptography = ">=44"
+pytest = ">=8"
+
+[tasks]
+# Reachable side: accept the outbound tunnel and expose a local port
+listen = "python rixi_tunnel.py listen"
+# Firewalled side: dial out and forward to a local target (the rixi server)
+connect = "python rixi_tunnel.py connect"
+test = "pytest tests/"

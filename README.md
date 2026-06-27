@@ -229,6 +229,26 @@ Task redeployed.
 Combine with `--offline-mode` (use case 2) to ship the same app — env and all — to a host with no
 internet at all.
 
+### 7. Reach a server behind a firewall (reverse tunnel)
+
+If the rixi server can't accept inbound connections, run it **outbound** instead: the firewalled
+host dials out over an AES-encrypted tunnel to a reachable host, which exposes a local port wired
+straight through to the server. The client then talks to `http://127.0.0.1:<port>` as if the server
+were local — all features (upload, streaming, handshake) pass through because the tunnel forwards
+raw TCP. See [`tunnel/`](tunnel/).
+
+```console
+# reachable host (e.g. your laptop): accept the tunnel, expose a local port
+$ RIXI_TUNNEL_SECRET=… pixi run listen -- --bind 127.0.0.1:9100 --ws-bind 0.0.0.0:7000
+
+# firewalled host (next to the server): dial out and forward to the local rixi server
+$ RIXI_TUNNEL_SECRET=… pixi run connect -- --to ws://laptop:7000 --target 127.0.0.1:9000
+
+# now drive the firewalled server as if it were local:
+$ rixi-client --server http://127.0.0.1:9100 --task hello
+Hello from RIXI! Running on Python 3.14.6.
+```
+
 ## Secure MCP (SMCP)
 
 rixi's agent speaks [MCP](https://modelcontextprotocol.io/) for tool access — and now also
@@ -339,6 +359,9 @@ rixi/
 ├── inference-server/    # Pluggable LLM inference backend (HuggingFace / Ollama)
 │   ├── inference_server.py
 │   └── pixi.toml
+├── tunnel/              # Reverse tunnel: reach a firewalled server over an outbound encrypted link
+│   ├── rixi_tunnel.py
+│   └── pixi.toml
 ├── examples/            # Runnable demos (see examples/README.md)
 │   ├── hello/                # Minimal Pixi task used by the quickstart
 │   ├── crewai-showcase/      # Optional CrewAI + Ollama multi-agent showcase
@@ -359,6 +382,7 @@ Each component has its own guide, and the examples have a walkthrough:
 - [`agent/README.md`](agent/README.md) — the multi-agent engine + MCP tool servers
 - [`proxy/README.md`](proxy/README.md) — the API-compatibility proxy
 - [`inference-server/README.md`](inference-server/README.md) — the LLM inference backend
+- [`tunnel/README.md`](tunnel/README.md) — reverse tunnel for firewalled servers
 - [`examples/README.md`](examples/README.md) — **how to run every example** (`hello`, `crewai-showcase`, `http-backends`, `agent-demos`)
 
 ## Key Features
@@ -371,6 +395,7 @@ Each component has its own guide, and the examples have a walkthrough:
 | **Real-time Streaming** | Length-prefixed encrypted frames for live output |
 | **MCP Integration** | Extensible tool access (filesystem, web search, custom) |
 | **SMCP (Secure MCP)** | Encrypted, authenticated, signed MCP over WebSocket — client & server ([smcp](https://github.com/KellerKev/smcp)) |
+| **Reverse Tunnel** | Reach firewalled servers via an outbound AES-encrypted, multiplexed tunnel (raw-TCP, protocol-agnostic) |
 | **Pixi-native** | Tasks are Pixi projects; the server runs `pixi run <task>` in an isolated subprocess |
 | **Air-gapped / Offline** | Bundle the resolved `.pixi/` environment with the code for dependency-free execution on disconnected hosts |
 | **Pluggable agents** | Pluggable inference backend with optional CrewAI multi-agent integration |
