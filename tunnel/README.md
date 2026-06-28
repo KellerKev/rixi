@@ -62,3 +62,16 @@ rixi_client.py --server http://127.0.0.1:9100 --task hello
   terminate the WebSocket behind TLS (`wss://`) at a reverse proxy.
 - This is the open-core connectivity primitive. A central **gateway** (registration, routing, and
   firing actions like provisioning a GPU server) builds on top of it.
+
+## Provisioned servers ([`../bootstrap.sh`](../bootstrap.sh))
+
+For a freshly-provisioned (e.g. cloud) box, [`bootstrap.sh`](../bootstrap.sh) installs the rixi
+server **and** a tunnel agent on the host and dials a gateway — everything from env
+(`RIXI_GATEWAY_URL`, `RIXI_NODE_ID`, `RIXI_TUNNEL_SECRET`, `RIXI_SERVER_PORT`). It's meant for
+cloud-init user-data, so a new box comes up already reachable through the tunnel with no inbound
+holes:
+
+```bash
+RIXI_GATEWAY_URL=ws://gateway:7100 RIXI_NODE_ID=<token> RIXI_TUNNEL_SECRET=… \
+  curl -fsSL https://raw.githubusercontent.com/KellerKev/rixi/main/bootstrap.sh | bash
+```
