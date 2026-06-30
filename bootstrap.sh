@@ -16,6 +16,11 @@
 #
 set -euo pipefail
 
+# cloud-init's runcmd runs without a login environment, so HOME may be unset.
+HOME="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
+HOME="${HOME:-/root}"
+export HOME
+
 GATEWAY_URL="${RIXI_GATEWAY_URL:?set RIXI_GATEWAY_URL}"
 NODE_ID="${RIXI_NODE_ID:?set RIXI_NODE_ID}"
 TUNNEL_SECRET="${RIXI_TUNNEL_SECRET:?set RIXI_TUNNEL_SECRET}"
