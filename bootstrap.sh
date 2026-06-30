@@ -15,6 +15,8 @@
 #   RIXI_KEY_SECRET     optional rixi server handshake secret → enables the client↔server AES key
 #                       handshake (true end-to-end encryption through a gateway). Empty = open mode.
 #   RIXI_KEY_SECRET_USES  max successful handshakes (0 = unlimited; default 0 when a secret is set)
+#   RIXI_JWT_JWKS_URL   optional JWKS URL → server requires a valid JWT (--jwks-url; enforced auth)
+#   RIXI_JWT_PUBLIC_KEY optional PEM public key → server requires a valid JWT (--public-key)
 #
 set -euo pipefail
 
@@ -77,6 +79,15 @@ SERVER_EXEC="$PIXI run --manifest-path $RIXI_DIR/server/pixi.toml python rixi_se
 if [ -n "${RIXI_KEY_SECRET:-}" ]; then
   SERVER_EXEC="$SERVER_EXEC --key-secret-uses ${RIXI_KEY_SECRET_USES:-0}"
   log "rixi server: AES key handshake ENABLED (end-to-end encryption available)"
+fi
+# Enforced auth: require a valid JWT on every request (JWKS URL preferred; PEM as a fallback).
+if [ -n "${RIXI_JWT_JWKS_URL:-}" ]; then
+  SERVER_EXEC="$SERVER_EXEC --jwks-url $RIXI_JWT_JWKS_URL"
+  log "rixi server: JWT auth ENFORCED via JWKS"
+elif [ -n "${RIXI_JWT_PUBLIC_KEY:-}" ]; then
+  ( umask 077; printf '%s' "$RIXI_JWT_PUBLIC_KEY" > "$RIXI_DIR/jwt_pub.pem" )
+  SERVER_EXEC="$SERVER_EXEC --public-key $RIXI_DIR/jwt_pub.pem"
+  log "rixi server: JWT auth ENFORCED via public key"
 fi
 TUNNEL_EXEC="$PIXI run --manifest-path $RIXI_DIR/tunnel/pixi.toml python rixi_tunnel.py connect --to $GATEWAY_URL --node-id $NODE_ID --target 127.0.0.1:$SERVER_PORT"
 
