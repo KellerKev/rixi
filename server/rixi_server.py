@@ -784,7 +784,10 @@ def _make_reader(tid: Optional[str], get_info, proxy_label: str = ""):
                 if name == "output" and ln.strip():
                     try:
                         data = json.loads(ln.strip())
-                        if data.get("type") == "http_response":
+                        # Tasks may legitimately print bare JSON arrays/scalars; only
+                        # dict frames carry our protocol. Guard with isinstance so a
+                        # non-dict can't raise AttributeError and kill this reader loop.
+                        if isinstance(data, dict) and data.get("type") == "http_response":
                             logger.debug("HTTP response detected", extra={"task_id": tid})
                             print(f"🔄 {proxy_label}Detected HTTP response for task {tid}")
                             http_proxy_manager.set_response_for_task(tid, data)
@@ -1104,6 +1107,8 @@ async def stream_logs(
                     for line in f:
                         try:
                             log_entry = json.loads(line.strip())
+                            if not isinstance(log_entry, dict):
+                                continue
                             entry_level = getattr(logging, log_entry.get("level", "INFO"), logging.INFO)
                             if entry_level >= min_level:
                                 yield f"data: {line}\n\n"
@@ -1129,6 +1134,8 @@ async def stream_logs(
                         for line in f:
                             try:
                                 log_entry = json.loads(line.strip())
+                                if not isinstance(log_entry, dict):
+                                    continue
                                 entry_level = getattr(logging, log_entry.get("level", "INFO"), logging.INFO)
                                 if entry_level >= min_level:
                                     yield f"data: {line}\n\n"
@@ -1764,7 +1771,7 @@ async def task_http_proxy(
                     if line_type == "output" and content.strip():
                         try:
                             data = json.loads(content.strip())
-                            if data.get("type") == "http_response":
+                            if isinstance(data, dict) and data.get("type") == "http_response":
                                 print(f"✅ Found response in recent output for task {tid} ({deployment_type})")
                                 resp = data["data"]
                                 response_content = resp.get("body", "")
