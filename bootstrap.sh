@@ -12,7 +12,9 @@
 #   RIXI_REF            git ref of the public rixi to install                 [default main]
 #   RIXI_DIR            install location                                      [default ~/rixi]
 #   RIXI_REPO           rixi git URL                                          [default github]
-#   RIXI_KEY_SECRET     optional rixi handshake secret (passed to the server)
+#   RIXI_KEY_SECRET     optional rixi server handshake secret → enables the client↔server AES key
+#                       handshake (true end-to-end encryption through a gateway). Empty = open mode.
+#   RIXI_KEY_SECRET_USES  max successful handshakes (0 = unlimited; default 0 when a secret is set)
 #
 set -euo pipefail
 
@@ -70,6 +72,12 @@ chmod 600 "$ENV_FILE"
 
 # 5. services: rixi server (loopback) + tunnel agent dialing the gateway -----
 SERVER_EXEC="$PIXI run --manifest-path $RIXI_DIR/server/pixi.toml python rixi_server.py --port $SERVER_PORT"
+# Secure mode: with a handshake secret set (read from the env-file as RIXI_KEY_SECRET), enable the
+# AES key handshake so clients can negotiate end-to-end encryption through the gateway.
+if [ -n "${RIXI_KEY_SECRET:-}" ]; then
+  SERVER_EXEC="$SERVER_EXEC --key-secret-uses ${RIXI_KEY_SECRET_USES:-0}"
+  log "rixi server: AES key handshake ENABLED (end-to-end encryption available)"
+fi
 TUNNEL_EXEC="$PIXI run --manifest-path $RIXI_DIR/tunnel/pixi.toml python rixi_tunnel.py connect --to $GATEWAY_URL --node-id $NODE_ID --target 127.0.0.1:$SERVER_PORT"
 
 if command -v systemctl >/dev/null 2>&1; then
