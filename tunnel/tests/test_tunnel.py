@@ -8,27 +8,28 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 pytest.importorskip("websockets")
-from rixi_tunnel import derive_key, enc, dec, _proof, run_listen, run_connect  # noqa: E402
+from rixi_tunnel import derive_keys, enc, dec, _proof, run_listen, run_connect  # noqa: E402
 
 SECRET = "tunnel-test-secret"
 
 
 def test_frame_roundtrip():
-    key = derive_key(SECRET)
+    key, _pk = derive_keys(SECRET)
     obj = {"type": "session_data", "sid": "abc", "data": "ZGF0YQ=="}
     assert dec(enc(obj, key), key) == obj
 
 
 def test_wrong_key_cannot_decrypt():
     obj = {"type": "x"}
-    blob = enc(obj, derive_key(SECRET))
+    blob = enc(obj, derive_keys(SECRET)[0])
     with pytest.raises(Exception):
-        dec(blob, derive_key("different"))
+        dec(blob, derive_keys("different")[0])
 
 
 def test_proof_is_stable_and_keyed():
-    assert _proof(SECRET, "abc") == _proof(SECRET, "abc")
-    assert _proof(SECRET, "abc") != _proof("other", "abc")
+    pk = derive_keys(SECRET)[1]
+    assert _proof(pk, "abc") == _proof(pk, "abc")
+    assert _proof(pk, "abc") != _proof(derive_keys("other")[1], "abc")
 
 
 async def _free_port():
