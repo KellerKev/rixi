@@ -128,7 +128,11 @@ class SMCPClient:
 
     async def _rt(self, msg: dict) -> dict:
         await self._ws.send(json.dumps(msg))
-        return json.loads(await self._ws.recv())
+        resp = json.loads(await self._ws.recv())
+        # Mutual auth: every server reply must carry a valid payload-bound signature.
+        if self._mac_key and not _verify_signature(self._mac_key, resp):
+            raise RuntimeError("smcp: server message signature invalid (mutual auth failed)")
+        return resp
 
     async def connect(self) -> None:
         if not HAS_SMCP:
@@ -145,11 +149,16 @@ class SMCPClient:
         self._ws = await websockets.connect(url)
 
         # malgra's v3 server requires a non-empty handshake nonce (mutual-auth challenge it echoes back).
+        nonce = uuid.uuid4().hex
         r = await self._rt(mk("handshake", {"client_id": self.config.node_id or "rixi",
                                              "protocol_version": PROTOCOL_VERSION,
-                                             "nonce": uuid.uuid4().hex}, False))
+                                             "nonce": nonce}, False))
         if r.get("type") != "handshake":
             raise RuntimeError(f"smcp handshake failed: {r}")
+        # Mutual auth: confirm the server echoed our fresh nonce (rejects replayed/forged handshakes).
+        hs = _decrypt(f, r)
+        if not isinstance(hs, dict) or hs.get("client_nonce") != nonce:
+            raise RuntimeError("smcp: server did not echo our handshake nonce (possible MITM/replay)")
 
         auth = _decrypt(f, await self._rt(mk("auth", {"api_key": self.config.api_key or ""}, True)))
         if not isinstance(auth, dict) or auth.get("status") != "success":
@@ -273,11 +282,14 @@ class SMCPToolServer:
             inner = {}
 
         if mtype == "handshake":
+            # Mutual auth: echo the client's nonce so it can confirm the server holds the shared secret
+            # and is answering THIS handshake (not a replay).
             return self._reply("handshake", {
                 "node_id": self.node_id,
                 "protocol_version": PROTOCOL_VERSION,
                 "capabilities_count": len(self.tools),
                 "encryption_enabled": True,
+                "client_nonce": str(inner.get("nonce", "")),
             }, encrypt=False)
 
         if mtype == "auth":
