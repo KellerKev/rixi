@@ -219,10 +219,10 @@ run_ssh "mkdir -p '$REMOTE_DIR'"
 if command -v rsync >/dev/null 2>&1 && run_ssh 'command -v rsync >/dev/null 2>&1'; then
   RSH="ssh ${SSH_OPTS[*]}"
   if [ -n "$SSH_PASSWORD" ]; then
-    SSHPASS="$SSH_PASSWORD" rsync -az --delete -e "sshpass -e ssh ${SSH_OPTS[*]}" \
+    SSHPASS="$SSH_PASSWORD" rsync -az --delete --exclude '.pixi' --exclude '__pycache__' -e "sshpass -e ssh ${SSH_OPTS[*]}" \
       "$LOCAL_SERVER_DIR/" "$TARGET:$REMOTE_DIR/server/"
   else
-    rsync -az --delete -e "$RSH" "$LOCAL_SERVER_DIR/" "$TARGET:$REMOTE_DIR/server/"
+    rsync -az --delete --exclude '.pixi' --exclude '__pycache__' -e "$RSH" "$LOCAL_SERVER_DIR/" "$TARGET:$REMOTE_DIR/server/"
   fi
 else
   log "rsync unavailable on one side — falling back to scp"
@@ -350,8 +350,9 @@ log "Installing dependencies (pixi install)… this can take a while"
 "$PIXI" install
 
 # --- build the server argument list ----------------------------------------------
-# Run with --no-reload (the reload path references a stale module) on the chosen port.
-BASE_ARGS=(run --manifest-path "$REMOTE_DIR/server/pixi.toml" python rixi_server.py --no-reload --port "$RIXI_PORT")
+# Launch the server on the chosen port. Extra flags (e.g. --host 0.0.0.0 --insecure) can be
+# forwarded after "--" on the install-rixi.sh command line.
+BASE_ARGS=(run --manifest-path "$REMOTE_DIR/server/pixi.toml" python rixi_server.py --port "$RIXI_PORT")
 
 esc_dq() {  # backslash-escape \ and " so the value is safe inside double quotes
   local s=$1
@@ -404,6 +405,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$REMOTE_DIR/server
+Environment=PATH=$(dirname "$PIXI"):/usr/local/bin:/usr/bin:/bin
 $ENV_FILE_LINE
 ExecStart=$EXEC_START
 Restart=on-failure
