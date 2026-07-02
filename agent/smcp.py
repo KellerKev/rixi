@@ -6,8 +6,10 @@ flow. This module lets rixi speak it in BOTH directions, so the agent's MCP inte
 gains SMCP as a second protocol that interoperates with malgra (server) and wolfgang
 (client). The wire format mirrors those reference implementations verbatim:
 
-  Fernet key = urlsafe_b64( PBKDF2-HMAC-SHA256(secret_key, b"scp_salt_2024", 100000, 32) )
-  signature  = hex( HMAC-SHA256(secret_key, id + type + f"{secs}.0") )
+  master     = PBKDF2-HMAC-SHA256(secret_key, kdf_salt, 600000, 32)          (v3)
+  cipher_key = HKDF-SHA256(master, info=b"malgra-tunnel-v3-cipher") -> Fernet
+  mac_key    = HKDF-SHA256(master, info=b"malgra-tunnel-v3-mac")
+  signature  = hex( HMAC-SHA256(mac_key, id + type + f"{secs}.0" + canonical(payload)) )
   envelope   = {id, type, timestamp: float(secs), payload, encrypted, signature}
   encrypted payload = {"encrypted_data": fernet.encrypt(json)}
 
@@ -40,24 +42,46 @@ try:
 except Exception:  # pragma: no cover
     HAS_JWT = False
 
-_SALT = b"scp_salt_2024"
+# v3 key derivation (matches malgra-tunnel/src/protocol.rs + docs/SMCP_PROTOCOL.md):
+#   master     = PBKDF2-HMAC-SHA256(secret, kdf_salt, 600_000, 32)
+#   cipher_key = HKDF-SHA256(master, salt=None, info="malgra-tunnel-v3-cipher", 32)  -> Fernet
+#   mac_key    = HKDF-SHA256(master, salt=None, info="malgra-tunnel-v3-mac",    32)  -> HMAC key
+# The signature is now payload-bound (id‖type‖ts‖canonical(payload)) — v3 requires it.
+_PBKDF2_ITERS = 600_000
+_DEFAULT_KDF_SALT = b"malgra-tunnel-v3"
+_HKDF_INFO_CIPHER = b"malgra-tunnel-v3-cipher"
+_HKDF_INFO_MAC = b"malgra-tunnel-v3-mac"
+PROTOCOL_VERSION = "3.0"
 
 
 # ───────────────────────── crypto / envelope ──────────────────────────────
-def _fernet(secret: str):
-    key = hashlib.pbkdf2_hmac("sha256", secret.encode(), _SALT, 100_000, dklen=32)
-    return Fernet(base64.urlsafe_b64encode(key))
+def _derive_keys(secret: str, kdf_salt: str = ""):
+    """v3: derive (Fernet cipher, mac_key bytes) from the shared secret + per-deployment salt.
+    Runs a 600k-iteration PBKDF2 — call ONCE per connection/startup, never per message."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    salt = kdf_salt.encode() if kdf_salt else _DEFAULT_KDF_SALT
+    master = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, _PBKDF2_ITERS, dklen=32)
+    cipher_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_HKDF_INFO_CIPHER).derive(master)
+    mac_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_HKDF_INFO_MAC).derive(master)
+    return Fernet(base64.urlsafe_b64encode(cipher_key)), mac_key
 
 
-def _sign(secret: str, mid: str, mtype: str, ts_str: str) -> str:
-    return hmac.new(secret.encode(), (mid + mtype + ts_str).encode(), hashlib.sha256).hexdigest()
+def _canonical(payload) -> str:
+    """Canonical JSON of the payload for signing: sorted keys, compact separators (matches serde_json)."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-def _envelope(secret: str, fernet, mtype: str, payload: dict, encrypt: bool) -> dict:
+def _sign(mac_key: bytes, mid: str, mtype: str, ts_str: str, payload_canon: str) -> str:
+    return hmac.new(mac_key, (mid + mtype + ts_str + payload_canon).encode(), hashlib.sha256).hexdigest()
+
+
+def _envelope(mac_key: bytes, fernet, mtype: str, payload: dict, encrypt: bool) -> dict:
     mid, secs = str(uuid.uuid4()), int(time.time())
     pf = {"encrypted_data": fernet.encrypt(json.dumps(payload).encode()).decode()} if encrypt else payload
     return {"id": mid, "type": mtype, "timestamp": float(secs),
-            "payload": pf, "encrypted": encrypt, "signature": _sign(secret, mid, mtype, f"{secs}.0")}
+            "payload": pf, "encrypted": encrypt, "signature": _sign(mac_key, mid, mtype, f"{secs}.0", _canonical(pf))}
 
 
 def _decrypt(fernet, resp: dict):
@@ -66,11 +90,12 @@ def _decrypt(fernet, resp: dict):
     return resp.get("payload")
 
 
-def _verify_signature(secret: str, msg: dict) -> bool:
-    """Recompute and constant-time-compare the envelope signature."""
+def _verify_signature(mac_key: bytes, msg: dict) -> bool:
+    """Recompute and constant-time-compare the payload-bound envelope signature."""
     try:
         secs = int(float(msg.get("timestamp", 0)))
-        expected = _sign(secret, str(msg.get("id", "")), str(msg.get("type", "")), f"{secs}.0")
+        expected = _sign(mac_key, str(msg.get("id", "")), str(msg.get("type", "")),
+                         f"{secs}.0", _canonical(msg.get("payload")))
         return hmac.compare_digest(expected, str(msg.get("signature", "")))
     except Exception:
         return False
@@ -84,6 +109,7 @@ class SMCPConfig:
         self.server_url: str = ""
         self.api_key: str = ""
         self.secret_key: str = ""
+        self.kdf_salt: str = ""     # v3 per-deployment KDF salt (must match the server's kdf_salt)
         self.jwt_secret: str = ""   # server-side only; accepted but unused by the client
         self.node_id: str = ""
         self.mode: str = ""
@@ -98,6 +124,7 @@ class SMCPClient:
         self._ws = None
         self._token = None
         self._fernet = None
+        self._mac_key = b""
 
     async def _rt(self, msg: dict) -> dict:
         await self._ws.send(json.dumps(msg))
@@ -112,13 +139,15 @@ class SMCPClient:
         url = self.config.server_url
         if not url:
             raise RuntimeError("smcp requires a server url (ws://…)")
-        self._fernet = _fernet(secret)
-        f, mk = self._fernet, lambda t, p, e: _envelope(secret, self._fernet, t, p, e)
+        self._fernet, self._mac_key = _derive_keys(secret, getattr(self.config, "kdf_salt", ""))
+        f, mk = self._fernet, lambda t, p, e: _envelope(self._mac_key, self._fernet, t, p, e)
 
         self._ws = await websockets.connect(url)
 
+        # malgra's v3 server requires a non-empty handshake nonce (mutual-auth challenge it echoes back).
         r = await self._rt(mk("handshake", {"client_id": self.config.node_id or "rixi",
-                                             "protocol_version": "1.0"}, False))
+                                             "protocol_version": PROTOCOL_VERSION,
+                                             "nonce": uuid.uuid4().hex}, False))
         if r.get("type") != "handshake":
             raise RuntimeError(f"smcp handshake failed: {r}")
 
@@ -133,8 +162,7 @@ class SMCPClient:
     async def invoke_tool(self, tool_name: str, **params) -> Any:
         if self._ws is None:
             raise RuntimeError("smcp client not connected")
-        secret = self.config.secret_key
-        msg = _envelope(secret, self._fernet, "tool_invoke",
+        msg = _envelope(self._mac_key, self._fernet, "tool_invoke",
                         {"token": self._token, "tool_name": tool_name, "parameters": params}, True)
         resp = await self._rt(msg)
         if resp.get("type") == "error":
@@ -168,6 +196,7 @@ class SMCPToolServer:
     """
 
     def __init__(self, tools: Dict[str, Tool], *, secret_key: str,
+                 kdf_salt: str = "",
                  jwt_secret: str = "rixi-smcp-default-jwt-secret-change-me", node_id: str = "rixi",
                  api_key: Optional[str] = None,
                  api_keys: Optional[Dict[str, str]] = None,
@@ -185,7 +214,7 @@ class SMCPToolServer:
         self.api_key = api_key
         self.api_keys = api_keys or {}
         self.default_agent = default_agent
-        self._fernet = _fernet(secret_key)
+        self._fernet, self._mac_key = _derive_keys(secret_key, kdf_salt)
 
     # -- helpers ----------------------------------------------------------
     def capabilities(self) -> Dict[str, Any]:
@@ -225,14 +254,14 @@ class SMCPToolServer:
             return False
 
     def _reply(self, mtype: str, payload: dict, encrypt: bool = True) -> dict:
-        return _envelope(self.secret_key, self._fernet, mtype, payload, encrypt)
+        return _envelope(self._mac_key, self._fernet, mtype, payload, encrypt)
 
     def _error(self, detail: str) -> dict:
         return self._reply("error", {"error": detail}, True)
 
     async def handle_message(self, raw: dict) -> Optional[dict]:
         """Process one inbound envelope, return the response envelope (or None)."""
-        if not _verify_signature(self.secret_key, raw):
+        if not _verify_signature(self._mac_key, raw):
             return self._error("invalid signature")
 
         mtype = raw.get("type")
@@ -246,7 +275,7 @@ class SMCPToolServer:
         if mtype == "handshake":
             return self._reply("handshake", {
                 "node_id": self.node_id,
-                "protocol_version": "1.0",
+                "protocol_version": PROTOCOL_VERSION,
                 "capabilities_count": len(self.tools),
                 "encryption_enabled": True,
             }, encrypt=False)

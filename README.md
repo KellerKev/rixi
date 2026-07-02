@@ -6,6 +6,12 @@
 
 **RIXI** — *Remote Interaction and Execution Implementation* — is a secure runner for [Pixi](https://pixi.sh/) projects: a client packages a project and ships it to the server over an encrypted, authenticated channel, and the server runs it as an isolated task and streams the output back. Optional components add a multi-agent engine, an API-compatibility proxy, and a pluggable inference backend, with [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for extensible tool access.
 
+> **RIXI is free and open source (MIT).** Everything in this repository — the execution engine,
+> clients, agent, proxy, inference backend, tunnel — is yours to use, self-host, and build on.
+> A separate, closed-source companion — **RIXI Next** — adds a managed control plane on top of
+> this core (on-demand cloud provisioning, brokered connectivity, policy/RBAC, audit, and
+> workflow orchestration). See [**RIXI Next**](#rixi-next-closed-source-companion) below.
+
 ## Architecture
 
 At its core RIXI is a **client** and a **server**. A client packages a Pixi project and ships it
@@ -627,6 +633,31 @@ See [SECURITY.md](SECURITY.md) for the vulnerability-reporting process and a dep
 - **FastAPI / aiohttp** - the `proxy/` API-compatibility layer
 - **transformers / PyTorch / accelerate** - the `inference-server/` model backend
 - **CrewAI** - multi-agent orchestration (the `agent/` engine + the CrewAI showcase)
+
+## RIXI Next (closed-source companion)
+
+The open-source core in this repository is a complete, self-hostable remote execution plane. For
+teams that want to run it as **managed infrastructure** — many users, many disposable cloud boxes,
+no inbound ports, centrally governed — there is a separate, **closed-source** project built on top
+of this core: **RIXI Next**.
+
+RIXI Next never forks the execution engine. It calls the open core over its public API as the
+compute backend, so everything here stays fully useful on its own. What it adds on top:
+
+| Capability | What it does |
+|------------|--------------|
+| **Gateway control plane** | A single authenticated rendezvous host. Your laptop and every compute box dial *out* to it — so the gateway is the **only** host that needs a public IP and one open port; nothing else opens an inbound port. |
+| **On-demand cloud provisioning** | Declare boxes by name in a simple TOML catalog; the gateway spins them up on demand (via OpenTofu), with warm-reuse or fresh-per-request, and auto-teardown (`idle` / `ttl` / `on_release`). No OpenTofu knowledge needed on the client. |
+| **Brokered end-to-end encryption** | The gateway brokers client↔server connections but, with RIXI's key handshake, sees only AES-256-GCM ciphertext it cannot read — true end-to-end encryption through a broker it doesn't have to be trusted with. |
+| **Policy, RBAC & quotas** | An admin-authored policy floor that users can only *tighten*, never loosen: JWT-driven roles, per-resource security requirements (`require_e2e` / `require_jwt` / `require_tls`), provider/region allowlists, and concurrency/total quotas — enforced by forcing the provisioned box's secure config. |
+| **Audit & OpenTelemetry** | Every security-relevant action recorded as a structured audit event, fanned out to OTLP collectors, a queryable DuckDB history, and a JSON log. |
+| **Management API + console** | A JWT-protected admin API and a web console for live nodes/resources/sessions, editing policy, and querying the audit log. |
+| **Workflow orchestration** *(in progress)* | Moving up the stack from "run a bundle" to orchestrating it: a Metaflow-style DAG model (branch / foreach / join), an artifact datastore with run versioning + lineage, and step-level retry/resume — with RIXI as the secure remote executor underneath. |
+
+**Interested?** RIXI Next isn't public. If any of the above fits what you're building — managed
+multi-tenant deployments, governed on-demand cloud compute, or workflow orchestration on a secure
+runner — I'd love to hear from you. Reach out: **[kevin@fineupp.com](mailto:kevin@fineupp.com)**
+(or via [kevinkeller.org](https://kevinkeller.org)).
 
 ## License
 

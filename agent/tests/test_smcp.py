@@ -7,25 +7,32 @@ smcp = pytest.importorskip("smcp")
 pytest.importorskip("websockets")
 pytest.importorskip("jwt")
 from smcp import (  # noqa: E402
-    SMCPClient, SMCPConfig, SMCPToolServer, _fernet, _sign, _verify_signature, _envelope,
+    SMCPClient, SMCPConfig, SMCPToolServer, _derive_keys, _sign, _canonical, _verify_signature, _envelope,
 )
 
 SECRET = "my_secret_key_2024"
 API_KEY = "demo_key_123"
 
 
-def test_fernet_derivation_matches_reference():
-    # Interop vector: PBKDF2-HMAC-SHA256(secret, b"scp_salt_2024", 100000) round-trips.
-    f = _fernet(SECRET)
+def test_v3_key_derivation_round_trips():
+    f, _mac = _derive_keys(SECRET)
     token = f.encrypt(b"hello")
     assert f.decrypt(token) == b"hello"
 
 
+def test_v3_interop_vector_matches_rust():
+    # Same secret+salt MUST yield the same signature as malgra-tunnel (crates/malgra-tunnel).
+    _f, mac = _derive_keys("interop-secret-value-32-bytes-xx", "interop-salt")
+    sig = _sign(mac, "fixedid", "auth", "1700000000.0", _canonical({"x": 1}))
+    assert sig == "661c3041e7cc52690927113ca9bc39c08899613f94e7d770addecd349374f8ca"
+
+
 def test_signature_roundtrip():
-    env = _envelope(SECRET, _fernet(SECRET), "handshake", {"a": 1}, False)
-    assert _verify_signature(SECRET, env)
+    f, mac = _derive_keys(SECRET)
+    env = _envelope(mac, f, "handshake", {"a": 1}, False)
+    assert _verify_signature(mac, env)
     env["signature"] = "deadbeef"
-    assert not _verify_signature(SECRET, env)
+    assert not _verify_signature(mac, env)
 
 
 def _stub_registry():
