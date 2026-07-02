@@ -8,6 +8,7 @@
 #   RIXI_NODE_ID        node id the agent presents at auth (e.g. a one-time   [required]
 #                       registration token, so the gateway wires the right client)
 #   RIXI_TUNNEL_SECRET  shared tunnel secret (channel encryption + auth)      [required]
+#   RIXI_TUNNEL_SALT    per-deployment tunnel KDF salt (v2); must match the gateway [default ""]
 #   RIXI_SERVER_PORT    loopback port the rixi server binds                   [default 9000]
 #   RIXI_REF            git ref of the public rixi to install                 [default main]
 #   RIXI_DIR            install location                                      [default ~/rixi]
@@ -68,6 +69,8 @@ ENV_FILE="$RIXI_DIR/rixi.env"
   umask 077
   : > "$ENV_FILE"
   printf 'RIXI_TUNNEL_SECRET=%s\n' "$TUNNEL_SECRET" >> "$ENV_FILE"
+  # per-deployment KDF salt (v2 tunnel crypto); the tunnel service reads it as its --kdf-salt default.
+  [ -z "${RIXI_TUNNEL_SALT:-}" ] || printf 'RIXI_TUNNEL_SALT=%s\n' "$RIXI_TUNNEL_SALT" >> "$ENV_FILE"
   [ -z "${RIXI_KEY_SECRET:-}" ] || printf 'RIXI_KEY_SECRET=%s\n' "$RIXI_KEY_SECRET" >> "$ENV_FILE"
 )
 chmod 600 "$ENV_FILE"
