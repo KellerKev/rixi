@@ -29,20 +29,32 @@ import os
 import uuid
 
 import websockets
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 logging.basicConfig(level=os.getenv("RIXI_TUNNEL_LOG", "INFO"),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("rixi.tunnel")
 
 NONCE_LEN = 12
-_SALT = b"rixi_tunnel_2026"
+# v2 key derivation. `kdf_salt` (--kdf-salt / RIXI_TUNNEL_SALT) is per-deployment; empty uses this
+# fixed default (still 600k-stretched). Peers MUST share the same secret AND salt.
+_DEFAULT_SALT = b"rixi-tunnel-v2"
 _READ = 65536
 
 
 # ───────────────────────── crypto / framing ───────────────────────────────
-def derive_key(secret: str) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", secret.encode(), _SALT, 100_000, dklen=32)
+def derive_keys(secret: str, kdf_salt: str = "") -> tuple[bytes, bytes]:
+    """v2: derive (AES-256-GCM key, proof HMAC key) from the shared secret + per-deployment salt.
+    master = PBKDF2-HMAC-SHA256(secret, salt, 600_000) -> HKDF splits an AES key and a proof key, so
+    the auth proof is no longer a raw-secret HMAC and offline brute-force of the secret is ~6000x
+    harder than the old 100k/fixed-salt derivation."""
+    salt = kdf_salt.encode() if kdf_salt else _DEFAULT_SALT
+    master = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, 600_000, dklen=32)
+    aes_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"rixi-tunnel-v2-aes").derive(master)
+    proof_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"rixi-tunnel-v2-proof").derive(master)
+    return aes_key, proof_key
 
 
 def enc(obj: dict, key: bytes) -> bytes:
@@ -55,8 +67,8 @@ def dec(raw: bytes, key: bytes) -> dict:
     return json.loads(AESGCM(key).decrypt(raw[:NONCE_LEN], raw[NONCE_LEN:], None).decode())
 
 
-def _proof(secret: str, nonce_hex: str) -> str:
-    return hmac.new(secret.encode(), nonce_hex.encode(), hashlib.sha256).hexdigest()
+def _proof(proof_key: bytes, nonce_hex: str) -> str:
+    return hmac.new(proof_key, nonce_hex.encode(), hashlib.sha256).hexdigest()
 
 
 # ───────────────────────── connection wrapper ─────────────────────────────
@@ -115,8 +127,8 @@ class Conn:
 
 
 # ───────────────────────────── listen role ────────────────────────────────
-async def run_listen(bind: str, ws_bind: str, secret: str):
-    key = derive_key(secret)
+async def run_listen(bind: str, ws_bind: str, secret: str, kdf_salt: str = ""):
+    key, proof_key = derive_keys(secret, kdf_salt)
     bind_host, bind_port = _split_hostport(bind, 9100)
     ws_host, ws_port = _split_hostport(ws_bind, 7000)
     state: dict = {"conn": None}  # current authenticated agent connection
@@ -131,7 +143,7 @@ async def run_listen(bind: str, ws_bind: str, secret: str):
             log.warning("agent failed auth (bad secret or no reply)")
             return
         if reply.get("type") != "auth" or not hmac.compare_digest(
-                reply.get("proof", ""), _proof(secret, nonce)):
+                reply.get("proof", ""), _proof(proof_key, nonce)):
             log.warning("agent rejected: bad auth proof")
             return
 
@@ -180,13 +192,13 @@ async def run_listen(bind: str, ws_bind: str, secret: str):
 
 
 # ──────────────────────────── connect role ────────────────────────────────
-async def run_connect(to_url: str, target: str, secret: str, node_id: str = "rixi"):
-    key = derive_key(secret)
+async def run_connect(to_url: str, target: str, secret: str, node_id: str = "rixi", kdf_salt: str = ""):
+    key, proof_key = derive_keys(secret, kdf_salt)
     t_host, t_port = _split_hostport(target, 9000)
     delay = 2
     while True:
         try:
-            await _connect_once(to_url, t_host, t_port, key, secret, node_id)
+            await _connect_once(to_url, t_host, t_port, key, proof_key, node_id)
             delay = 2
         except asyncio.CancelledError:
             raise
@@ -196,13 +208,13 @@ async def run_connect(to_url: str, target: str, secret: str, node_id: str = "rix
         delay = min(delay * 2, 60)
 
 
-async def _connect_once(to_url, t_host, t_port, key, secret, node_id):
+async def _connect_once(to_url, t_host, t_port, key, proof_key, node_id):
     async with websockets.connect(to_url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
         # Auth: decrypt the challenge (proves we hold the key), return the proof.
         ch = dec(await asyncio.wait_for(ws.recv(), timeout=10), key)
         if ch.get("type") != "challenge":
             raise RuntimeError("expected challenge")
-        await ws.send(enc({"type": "auth", "proof": _proof(secret, ch["nonce"]), "node_id": node_id}, key))
+        await ws.send(enc({"type": "auth", "proof": _proof(proof_key, ch["nonce"]), "node_id": node_id}, key))
         conn = Conn(ws, key)
         log.info("connected to %s — forwarding to %s:%d", to_url, t_host, t_port)
         try:
@@ -246,11 +258,13 @@ def main():
     pl.add_argument("--bind", default="127.0.0.1:9100", help="local TCP port to expose (loopback by default)")
     pl.add_argument("--ws-bind", default="0.0.0.0:7000", help="address the firewalled server dials into")
     pl.add_argument("--secret", default=os.getenv("RIXI_TUNNEL_SECRET"), help="shared secret (or RIXI_TUNNEL_SECRET)")
+    pl.add_argument("--kdf-salt", default=os.getenv("RIXI_TUNNEL_SALT", ""), help="per-deployment KDF salt (or RIXI_TUNNEL_SALT); must match the peer")
 
     pc = sub.add_parser("connect", help="firewalled side: dial out and forward to a local target")
     pc.add_argument("--to", required=True, help="listener ws URL, e.g. ws://client-host:7000")
     pc.add_argument("--target", default="127.0.0.1:9000", help="local service to expose (the rixi server)")
     pc.add_argument("--secret", default=os.getenv("RIXI_TUNNEL_SECRET"), help="shared secret (or RIXI_TUNNEL_SECRET)")
+    pc.add_argument("--kdf-salt", default=os.getenv("RIXI_TUNNEL_SALT", ""), help="per-deployment KDF salt (or RIXI_TUNNEL_SALT); must match the peer")
     pc.add_argument("--node-id", default="rixi", help="identifier sent at auth (for logs)")
 
     args = ap.parse_args()
@@ -259,9 +273,9 @@ def main():
 
     try:
         if args.role == "listen":
-            asyncio.run(run_listen(args.bind, args.ws_bind, args.secret))
+            asyncio.run(run_listen(args.bind, args.ws_bind, args.secret, args.kdf_salt))
         else:
-            asyncio.run(run_connect(args.to, args.target, args.secret, args.node_id))
+            asyncio.run(run_connect(args.to, args.target, args.secret, args.node_id, args.kdf_salt))
     except KeyboardInterrupt:
         pass
 
