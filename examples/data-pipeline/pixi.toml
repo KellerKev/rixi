@@ -1,0 +1,17 @@
+[workspace]
+channels = ["conda-forge"]
+name = "data-pipeline"
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+version = "0.1.0"
+
+# A small data/ETL job: read CSV → transform with Polars → write Parquet + a summary.
+# Ship it to a rixi server to run near your data (or on a bigger box) without installing
+# the data stack locally.
+
+[tasks]
+pipeline = "python pipeline.py"
+
+[dependencies]
+python = ">=3.10"
+polars = ">=0.20"
+pyarrow = ">=15"

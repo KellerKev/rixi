@@ -1,0 +1,174 @@
+# rixi.toml — gateway-side resource catalog.
+#
+# Declare cloud compute in plain TOML; the gateway translates each entry into OpenTofu for you —
+# no OpenTofu knowledge required. Copy this to `rixi.toml` next to the gateway (it's gitignored),
+# fill it in, and start the gateway with it:
+#
+#     python -m gateway --secret "$RIXI_GATEWAY_SECRET" --config rixi.toml
+#
+# Clients then ask for a box BY NAME (no cloud details on the client):
+#
+#     python -m gateway.client --to ws://gateway:7100 --secret S --resource gpu-box --bind 127.0.0.1:9100
+#     python -m gateway.client --to ws://gateway:7100 --secret S --teardown gpu-box   # destroy it
+#
+# …or BY CAPABILITY — the gateway picks the cheapest matching resource below (priced from
+# offerings.toml): --gpu L4 --min-ram 24 · --min-vcpu 8 --arch arm · --min-ram 16
+#
+#     python -m gateway.client --to ws://gateway:7100 --secret S --gpu L4 --min-ram 24 --bind 127.0.0.1:9100
+#
+# ── Fields ───────────────────────────────────────────────────────────────────────────────────────
+#   provider      "scaleway" | "dummy" | …   (a module under provisioning/terraform/providers/<name>)
+#   type          server type            → tofu var `instance_type`
+#   region, image …                      → passed straight through as tofu vars
+#   [<name>.credentials]                 → mapped to the provider's env vars (SCW_ACCESS_KEY, …);
+#                                          reach tofu via the subprocess env, never written to disk.
+#                                          Use ${env:VAR} / ${file:/path} to keep secrets out of git.
+#
+# ── Lifecycle (two independent knobs) ────────────────────────────────────────────────────────────
+#   reuse = true|false   true  → if the box is already up, route to it (no tofu run);
+#                        false → provision a fresh box on every request.
+#   teardown = "manual" | "on_release" | "idle" | "ttl"
+#                        manual      → only `--teardown <name>` destroys it.
+#                        on_release  → destroy when the client disconnects (natural for reuse=false).
+#                        idle        → destroy after `idle_timeout` with no active routes.
+#                        ttl         → destroy after `max_age` from creation.
+#   Defaults: reuse=true → manual · reuse=false → on_release.   (durations: 90s, 30m, 2h, 1d)
+#
+# ── End-to-end encryption (optional) ─────────────────────────────────────────────────────────────
+#   key_secret        → the box runs the rixi server with the AES key handshake ON, so a client can
+#                       negotiate an AES-256-GCM session that passes through the gateway OPAQUELY
+#                       (the gateway only ever sees ciphertext). Clients use the same secret:
+#                         rixi_client --server http://127.0.0.1:9100 --handshake-secret <it> …
+#                       Share it with your client users out-of-band (not via the gateway) so the
+#                       gateway can't impersonate them. key_secret_uses bounds handshakes
+#                       (0 = unlimited; set >0 to cap; needed when many clients reuse one warm box).
+#                       See "End-to-end encryption" in the top-level README.
+
+# ── Policy & enforcement (admin floor; users may only TIGHTEN) ────────────────────────────────────
+# A global [policy] table is the enforced floor. Clients present a JWT (verified by the gateway's
+# --jwt-jwks-url/--jwt-public-key); roles drive RBAC. "admin is more important": a user request can
+# make things stricter, never weaker. Per-resource floors live in [resource.<n>.policy].
+[policy]
+require_jwt       = true                       # every client must present a valid JWT
+require_e2e       = false                       # global floor; resources can raise it
+admin_role        = "admin"
+default_role      = "user"
+allowed_providers = ["scaleway", "dummy"]
+[policy.quotas]
+max_concurrent_resources = 4                    # per identity
+# Budget guardrails (priced from offerings.toml; fleet-wide, enforced for everyone incl. admins):
+# max_eur_per_hour = 5.0                         # deny a new box if the fleet burn would exceed this
+# max_fleet_eur    = 100.0                       # deny once cumulative estimated spend hits this
+[policy.roles.user]
+allowed_ops = ["list", "route", "request_compute", "release", "list_resources"]
+[policy.roles.admin]
+allowed_ops = ["*"]                             # admin bypasses RBAC + quota (still audited)
+
+# A warm, reusable GPU box — provisioned once, reused by everyone, auto-destroyed after 30m idle.
+# With key_secret + jwt_jwks_url it serves end-to-end-encrypted AND enforces JWT on the box itself.
+[resource.gpu-box]
+provider        = "scaleway"
+type            = "L4-1-24G"
+region          = "fr-par-2"
+image           = "ubuntu_focal_gpu_os_12"
+reuse           = true
+teardown        = "idle"
+idle_timeout    = "30m"
+prewarm         = true                              # keep it provisioned + ready (no cold start);
+                                                    # idle teardown is skipped for prewarmed boxes
+fallback_regions = ["fr-par-1"]                     # on a stock-out, retry these regions in order
+fallback_types   = ["L40S-1-48G"]                   # …then these instance types (else derive from offerings)
+key_secret      = "${env:RIXI_HANDSHAKE_SECRET}"   # end-to-end AES; share with clients out-of-band
+key_secret_uses = 0                                 # unlimited (many clients reuse this warm box)
+jwt_jwks_url    = "${env:RIXI_BOX_JWKS_URL}"        # box runs rixi_server --jwks-url (enforced auth)
+
+# Per-resource policy floor: only these roles, only this region, and e2e is mandatory here.
+[resource.gpu-box.policy]
+require_e2e   = true
+require_jwt   = true
+allowed_roles = ["ml", "admin"]
+max_concurrent = 3
+allowed_regions = ["fr-par-2"]
+
+[resource.gpu-box.credentials]
+api_key    = "${env:SCW_ACCESS_KEY}"
+secret     = "${env:SCW_SECRET_KEY}"
+project_id = "${env:SCW_DEFAULT_PROJECT_ID}"
+
+# An always-fresh scratch box, destroyed as soon as the client disconnects.
+[resource.scratch]
+provider = "scaleway"
+type     = "DEV1-S"
+region   = "fr-par-2"
+reuse    = false
+
+[resource.scratch.credentials]
+api_key = "${env:SCW_ACCESS_KEY}"
+secret  = "${env:SCW_SECRET_KEY}"
+
+# A cheap Hetzner CPU box (no GPUs on Hetzner Cloud) — good for compile jobs, test runners, and
+# data/ETL. One project-scoped token; destroyed when the client disconnects.
+[resource.hetzner-cpu]
+provider = "hetzner"
+type     = "cx23"          # 2 vCPU / 4 GB, cheapest x86; also cax11 (ARM), cx33, …
+region   = "nbg1"          # nbg1 | fsn1 | hel1 | ash | hil
+reuse    = false
+teardown = "on_release"
+
+[resource.hetzner-cpu.credentials]
+api_key = "${env:HCLOUD_TOKEN}"
+
+# Spot / preemptible: set spot = true to request cheaper interruptible capacity. The gateway tries
+# spot first and falls back to on-demand on a capacity error (audited as spot.fallback); if the
+# cloud preempts the box, the gateway re-provisions it (audited as spot.interrupted). Spot resources
+# are priced at their spot rate for capability scheduling, so a spot box wins on cost.
+#   NOTE: no shipped provider offers spot yet — Hetzner and Scaleway have no spot product, and a pod
+#   is not a spot VM. The wiring is ready for an AWS/GCP module (add the module + a spot_eur_per_hour
+#   in offerings.toml); providers without spot accept-and-ignore the flag.
+# [resource.aws-spot]
+# provider = "aws"          # (a future module)
+# type     = "g5.xlarge"
+# spot     = true
+
+# A rixi box as a Kubernetes Pod (resource != VM) — runs the SAME bootstrap.sh as a VM, so the pod
+# dials the gateway and serves like any box. Uses the local kubeconfig (no cloud credentials) —
+# great with Rancher Desktop / k3s for local dev.
+[resource.k8s-box]
+provider = "kubernetes"
+reuse    = true
+teardown = "on_release"
+[resource.k8s-box.vars]
+namespace    = "default"
+kube_context = "rancher-desktop"   # optional; omit to use the current kubeconfig context
+image        = "debian:bookworm-slim"
+
+# A throwaway box that runs ONE GitHub Actions job as an ephemeral self-hosted runner, then is
+# destroyed (see ci-runner/). reuse=false → a fresh box per job; teardown=on_release → gone when
+# the driver disconnects. Drive it with: python ci-runner/rixi_ci_runner.py --repo owner/name …
+[resource.ci-runner]
+provider = "kubernetes"            # local/free on Rancher; swap to "hetzner" for a real cloud box
+reuse    = false
+teardown = "on_release"
+[resource.ci-runner.vars]
+kube_context = "rancher-desktop"
+image        = "debian:bookworm-slim"
+
+# Optional: encrypt/relocate OpenTofu state. State is ALWAYS encrypted at rest (a passphrase from
+# RIXI_STATE_PASSPHRASE, or an auto-generated key file). To also store it remotely (HA gateway),
+# declare a backend here (or set RIXI_STATE_BACKEND); needs the backend's own credentials.
+# [state.backend]
+# type   = "s3"                       # s3 | gcs | http
+# bucket = "my-rixi-tfstate"
+# key    = "gateway/state"
+# region = "eu-central-1"
+
+# Expert escape hatch — bring your own OpenTofu module. rixi runs it verbatim; the only contract is
+# that it accepts the standard vars `gateway_ws_url`, `node_id`, `tunnel_secret` (see
+# provisioning/terraform/modules/iface/cloud-init.tftpl for the reference that runs bootstrap.sh).
+# Anything under [<name>.vars] is passed through as tofu variables.
+# [resource.custom]
+# module = "./my-opentofu"
+# reuse  = true
+# [resource.custom.vars]
+# instance_type = "x"
+# whatever      = "y"

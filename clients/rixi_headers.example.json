@@ -1,0 +1,6 @@
+{
+  "//": "Template for extra HTTP headers the client sends on every request. Copy to rixi_headers.json (gitignored) or point --headers-file at it. Values support ${env:VAR} and ${file:path} so external programs can drop in secrets via the environment or a file. Keys starting with // or _ are ignored.",
+  "X-Tenant": "acme",
+  "X-Trace-Id": "${env:RIXI_TRACE_ID}",
+  "Authorization": "Bearer ${env:RIXI_TOKEN}"
+}

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check .
+
+  shellcheck:
+    name: ShellCheck scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck all shell scripts
+        run: shellcheck install-rixi.sh bootstrap.sh provision-scaleway-gpu.sh docker-entrypoint.sh
+
+  compile:
+    name: Byte-compile sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile all Python sources
+        run: python -m compileall -q -x '\.pixi' src server clients agent proxy inference-server tunnel gateway examples
+
+  sdk:
+    name: SDK unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install package (editable) + dev deps
+        run: pip install -e '.[server,dev]'
+      - name: Test the client SDK
+        run: pytest tests/ -q
+      - name: Server security regression tests
+        run: pytest server/tests/ -q
+
+  gateway:
+    name: Gateway tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.0
+        with:
+          manifest-path: gateway/pixi.toml
+      - name: Run gateway tests
+        run: pixi run test
+        working-directory: gateway
+
+  metaflow-rixi:
+    name: Metaflow @rixi extension tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the rixi SDK + the metaflow extension
+        run: |
+          pip install -e .
+          pip install -e ./metaflow-rixi
+      - name: Test the @rixi extension
+        run: pytest metaflow-rixi/tests/ -q
+
+  agent:
+    name: Agent tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.0
+        with:
+          manifest-path: agent/pixi.toml
+      - name: Run agent tests
+        run: pixi run test
+        working-directory: agent

@@ -1,0 +1,18 @@
+# Pixi environment the rixi box resolves to RUN a step. It needs Metaflow (a version compatible
+# with the orchestrator's), boto3 (S3 datastore), and the @rixi decorator so the flow imports.
+# `metaflow-rixi` is a path dep to `_deps/metaflow-rixi`, which the `rixi step` CLI populates in
+# the shipped bundle (self-contained, no PyPI needed). This file is used ON THE BOX, not by the
+# orchestrator.
+[workspace]
+channels = ["conda-forge"]
+name = "rixi-metaflow-branching"
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+version = "0.1.0"
+
+[dependencies]
+python = ">=3.10,<3.13"
+
+[pypi-dependencies]
+metaflow = ">=2.12"
+boto3 = ">=1.28"
+metaflow-rixi = { path = "_deps/metaflow-rixi", editable = false }

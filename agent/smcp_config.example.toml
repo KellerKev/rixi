@@ -1,0 +1,18 @@
+# Example config for the rixi SMCP tool server (agent/smcp_server.py).
+# Copy to smcp_config.toml (gitignored) or pass flags / env vars. The server exposes
+# rixi's MCP tools (filesystem, web search) over an encrypted Fernet/HMAC WebSocket,
+# so SMCP clients (wolfgang, malgra's probe, or rixi's own agent in client mode) can
+# securely discover and invoke them.
+#
+# Flags:  python smcp_server.py --bind 127.0.0.1:8770 --secret-key … --api-key …
+# Env:    RIXI_SMCP_SECRET, RIXI_SMCP_API_KEY, RIXI_SMCP_JWT_SECRET, RIXI_SMCP_ALLOW_OPEN
+
+[smcp]
+bind = "127.0.0.1:8770"            # loopback by default; expose deliberately
+secret_key = "my_secret_key_2024"  # shared Fernet/HMAC secret (must match the client)
+api_key = "demo_key_123"           # required client api_key; omit ONLY with allow_open (dev)
+# jwt_secret is optional: when omitted it is derived from secret_key (per-deployment,
+# never a public default). Set it only to pin an explicit HS256 signing key.
+# jwt_secret = ""
+# allow_open = false               # set true to accept any client when no api_key is set (dev only)
+root = "."                          # filesystem root exposed to read/write tools

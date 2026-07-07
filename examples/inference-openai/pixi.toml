@@ -1,0 +1,18 @@
+[workspace]
+channels = ["conda-forge"]
+name = "inference-openai"
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+version = "0.1.0"
+
+# Client side of the OpenAI-compatible inference demo. The model backend
+# (../../inference-server) runs on a rixi GPU box; the proxy (../../proxy) fronts it with an
+# OpenAI-compatible API; this task calls it with the standard OpenAI SDK.
+
+[tasks]
+call = "python call.py"
+
+[dependencies]
+python = ">=3.10"
+
+[pypi-dependencies]
+openai = ">=1.30"

@@ -1,0 +1,12 @@
+# Lean baseline: syntax errors (E9) and pyflakes (F) only.
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E9", "F"]
+# Remaining cosmetic rules the legacy god-files don't yet pass; correctness checks
+# (undefined names, redefinitions, f-strings, ...) are enforced. F401 (unused imports)
+# and F841 (unused vars) stay ignored only because auto-stripping them across the large,
+# thinly-tested server/client modules is unsafe without a dedicated runtime pass — remove
+# them as those modules gain coverage.
+ignore = ["F401", "F841"]

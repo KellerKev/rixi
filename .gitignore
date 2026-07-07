@@ -1,0 +1,72 @@
+# Secrets and keys
+*.secret
+*.key
+aes.key
+rotation.secret
+# Local credential/config overrides (never commit real tokens)
+*.local.toml
+*.local.yaml
+*.local.yml
+.env
+.env.*
+# Runtime-generated client artifacts
+mcp_info.json
+.offline_metadata.json
+# Populated custom request headers (may contain secrets); keep the .example
+rixi_headers.json
+# Populated SMCP server config (may contain secrets); keep the .example
+smcp_config.toml
+# Populated gateway resource catalog (may contain creds); keep the .example
+rixi.toml
+# Gateway audit store
+*.duckdb
+# OpenTofu / Terraform provisioning state (written to workdirs; never commit)
+*.tfstate
+*.tfstate.*
+*.tfvars.json
+.terraform/
+.terraform.lock.hcl
+
+# Logs
+logs/
+*.log
+
+# Certificates / private keys
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+build_tmp/
+*.egg
+
+# Node (gateway console / PyLevate build)
+node_modules/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Pixi
+.pixi/
+# NOTE: pixi.lock files are intentionally committed for reproducible builds of the
+# deployable components. Run `pixi install` in a component dir to generate/update its lock.
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

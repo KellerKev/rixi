@@ -1,0 +1,18 @@
+name: ci-runner self-test
+
+# Manual only. Dispatched by ci-runner/rixi_ci_runner.py to prove the ephemeral-runner flow end
+# to end: a rixi-provisioned box registers as an ephemeral self-hosted runner, this one job runs
+# on it, then the runner deregisters and the box is torn down. It never runs on push, so it does
+# not affect normal CI.
+on:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: [self-hosted, rixi-ephemeral]
+    steps:
+      - name: Report the throwaway box it ran on
+        run: |
+          echo "hello from an ephemeral rixi box"
+          uname -a
+          echo "runner name: ${RUNNER_NAME:-unknown}"

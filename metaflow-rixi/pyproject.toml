@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metaflow-rixi"
+version = "0.1.0"
+description = "Run Metaflow steps on RIXI compute — the @rixi step decorator (a Metaflow compute backend)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Kevin Keller" }]
+keywords = ["metaflow", "rixi", "mlops", "remote-execution", "compute-backend"]
+# Only metaflow is required to IMPORT the @rixi decorator (needed on the remote box too, which
+# is why rixi is NOT a hard dep here). The orchestrator additionally needs the `rixi` SDK — it is
+# imported lazily by the CLI when a step is dispatched. Install it there (`pip install rixi`).
+dependencies = [
+    "metaflow>=2.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/KellerKev/rixi"
+
+[project.optional-dependencies]
+orchestrator = ["rixi>=0.2"]   # the machine that runs the flow needs the RIXI client SDK
+dev = ["pytest>=8", "boto3>=1.28", "rixi>=0.2"]
+
+# metaflow discovers extensions via the `metaflow_extensions` namespace package.
+[tool.setuptools.packages.find]
+include = ["metaflow_extensions*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.md"]

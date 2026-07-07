@@ -1,0 +1,15 @@
+[workspace]
+channels = ["conda-forge"]
+name = "rixi-ci-runner"
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+version = "0.1.0"
+
+# Just enough to fetch + unpack the GitHub Actions runner on the box; the runner itself is a
+# self-contained binary (its extra system libs come from ./bin/installdependencies.sh).
+[dependencies]
+bash = "*"
+curl = "*"
+tar = "*"
+
+[tasks]
+ci-runner = "bash run_ephemeral.sh"

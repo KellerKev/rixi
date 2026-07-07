@@ -1,0 +1,11 @@
+[workspace]
+channels = ["conda-forge"]
+name = "hello"
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+version = "0.1.0"
+
+[tasks]
+hello = "python hello.py"
+
+[dependencies]
+python = ">=3.12"

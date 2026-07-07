@@ -1,0 +1,8 @@
+#cloud-config
+# Canonical cloud-init for a rixi compute box. A real provider renders this with templatefile()
+# and passes it as the instance's user-data. On first boot the box fetches the OPEN bootstrap and
+# installs the rixi server + tunnel agent, configured to dial the gateway with the one-time token.
+runcmd:
+  - export RIXI_GATEWAY_URL='${gateway_ws_url}' RIXI_NODE_ID='${node_id}' RIXI_TUNNEL_SECRET='${tunnel_secret}' RIXI_TUNNEL_SALT='${kdf_salt}' RIXI_SERVER_PORT='${server_port}' RIXI_REF='${rixi_ref}' RIXI_KEY_SECRET='${key_secret}' RIXI_KEY_SECRET_USES='${key_secret_uses}' RIXI_JWT_JWKS_URL='${jwt_jwks_url}'
+  - curl -fsSL "https://raw.githubusercontent.com/KellerKev/rixi/${rixi_ref}/bootstrap.sh" -o /opt/rixi-bootstrap.sh
+  - bash /opt/rixi-bootstrap.sh

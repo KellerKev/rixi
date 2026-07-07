@@ -1,0 +1,18 @@
+[project]
+name = "rixi-http-backends"
+version = "0.1.0"
+description = "Example HTTP backend services (stdlib/Flask) for use behind the RIXI proxy"
+authors = ["Kevin Keller <kellerkev@gmail.com>"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+
+[dependencies]
+python = ">=3.10"
+requests = "*"
+flask = ">=3.0"
+
+[tasks]
+# Stdlib HTTP backend example
+http-service = "python server.py"
+# Flask backend example
+flask-service = "python flask_app.py"

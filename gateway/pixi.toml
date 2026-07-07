@@ -1,0 +1,33 @@
+[project]
+name = "rixi-gateway"
+version = "0.1.0"
+description = "rixi gateway — control plane: registry, brokered routing, OpenTofu provisioning, JWT RBAC + policy, audit"
+authors = ["Kevin Keller <kellerkev@gmail.com>"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+
+[dependencies]
+python = ">=3.10"
+websockets = ">=12"
+cryptography = ">=44"
+pytest = ">=8"
+tomli = ">=2"        # TOML resource catalog on py3.10 (stdlib tomllib used on 3.11+)
+opentofu = ">=1.7"   # cloud-agnostic provisioning + native state encryption (1.7+)
+
+[pypi-dependencies]
+# control plane: JWT RBAC, management API, OpenTelemetry + DuckDB audit
+pyjwt = ">=2.8"
+requests = "*"                                  # JWKS fetch (matches the core server)
+fastapi = "*"
+uvicorn = "*"
+duckdb = ">=0.10"                               # queryable audit store
+opentelemetry-sdk = "*"
+opentelemetry-exporter-otlp-proto-http = "*"    # OTLP audit export
+
+[tasks]
+serve = "python -m gateway"
+test = "pytest tests/"
+# Console (PyLevate → Preact). Requires `pylevate` + node on PATH; output → console/dist/web,
+# served by management.py when --admin-bind is set.
+build-ui = { cmd = "npm install && pylevate build --target web", cwd = "console" }
+dev-ui = { cmd = "pylevate dev", cwd = "console" }

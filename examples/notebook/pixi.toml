@@ -1,0 +1,20 @@
+[workspace]
+channels = ["conda-forge"]
+name = "rixi-notebook"
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+version = "0.1.0"
+
+# Drive a remote RIXI server from a Jupyter notebook using the importable SDK.
+#   pixi run lab   → opens JupyterLab; open quickstart.ipynb
+
+[tasks]
+lab = "jupyter lab quickstart.ipynb"
+
+[dependencies]
+python = ">=3.10"
+jupyterlab = ">=4"
+
+[pypi-dependencies]
+# Install the rixi SDK from this repo checkout. After `pip install rixi` lands on PyPI you
+# can replace this with a plain `rixi = ">=0.2"`.
+rixi = { path = "../..", editable = true }
