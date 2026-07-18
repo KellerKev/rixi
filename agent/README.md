@@ -94,6 +94,14 @@ See [`smcp_config.example.toml`](smcp_config.example.toml) for the server config
 [`../examples/agent-demos/smcp_probe.py`](../examples/agent-demos/smcp_probe.py) for a
 handshake→auth→discover→invoke connectivity probe.
 
+**A2A federation.** rixi is a full SMCP federation peer (send *and* receive). The server accepts
+`federated_key_exchange` / `federated_forward` (invoked over `tool_invoke`, off by default), and
+`SMCPClient.federated_forward` delegates a client-authorized task to a downstream node carrying the
+user's identity. Signed forwarding proofs (HMAC or per-node PS256 with algorithm pinning),
+forward-secret P-256 ECDH, AES-256-GCM (session-id AAD), and RS256 client tokens live in
+[`smcp_federation.py`](smcp_federation.py), verified against the shared cross-language conformance
+vectors. The handshake also negotiates the protocol version by MAJOR component.
+
 ## Configuration
 
 `agent_config.example.yaml` is the in-place template (the default for `start_agent.py` and what

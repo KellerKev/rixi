@@ -308,9 +308,19 @@ runnable across machines.
 
 RIXI's agent uses SMCP for exactly that networked case: WebSocket transport, Fernet (AES) on every
 payload, `api_key` → JWT sessions, and an HMAC-SHA256 signature per message — so the same tools are
-shareable between agents over an untrusted link. See
-[`agent/README.md`](agent/README.md#smcp-secure-mcp) for RIXI's implementation, and
+shareable between agents over an untrusted link. The handshake negotiates the protocol version by
+MAJOR component (a future `3.x` interoperates with `3.0`; an incompatible `2.x`/`4.x` peer is
+rejected). See [`agent/README.md`](agent/README.md#smcp-secure-mcp) for RIXI's implementation, and
 [**github.com/KellerKev/smcp**](https://github.com/KellerKev/smcp) for the standalone SMCP project.
+
+**A2A federation (full peer).** RIXI is a first-class SMCP federation peer — it can both *send*
+(forward a client-authorized task to a downstream node with the user's identity) and *receive*
+(`federated_key_exchange` / `federated_forward`, invoked over `tool_invoke`). Federation is off by
+default; when enabled it uses signed forwarding proofs (shared-secret HMAC or per-node RSA-PSS/PS256
+with algorithm pinning), forward-secret P-256 ECDH session keys, AES-256-GCM session encryption
+bound to the session id, and RS256 client-token verification. The crypto is self-contained in
+[`agent/smcp_federation.py`](agent/smcp_federation.py) and verified byte-for-byte against the shared
+cross-language conformance vectors (the same file malgra's Rust implementation checks against).
 
 ## Quickstart
 
