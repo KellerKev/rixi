@@ -56,6 +56,15 @@ _HKDF_INFO_JWT = b"rixi-smcp-v3-jwt"
 PROTOCOL_VERSION = "3.0"
 
 
+def _protocol_major(version: str) -> str:
+    """MAJOR component of a ``"<major>.<minor>"`` protocol version string.
+
+    Version negotiation compares MAJOR only (docs/SMCP_PROTOCOL.md): a future
+    ``3.x`` interoperates with ``3.0`` while a different major (``2.x``/``4.x``)
+    is rejected."""
+    return str(version).split(".", 1)[0].strip()
+
+
 # ───────────────────────── crypto / envelope ──────────────────────────────
 def _derive_keys(secret: str, kdf_salt: str = ""):
     """v3: derive (Fernet cipher, mac_key bytes) from the shared secret + per-deployment salt.
@@ -201,6 +210,23 @@ class SMCPClient:
         out = _decrypt(self._fernet, resp)
         return out.get("result") if isinstance(out, dict) else out
 
+    async def federated_forward(self, target_node: str, task: dict, client_jwt: str, *,
+                                node_id: str = "", hmac_secret: Optional[str] = None,
+                                private_key_pem: Any = None) -> Any:
+        """Sender side of A2A federation: forward a client-authorized ``task`` to a
+        downstream federation node over this connection. Runs the ECDH key
+        exchange, signs a forwarding proof (PS256 when a private key is given,
+        else HMAC), GCM-encrypts the request, and invokes ``federated_forward`` on
+        the peer. Returns the peer's result."""
+        try:
+            from smcp_federation import forward_request
+        except ImportError:  # pragma: no cover - repo-root import layout
+            from agent.smcp_federation import forward_request
+
+        me = node_id or self.config.node_id or "rixi"
+        return await forward_request(self.invoke_tool, me, target_node, task, client_jwt,
+                                     hmac_secret=hmac_secret, private_key_pem=private_key_pem)
+
     async def disconnect(self) -> None:
         if self._ws is not None:
             try:
@@ -230,7 +256,13 @@ class SMCPToolServer:
                  api_key: Optional[str] = None,
                  api_keys: Optional[Dict[str, str]] = None,
                  default_agent: str = "rixi-client",
-                 allow_open: bool = False) -> None:
+                 allow_open: bool = False,
+                 federation_enabled: bool = False,
+                 federation_hmac_secret: str = "",
+                 federation_issuer_pem: Any = None,
+                 federation_peer_keys: Optional[Dict[str, Any]] = None,
+                 federation_strict: bool = False,
+                 federation_dispatch: Optional[Callable[[dict, Optional[str], dict], Any]] = None) -> None:
         if not HAS_SMCP:
             raise RuntimeError("smcp server requires websockets + cryptography")
         if not HAS_JWT:
@@ -258,6 +290,36 @@ class SMCPToolServer:
         self.default_agent = default_agent
         self.allow_open = allow_open
         self._fernet, self._mac_key = _derive_keys(secret_key, kdf_salt)
+
+        # A2A federation (off by default). When enabled, the server accepts
+        # federated_key_exchange / federated_forward (invoked as tool_invoke per
+        # the SMCP A2A spec) so rixi can be a federation peer like malgra. The
+        # HMAC proof-fallback secret defaults to the (independent) jwt_secret;
+        # set federation_hmac_secret to share one across a federation.
+        self.federation_enabled = federation_enabled
+        self._fed_hmac_secret = federation_hmac_secret or jwt_secret
+        self._fed_issuer_pem = federation_issuer_pem
+        self._fed_peer_keys = federation_peer_keys or {}
+        self._fed_strict = federation_strict
+        self._fed_dispatch = federation_dispatch
+
+    def _new_fed_receiver(self):
+        """Build fresh per-connection federation state (ECDH sessions + nonce
+        cache are scoped to one connection, matching malgra's ConnState)."""
+        try:
+            from smcp_federation import FederationReceiver
+        except ImportError:  # pragma: no cover - repo-root import layout
+            from agent.smcp_federation import FederationReceiver
+
+        receiver = FederationReceiver(
+            self.node_id, self._fed_hmac_secret,
+            issuer_pem=self._fed_issuer_pem,
+            strict_asymmetric=self._fed_strict,
+            dispatch=self._fed_dispatch,
+        )
+        for nid, pem in self._fed_peer_keys.items():
+            receiver.register_peer_public_key(nid, pem)
+        return receiver
 
     # -- helpers ----------------------------------------------------------
     def capabilities(self) -> Dict[str, Any]:
@@ -302,8 +364,12 @@ class SMCPToolServer:
     def _error(self, detail: str) -> dict:
         return self._reply("error", {"error": detail}, True)
 
-    async def handle_message(self, raw: dict) -> Optional[dict]:
-        """Process one inbound envelope, return the response envelope (or None)."""
+    async def handle_message(self, raw: dict, fed=None) -> Optional[dict]:
+        """Process one inbound envelope, return the response envelope (or None).
+
+        ``fed`` is the per-connection FederationReceiver (created by
+        _conn_handler); when federation is enabled it carries the connection's
+        ECDH sessions and proof-nonce cache."""
         if not _verify_signature(self._mac_key, raw):
             return self._error("invalid signature")
 
@@ -316,6 +382,13 @@ class SMCPToolServer:
             inner = {}
 
         if mtype == "handshake":
+            # Version negotiation by MAJOR component: reject a genuinely incompatible peer
+            # (2.x/4.x) rather than silently accepting it. A future 3.x still interoperates.
+            client_version = str(inner.get("protocol_version", PROTOCOL_VERSION))
+            if _protocol_major(client_version) != _protocol_major(PROTOCOL_VERSION):
+                return self._error(
+                    f"unsupported protocol version {client_version!r} "
+                    f"(server requires major {_protocol_major(PROTOCOL_VERSION)})")
             # Mutual auth: echo the client's nonce so it can confirm the server holds the shared secret
             # and is answering THIS handshake (not a replay).
             return self._reply("handshake", {
@@ -344,6 +417,22 @@ class SMCPToolServer:
                 return self._error("Unauthorized")
             name = str(inner.get("tool_name", ""))
             params = inner.get("parameters", {})
+
+            # A2A federation verbs (invoked as tool_invoke per the SMCP A2A spec),
+            # handled before normal tool dispatch when federation is enabled.
+            if name in ("federated_key_exchange", "federated_forward"):
+                if not self.federation_enabled or fed is None:
+                    return self._error("federation not enabled on this node")
+                p = params if isinstance(params, dict) else {}
+                try:
+                    if name == "federated_key_exchange":
+                        result = fed.key_exchange(p)
+                    else:
+                        result = fed.forward(p)
+                    return self._reply("tool_response", {"tool_name": name, "result": result, "status": "success"})
+                except Exception as e:  # noqa: BLE001 - report federation failures over the wire
+                    return self._error(f"federation error: {e}")
+
             tool = self.tools.get(name)
             if tool is None:
                 return self._error(f"unknown tool '{name}'")
@@ -359,13 +448,15 @@ class SMCPToolServer:
         return self._error(f"unsupported message type: {mtype}")
 
     async def _conn_handler(self, ws):
+        # Per-connection federation state (ECDH sessions + proof-nonce cache).
+        fed = self._new_fed_receiver() if self.federation_enabled else None
         async for raw in ws:
             try:
                 msg = json.loads(raw)
             except Exception:
                 await ws.send(json.dumps(self._error("invalid json")))
                 continue
-            resp = await self.handle_message(msg)
+            resp = await self.handle_message(msg, fed=fed)
             if resp is not None:
                 await ws.send(json.dumps(resp))
 
