@@ -249,6 +249,14 @@ class AuthSettings:
         self.public_key_path: Optional[str] = None
         self.jwks_url: Optional[str] = None
         self.jwks_keys: Dict[str, Dict[str, Any]] = {}
+        # Box scoping: when several servers trust the same issuer, these stop a
+        # token minted for one server (or one tenant) from working on another.
+        self.audience: Optional[str] = None
+        self.required_claims: Dict[str, str] = {}
+        self.require_exp: bool = False
+        self.revoked_jti_path: Optional[str] = None
+        self._revoked_jti: set[str] = set()
+        self._revoked_mtime: Optional[float] = None
 
 auth_settings = AuthSettings()
 security = HTTPBearer(auto_error=False)
@@ -334,9 +342,42 @@ async def refresh_jwks_keys() -> None:
         logger.error("JWKS refresh failed", extra={"error": str(exc)})
         print("JWKS refresh error:", exc)
 
+def _revoked_jtis() -> set[str]:
+    """The revocation list is a plain file, one jti per line, re-read when it changes."""
+    path = auth_settings.revoked_jti_path
+    if not path:
+        return set()
+    try:
+        mtime = os.stat(path).st_mtime
+    except FileNotFoundError:
+        auth_settings._revoked_jti, auth_settings._revoked_mtime = set(), None
+        return set()
+    if mtime != auth_settings._revoked_mtime:
+        lines = pathlib.Path(path).read_text().splitlines()
+        auth_settings._revoked_jti = {ln.strip() for ln in lines if ln.strip()}
+        auth_settings._revoked_mtime = mtime
+    return auth_settings._revoked_jti
+
+def _decode(token: str, key: Any) -> dict:
+    """Verify signature, then the box-scoping rules. Raises jwt.PyJWTError on any failure."""
+    options: Dict[str, Any] = {"verify_aud": auth_settings.audience is not None}
+    if auth_settings.require_exp:
+        options["require"] = ["exp"]
+    payload = jwt.decode(token, key, algorithms=["RS256", "ES256"],
+                         audience=auth_settings.audience, options=options)
+    for claim, expected in auth_settings.required_claims.items():
+        if str(payload.get(claim)) != expected:
+            raise jwt.InvalidTokenError(f"claim {claim!r} does not match")
+    if auth_settings.revoked_jti_path:
+        jti = payload.get("jti")
+        if not jti:
+            raise jwt.InvalidTokenError("token has no jti but revocation is enabled")
+        if jti in _revoked_jtis():
+            raise jwt.InvalidTokenError("token has been revoked")
+    return payload
+
 async def validate_token(token: str) -> tuple[bool, Optional[dict]]:
     """Validate JWT token and return (is_valid, decoded_payload)"""
-    allowed_algorithms = ["RS256", "ES256"]
     try:
         hdr = jwt.get_unverified_header(token)
         kid = hdr.get("kid")
@@ -357,21 +398,18 @@ async def validate_token(token: str) -> tuple[bool, Optional[dict]]:
             pem = rsa.RSAPublicNumbers(e, n).public_key(default_backend()).public_bytes(
                 serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
             )
-            payload = jwt.decode(token, pem, algorithms=allowed_algorithms, options={"verify_aud": False})
-            return True, payload
+            return True, _decode(token, pem)
 
         # local PEM
         if auth_settings.public_key:
             try:
-                payload = jwt.decode(token, auth_settings.public_key, algorithms=allowed_algorithms, options={"verify_aud": False})
-                return True, payload
+                return True, _decode(token, auth_settings.public_key)
             except jwt.InvalidAlgorithmError:
                 from cryptography.hazmat.primitives import serialization
                 from cryptography.hazmat.backends import default_backend
                 try:
                     key_obj = serialization.load_pem_public_key(auth_settings.public_key.encode(), backend=default_backend())
-                    payload = jwt.decode(token, key_obj, algorithms=allowed_algorithms, options={"verify_aud": False})
-                    return True, payload
+                    return True, _decode(token, key_obj)
                 except Exception:
                     return False, None
         return False, None
@@ -448,6 +486,25 @@ def setup_auth(pub: Optional[str], jwks: Optional[str]) -> None:
     if not auth_settings.enabled:
         logger.warning("Authentication disabled - running in open mode")
         print("Authentication disabled – open mode")
+
+def setup_token_scope(audience: Optional[str], required: list[str],
+                      require_exp: bool, revoked_jti_file: Optional[str]) -> None:
+    claims: Dict[str, str] = {}
+    for item in required:
+        name, sep, value = item.partition("=")
+        if not sep or not name:
+            raise ValueError(f"--required-claim expects NAME=VALUE, got {item!r}")
+        claims[name] = value
+    if (audience or claims or revoked_jti_file) and not auth_settings.enabled:
+        raise ValueError("token scoping needs JWT auth (--public-key or --jwks-url)")
+    auth_settings.audience = audience
+    auth_settings.required_claims = claims
+    auth_settings.require_exp = require_exp or audience is not None
+    auth_settings.revoked_jti_path = revoked_jti_file
+    if audience or claims:
+        logger.info("Token scope enforced", extra={"audience": audience,
+                                                   "required_claims": sorted(claims)})
+        print(f"Token scope: aud={audience} claims={sorted(claims)}")
 
 # ─────────────────────────── Task helpers ─────────────────────────────────
 running_tasks: Dict[str, Dict[str, Any]] = {}
@@ -1855,7 +1912,8 @@ async def health_check():
 
 # ENHANCED: Status endpoint with deployment statistics
 @app.get("/status")
-async def get_server_status():
+async def get_server_status(auth: bool = Depends(verify_authentication)):
+    # Authenticated: recent_output carries task output, which must never be public.
     recent_output = []
     for tid, info in running_tasks.items():
         output_lines = list(info.get("output_lines", []))
@@ -2352,6 +2410,16 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Start LZ4 Pixi Runner with HTTP Proxy, MCP Support + Offline Deployment + JSON Logging")
     p.add_argument("--public-key")
     p.add_argument("--jwks-url")
+    p.add_argument("--audience",
+                    help="Require this JWT 'aud' (e.g. the box id) so tokens minted for "
+                         "another server sharing the same issuer are refused. Implies --require-exp")
+    p.add_argument("--required-claim", action="append", default=[], metavar="NAME=VALUE",
+                    help="Require a JWT claim to equal VALUE (repeatable), e.g. tenant=42")
+    p.add_argument("--require-exp", action="store_true",
+                    help="Refuse tokens without an 'exp' claim")
+    p.add_argument("--revoked-jti-file",
+                    help="File of revoked token ids (one jti per line, re-read on change). "
+                         "When set, tokens without a jti are refused")
     p.add_argument("--host", default="127.0.0.1",
                     help="Interface to bind (default: 127.0.0.1). Binding a non-loopback "
                          "host with JWT auth disabled requires --insecure")
@@ -2407,6 +2475,11 @@ if __name__ == "__main__":
         print("AES key loaded")
 
     setup_auth(args.public_key, args.jwks_url)
+    try:
+        setup_token_scope(args.audience, args.required_claim, args.require_exp,
+                          args.revoked_jti_file)
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: {exc}")
     key_secret = args.key_secret or os.environ.get("RIXI_KEY_SECRET")
     setup_handshake(key_secret, args.key_secret_uses)
 

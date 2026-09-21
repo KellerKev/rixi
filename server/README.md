@@ -36,6 +36,10 @@ curl http://localhost:9000/health
 
 - Binds **`127.0.0.1`** by default. To listen on a public interface you must either enable JWT
   auth (`--public-key` / `--jwks-url`) or pass `--insecure` explicitly.
+- `/health` is the only unauthenticated endpoint. `/status` needs a token because it carries recent
+  task output.
+- When many servers trust one issuer (a fleet), scope each server's tokens with `--audience` so a
+  token for one box cannot run code on another.
 - Uploaded archives are extracted with path-traversal/symlink filtering; task names are validated
   before reaching a shell; uploads are size-capped (`--max-upload-mb`, default 2048).
 
@@ -46,6 +50,10 @@ curl http://localhost:9000/health
 | `--host` / `--port` | Listen address (default `127.0.0.1:9000`) |
 | `--insecure` | Allow a non-loopback bind without auth |
 | `--public-key PATH` / `--jwks-url URL` | JWT verification (pinned alg allow-list) |
+| `--audience AUD` | Require `aud` = AUD (and an `exp`), so a token minted for another server that trusts the same issuer is refused |
+| `--required-claim NAME=VALUE` | Require a claim to match (repeatable), e.g. `tenant=42` |
+| `--require-exp` | Refuse tokens with no `exp` (implied by `--audience`) |
+| `--revoked-jti-file PATH` | Revoked token ids, one per line, re-read on change; tokens without a `jti` are then refused |
 | `--aes-key PATH` / `--gen-aes` | AES-256-GCM encryption (use/generate a key) |
 | `--key-secret` / `--key-secret-uses` | Handshake secret for key rotation |
 | `--max-upload-mb` | Hard cap on transferred + decompressed bytes |
