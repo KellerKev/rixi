@@ -3,7 +3,7 @@ name = "rixi-gateway"
 version = "0.1.0"
 description = "rixi gateway — control plane: registry, brokered routing, OpenTofu provisioning, JWT RBAC + policy, audit"
 authors = ["Kevin Keller <kellerkev@gmail.com>"]
-channels = ["conda-forge"]
+channels = ["conda-forge", "https://prefix.dev/websaw-ng"]
 platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
 
 [dependencies]
@@ -13,11 +13,17 @@ cryptography = ">=44"
 pytest = ">=8"
 tomli = ">=2"        # TOML resource catalog on py3.10 (stdlib tomllib used on 3.11+)
 opentofu = ">=1.7"   # cloud-agnostic provisioning + native state encryption (1.7+)
+# direct mode: websaw-ng HTTP API + sqladal store (SQLite, or Postgres via psycopg)
+websaw-ng = ">=0.1.0,<0.2"
+ombott-ng = ">=2.5,<3"
+sqladal = ">=0.8,<0.9"
+psycopg = ">=3.2"
 
 [pypi-dependencies]
 # control plane: JWT RBAC, management API, OpenTelemetry + DuckDB audit
 pyjwt = ">=2.8"
 requests = "*"                                  # JWKS fetch (matches the core server)
+httpx = "*"                                     # tests drive the direct-mode ASGI app in-process
 fastapi = "*"
 uvicorn = "*"
 duckdb = ">=0.10"                               # queryable audit store

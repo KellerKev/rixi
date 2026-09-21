@@ -33,7 +33,7 @@ def _sessions(gateway):
     for node in gateway.registry.list("client"):
         cnt = sum(1 for k in gateway._bridges if k[0] == id(node.conn))
         if cnt:
-            ident = getattr(node.conn, "auth", None)
+            ident = getattr(node.conn, "identity", None)
             out.append({"client": node.node_id,
                         "identity": getattr(ident, "sub", "") if ident else "",
                         "sessions": cnt})

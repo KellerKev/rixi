@@ -119,3 +119,39 @@ def test_status_endpoint_requires_auth(signer):
     assert client.get("/health").status_code == 200
     tok = signer(exp=_exp())
     assert client.get("/status", headers={"Authorization": f"Bearer {tok}"}).status_code == 200
+
+
+def test_jwks_recovers_after_failed_first_fetch(monkeypatch):
+    """A JWKS endpoint that is down at startup must not leave the server rejecting every token."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv_pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                 serialization.NoEncryption()).decode()
+    nums = key.public_key().public_numbers()
+
+    def b64(n):
+        import base64
+        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    jwk = {"kty": "RSA", "kid": "k1", "n": b64(nums.n), "e": b64(nums.e)}
+
+    s = rixi_server.auth_settings
+    monkeypatch.setattr(s, "enabled", True)
+    monkeypatch.setattr(s, "public_key", None)
+    monkeypatch.setattr(s, "jwks_url", "https://issuer.invalid/jwks")
+    monkeypatch.setattr(s, "jwks_keys", {})             # first fetch failed
+    for attr, value in (("audience", None), ("required_claims", {}), ("require_exp", False),
+                        ("revoked_jti_path", None)):
+        monkeypatch.setattr(s, attr, value)
+
+    async def fake_refresh():
+        s.jwks_keys = {"k1": jwk}
+    monkeypatch.setattr(rixi_server, "refresh_jwks_keys", fake_refresh)
+    tok = jwt.encode({"sub": "u", "exp": _exp()}, priv_pem, algorithm="RS256",
+                     headers={"kid": "k1"})
+    assert _valid(tok)
+
+
+def test_health_reports_task_count_without_auth():
+    from fastapi.testclient import TestClient
+    body = TestClient(rixi_server.app).get("/health").json()
+    assert body["active_tasks"] == len(rixi_server.running_tasks)

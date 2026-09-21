@@ -31,6 +31,44 @@ Brokered routing (client agents that also dial in), the control API, and OpenTof
 (dummy + Scaleway, verified live) are now implemented; see [`client.py`](client.py),
 [`actions/provision.py`](actions/provision.py), and [`provisioning/`](provisioning/).
 
+## Two modes
+
+| | **Tunnel mode** (`python -m gateway`) | **Direct mode** (`python -m gateway.direct`) |
+|---|---|---|
+| Data path | client → gateway → box (brokered) | client → box, TLS ending on the box |
+| Reaches firewalled boxes | yes, boxes dial out | no, boxes need a public IP |
+| Gateway sees workload traffic | yes (tunnel frames) | never, only heartbeats (task count, readiness) |
+| Tenancy | single operator, one shared tunnel secret | per-tenant boxes, scoped tokens, 404 across tenants |
+| State | in memory | durable (SQLite or Postgres, via sqladal) |
+| HTTP stack | FastAPI admin API | websaw-ng |
+
+Use tunnel mode for your own firewalled or air-gapped machines. Use direct mode to offer boxes to
+several tenants: nobody's traffic crosses the gateway, and a box can only be driven with a token
+minted for that box and its tenant.
+
+## Direct mode — a control plane only
+
+`python -m gateway.direct --config rixi-direct.toml` (see
+[`rixi-direct.toml.example`](rixi-direct.toml.example)). A claim creates one box for the caller's
+tenant:
+
+1. The box row is written to the store **before** anything exists at the cloud, and every cloud
+   resource is tagged `rixi-managed` / `rixi-box=<id>` / `rixi-tenant=<t>`, so a crash at any step
+   leaves something the reaper or reconciler can finish.
+2. The public IP is allocated, `b-<id>.<box_domain>` is pointed at it, then the box boots with
+   user-data carrying only its own id, tenant, hostname and heartbeat secret (stored hashed).
+3. [`box/bootstrap-direct.sh`](../box/bootstrap-direct.sh), from a pinned release, installs the rixi
+   server (loopback, `--audience box-<id> --required-claim tenant=<t> --revoked-jti-file`), Caddy
+   (Let's Encrypt for the box's name) and a heartbeat agent.
+4. The box is `ready` once its public name serves a valid certificate. The reaper releases it on
+   TTL, idle (no running task), lost heartbeat, a failed or interrupted create, or on request.
+   The reconciler destroys tagged cloud resources the store does not own and stops billing boxes
+   the cloud no longer has.
+
+Billing stays outside: `GET /api/usage?since=` returns each box's rate (snapshotted at claim) and
+its billable interval, and an optional authorizer URL must approve every claim. A tenant can be
+stopped with `POST /api/tenants/<t>/stop`.
+
 ## Resource catalog — declare compute in TOML (no OpenTofu required)
 
 Instead of passing raw provisioning specs, declare named resources in a gateway-side

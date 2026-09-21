@@ -1,0 +1,56 @@
+# rixi-direct.toml — the gateway as a control plane only ("direct mode").
+#
+#     python -m gateway.direct --config rixi-direct.toml --bind 127.0.0.1:7101
+#
+# The gateway creates one box per claim, points b-<id>.<box_domain> at it, and tears it down on TTL,
+# idle, lost heartbeat, or release. Clients connect straight to https://b-<id>.<box_domain>: TLS ends
+# on the box (Caddy + Let's Encrypt), the box only accepts tokens with aud=box-<id> and the owning
+# tenant, and no workload traffic ever passes through the gateway.
+#
+# Put the heartbeat route behind your public HTTPS reverse proxy (e.g. nginx `location /gw/`);
+# keep /api/ on loopback or behind your portal. Use a dedicated cloud project for the boxes, with
+# no project-wide SSH keys (Scaleway injects them into every new instance).
+
+[direct]
+box_domain     = "run.example.com"                          # needs a DNS zone the gateway can edit
+heartbeat_url  = "https://gw.example.com/gw/heartbeat"
+box_jwks_url   = "https://portal.example.com/.well-known/jwks.json"   # boxes verify client tokens
+rixi_ref       = "v0.2.0"                                    # pinned release installed on boxes
+store          = "sqlite:////var/lib/rixi/direct.db"         # or "postgresql://user:pw@host/db"
+allowed_regions = ["fr-par-2", "pl-waw-2"]                   # hard floor; templates are checked at load
+jwt_jwks_url   = "https://portal.example.com/.well-known/jwks.json"   # who may call /api/*
+tenant_claim   = "tenant"                                    # JWT claim naming the owning tenant
+admin_role     = "admin"                                     # role that sees every tenant
+# acme_email   = "ops@example.com"
+# Optional: ask a billing service before every claim; it must answer {"allow": true}.
+# authorizer_url   = "http://127.0.0.1:8030/internal/authorize"
+# authorizer_token = "${env:RIXI_AUTHORIZER_TOKEN}"
+
+[direct.limits]           # per tenant
+max_boxes        = 2
+max_eur_per_hour = 5.0
+default_ttl      = "2h"
+max_ttl          = "12h"
+idle_timeout     = "30m"  # no running task for this long → released ("off" to disable)
+
+[direct.providers.scaleway]
+secret_key = "${env:SCW_SECRET_KEY}"
+project_id = "${env:SCW_DEFAULT_PROJECT_ID}"
+
+[direct.dns]
+provider = "scaleway"     # or "none"
+zone     = "example.com"  # the Scaleway Domains zone that contains box_domain
+
+[template.cpu]
+provider = "scaleway"
+type     = "DEV1-S"
+zones    = ["fr-par-2", "pl-waw-2"]
+image    = "ubuntu_noble"
+
+[template.l4]
+provider       = "scaleway"
+type           = "L4-1-24G"
+zones          = ["fr-par-2", "pl-waw-2"]
+image          = "ubuntu_noble_gpu_os_12"
+root_volume_gb = 100
+# eur_per_hour = 0.7875   # overrides offerings.toml (refresh it with `python -m gateway.offerings --refresh`)

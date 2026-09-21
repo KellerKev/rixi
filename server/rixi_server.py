@@ -382,8 +382,8 @@ async def validate_token(token: str) -> tuple[bool, Optional[dict]]:
         hdr = jwt.get_unverified_header(token)
         kid = hdr.get("kid")
 
-        # JWKS
-        if auth_settings.jwks_keys and kid:
+        # JWKS (keyed on the URL, not the cache: a failed first fetch must not disable it forever)
+        if auth_settings.jwks_url and kid:
             key = auth_settings.jwks_keys.get(kid)
             if not key:
                 await refresh_jwks_keys()
@@ -1892,6 +1892,7 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "uptime_seconds": time.time() - server_start_time,
         "service": "pixi-runner-server",
+        "active_tasks": len(running_tasks),   # a count only; task details need a token
         "features": [
             "http_proxy", 
             "aes_encryption", 
