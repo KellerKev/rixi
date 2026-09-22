@@ -31,6 +31,7 @@ def _conf(**direct):
         "heartbeat_url": "https://gw.example.test/gw/heartbeat",
         "box_jwks_url": "https://portal.example.test/jwks.json",
         "rixi_ref": "v9.9.9",
+        "jwt_audience": "rixi-gateway",
         "allowed_regions": ["fr-par-2", "pl-waw-2"],
         "limits": {"max_boxes": 2, "max_eur_per_hour": 2.0, "default_ttl": "1h",
                    "max_ttl": "4h", "idle_timeout": "10m"},
@@ -98,6 +99,17 @@ def test_config_refuses_template_outside_eu_floor():
     c["template"]["us"] = {"provider": "dummy", "type": "x", "zones": ["us-east-1"]}
     with pytest.raises(ConfigError, match="outside allowed_regions"):
         parse(c)
+
+
+def test_config_requires_api_audience():
+    with pytest.raises(ConfigError, match="jwt_audience"):
+        parse(_conf(jwt_audience=None))
+
+
+def test_api_refuses_box_tokens():
+    tc, svc, h = _api()
+    r = tc.post("/api/boxes", json={"template": "cpu"}, headers=h("alice", "t-a", aud="box-x"))
+    assert r.status_code == 401
 
 
 def test_config_refuses_unpinned_ref():
@@ -398,10 +410,11 @@ class SyncClient:
 def _api():
     priv, pub = _keys()
     svc = _svc()
-    tc = SyncClient(asgi(build_app(svc, JwtVerifier(public_key_pem=pub))))
+    tc = SyncClient(asgi(build_app(svc, JwtVerifier(public_key_pem=pub,
+                                                    audience="rixi-gateway"))))
 
-    def h(sub, tenant=None, roles=()):
-        claims = {"sub": sub, "roles": list(roles), "exp": int(time.time()) + 600}
+    def h(sub, tenant=None, roles=(), aud="rixi-gateway"):
+        claims = {"sub": sub, "roles": list(roles), "exp": int(time.time()) + 600, "aud": aud}
         if tenant:
             claims["tenant"] = tenant
         return {"Authorization": f"Bearer {jwt.encode(claims, priv, 'RS256')}"}

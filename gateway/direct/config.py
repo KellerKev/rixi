@@ -10,6 +10,7 @@
     authorizer_url = "http://127.0.0.1:8030/internal/authorize"           # optional
     authorizer_token = "${env:RIXI_AUTHORIZER_TOKEN}"
     jwt_jwks_url   = "https://portal.example.com/.well-known/jwks.json"   # who may call the API
+    jwt_audience   = "rixi-gateway"           # API tokens must carry this aud; box tokens never do
 
     [direct.limits]      # per tenant
     max_boxes = 2
@@ -88,6 +89,7 @@ class DirectConfig:
     authorizer_token: Optional[str] = None
     jwt_public_key: Optional[str] = None
     jwt_jwks_url: Optional[str] = None
+    jwt_audience: Optional[str] = None     # required `aud` on API tokens (see parse())
     tenant_claim: str = "tenant"
     roles_claim: str = "roles"
     admin_role: str = "admin"
@@ -124,6 +126,11 @@ def parse(data: dict) -> DirectConfig:
     for key in ("box_domain", "heartbeat_url", "box_jwks_url", "rixi_ref"):
         if not d.get(key):
             raise ConfigError(f"[direct] needs {key}")
+    if not d.get("jwt_audience") and not d.get("allow_any_audience"):
+        # Box tokens are usually signed by the same issuer (aud=box-<id>, with the tenant claim);
+        # without an audience check here, a leaked box token could claim boxes on the API.
+        raise ConfigError("[direct] needs jwt_audience (e.g. \"rixi-gateway\"), so tokens minted "
+                          "for boxes are not accepted by the API")
     if d["rixi_ref"] in ("main", "master", "HEAD") and not d.get("allow_unpinned_ref"):
         raise ConfigError("[direct] rixi_ref must be a pinned tag or commit, not a branch "
                           "(set allow_unpinned_ref = true for development)")
@@ -169,6 +176,7 @@ def parse(data: dict) -> DirectConfig:
         authorizer_url=d.get("authorizer_url") or None,
         authorizer_token=d.get("authorizer_token") or None,
         jwt_public_key=d.get("jwt_public_key") or None, jwt_jwks_url=d.get("jwt_jwks_url") or None,
+        jwt_audience=d.get("jwt_audience") or None,
         tenant_claim=d.get("tenant_claim", "tenant"), roles_claim=d.get("roles_claim", "roles"),
         admin_role=d.get("admin_role", "admin"), acme_email=d.get("acme_email") or None,
         heartbeat_timeout=_duration(d.get("heartbeat_timeout", "10m")),

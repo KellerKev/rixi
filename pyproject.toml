@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rixi"
-version = "0.2.0"
+version = "0.2.1"
 description = "Secure remote execution for Pixi projects — client SDK and CLI"
 readme = "README.md"
 requires-python = ">=3.9"

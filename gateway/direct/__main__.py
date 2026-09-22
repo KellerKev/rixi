@@ -39,7 +39,7 @@ def main() -> None:
 
     svc = build_service(cfg, audit=audit)
     verifier = JwtVerifier(public_key_pem=cfg.jwt_public_key, jwks_url=cfg.jwt_jwks_url,
-                           roles_claim=cfg.roles_claim)
+                           roles_claim=cfg.roles_claim, audience=cfg.jwt_audience)
     app = asgi(build_app(svc, verifier))
     svc.start()
     host, _, port = args.bind.rpartition(":")
