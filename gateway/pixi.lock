@@ -72,7 +72,7 @@ environments:
       - conda: https://prefix.dev/websaw-ng/noarch/threadsafevariable-20250716.1-pyh4616a5c_4.conda
       - conda: https://prefix.dev/websaw-ng/noarch/upytl-0.0.9-pyh4616a5c_4.conda
       - conda: https://prefix.dev/websaw-ng/noarch/voodoodal-1.1.0-pyh4616a5c_4.conda
-      - conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.0-pyh4616a5c_7.conda
+      - conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.1-pyh4616a5c_0.conda
       - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/17/83/6dba32b85f31868400440dc7ad2ca1eab94cbbf3a7b0459ed39f8311a9e2/opentelemetry_api-1.43.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/1e/5e/d4e9f1a599fb8e573b7b87160658329fbf28d19eac2718f51fc3def3aa5a/idna-3.18-py3-none-any.whl
@@ -152,7 +152,7 @@ environments:
       - conda: https://prefix.dev/websaw-ng/noarch/threadsafevariable-20250716.1-pyh4616a5c_4.conda
       - conda: https://prefix.dev/websaw-ng/noarch/upytl-0.0.9-pyh4616a5c_4.conda
       - conda: https://prefix.dev/websaw-ng/noarch/voodoodal-1.1.0-pyh4616a5c_4.conda
-      - conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.0-pyh4616a5c_7.conda
+      - conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.1-pyh4616a5c_0.conda
       - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/10/03/8aeeb7458d22546bf64b5250ca1daeb5ff757d900e8e4a7476c6f0db843e/protobuf-7.35.1-cp310-abi3-macosx_10_9_universal2.whl
       - pypi: https://files.pythonhosted.org/packages/17/83/6dba32b85f31868400440dc7ad2ca1eab94cbbf3a7b0459ed39f8311a9e2/opentelemetry_api-1.43.0-py3-none-any.whl
@@ -232,7 +232,7 @@ environments:
       - conda: https://prefix.dev/websaw-ng/noarch/threadsafevariable-20250716.1-pyh4616a5c_4.conda
       - conda: https://prefix.dev/websaw-ng/noarch/upytl-0.0.9-pyh4616a5c_4.conda
       - conda: https://prefix.dev/websaw-ng/noarch/voodoodal-1.1.0-pyh4616a5c_4.conda
-      - conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.0-pyh4616a5c_7.conda
+      - conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.1-pyh4616a5c_0.conda
       - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/10/03/8aeeb7458d22546bf64b5250ca1daeb5ff757d900e8e4a7476c6f0db843e/protobuf-7.35.1-cp310-abi3-macosx_10_9_universal2.whl
       - pypi: https://files.pythonhosted.org/packages/10/b2/b9dc7624b105d414585b8530451c1162c0b4750c0be9be2e497bb47a8a9b/duckdb-1.5.4-cp314-cp314-macosx_11_0_arm64.whl
@@ -309,7 +309,7 @@ environments:
       - conda: https://prefix.dev/websaw-ng/noarch/threadsafevariable-20250716.1-pyh4616a5c_4.conda
       - conda: https://prefix.dev/websaw-ng/noarch/upytl-0.0.9-pyh4616a5c_4.conda
       - conda: https://prefix.dev/websaw-ng/noarch/voodoodal-1.1.0-pyh4616a5c_4.conda
-      - conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.0-pyh4616a5c_7.conda
+      - conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.1-pyh4616a5c_0.conda
       - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/0a/19/8d0cb6f20a1ef7b18f1c8986ad5783f22f84cce39c6ce9a6e645ea55192e/protobuf-7.35.1-cp310-abi3-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/17/83/6dba32b85f31868400440dc7ad2ca1eab94cbbf3a7b0459ed39f8311a9e2/opentelemetry_api-1.43.0-py3-none-any.whl
@@ -2404,9 +2404,9 @@ packages:
   run_exports: {}
   size: 8767
   timestamp: 1782915174253
-- conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.0-pyh4616a5c_7.conda
-  sha256: fa93c5098e425ebb2fda7b06015c18c911700c14a14cb819fe4d5c0b1b913d9c
-  md5: 702f4626d18d7341942e7a0886f98f59
+- conda: https://prefix.dev/websaw-ng/noarch/websaw-ng-0.1.1-pyh4616a5c_0.conda
+  sha256: a400d34aae6439f4c39c6d4e936beba2e2b9cdd05771e4159c27e61eae30b45f
+  md5: 2e12f38b7b439cbde8c80819da74089c
   depends:
   - python >=3.8
   - ombott-ng >=1.0.0
@@ -2420,8 +2420,8 @@ packages:
   - python
   license: MIT
   run_exports: {}
-  size: 44485
-  timestamp: 1783015398611
+  size: 45188
+  timestamp: 1790780791644
 - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
   name: h11
   version: 0.16.0

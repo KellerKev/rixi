@@ -14,7 +14,7 @@ pytest = ">=8"
 tomli = ">=2"        # TOML resource catalog on py3.10 (stdlib tomllib used on 3.11+)
 opentofu = ">=1.7"   # cloud-agnostic provisioning + native state encryption (1.7+)
 # direct mode: websaw-ng HTTP API + sqladal store (SQLite, or Postgres via psycopg)
-websaw-ng = ">=0.1.0,<0.2"
+websaw-ng = ">=0.1.1,<0.2"
 ombott-ng = ">=2.5,<3"
 sqladal = ">=0.8,<0.9"
 psycopg = ">=3.2"
