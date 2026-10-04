@@ -857,7 +857,24 @@ def _make_reader(tid: Optional[str], get_info, proxy_label: str = ""):
     return reader
 
 # ─────────────────────────── ENHANCED Pixi runner generator (with offline support) ──────────────────
-async def extract_and_run(pkg: str, task: str, tid: Optional[str]) -> AsyncGenerator[bytes, None]:
+async def extract_and_run(pkg: str, task: str, tid: str, keep: bool = True) -> AsyncGenerator[bytes, None]:
+    """Stream a task's progress, output and exit code.
+
+    Every run gets a task record, whether or not the caller asked to keep the task alive:
+    the streaming loop reads the output the reader thread collects there, so without one a
+    plain `rixi run` streamed the opening statuses and nothing else. A run that was not
+    asked to be kept is cleaned up when the stream ends — including when the client
+    disconnects mid-run, which otherwise left the process and its temp dir behind.
+    """
+    try:
+        async for chunk in _extract_and_run(pkg, task, tid):
+            yield chunk
+    finally:
+        if not keep:
+            cleanup_task(tid)
+
+
+async def _extract_and_run(pkg: str, task: str, tid: str) -> AsyncGenerator[bytes, None]:
     tmp = tempfile.mkdtemp()
     if tid:
         with running_tasks_lock:
@@ -1093,9 +1110,6 @@ async def extract_and_run(pkg: str, task: str, tid: Optional[str]) -> AsyncGener
         "task_id": tid,
         "deployment_type": deployment_type
     }) + "\n").encode())
-
-    if not tid:
-        shutil.rmtree(tmp)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # NEW: LOG RETRIEVAL ENDPOINTS
@@ -1468,7 +1482,7 @@ async def upload(
 ):
     _validate_task_name(task_name)
     keep = keep_alive.lower() == "true"
-    tid = str(uuid.uuid4()) if keep else None
+    tid = str(uuid.uuid4())      # always: the stream reads the task's own output buffer
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".lz4")
 
     logger.info("Package upload started", extra={
@@ -1500,7 +1514,7 @@ async def upload(
         })
 
         return StreamingResponse(
-            extract_and_run(temp.name, task_name, tid),
+            extract_and_run(temp.name, task_name, tid, keep),
             media_type="application/octet-stream" if aes_key else "application/json",
         )
     except Exception as exc:
