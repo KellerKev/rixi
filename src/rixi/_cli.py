@@ -26,14 +26,28 @@ def _client(args) -> Client:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="rixi", description="rixi client — run Pixi projects on a remote rixi server")
     p.add_argument("--version", action="version", version=f"rixi {__version__}")
-    p.add_argument("--server", default=os.getenv("RIXI_SERVER", "http://127.0.0.1:9000"),
+    p.add_argument("--server", default=None,
                    help="server URL (or RIXI_SERVER; default http://127.0.0.1:9000)")
     p.add_argument("--token", help="JWT bearer token (or RIXI_TOKEN)")
     p.add_argument("--aes-key", help="base64 of a 32-byte AES key (or RIXI_AES_KEY_B64)")
     p.add_argument("--no-verify-ssl", action="store_true", help="skip TLS cert verification (dev only)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("health", help="check server health")
+    def connection_flags(sp):
+        """Accept the connection flags after the subcommand too.
+
+        `rixi run --server …` is what the docs show and what people type, but argparse only
+        accepts a parent flag before the subcommand. The copies write to their own names:
+        sharing a name would have the subparser's unset default overwrite a value the parent
+        had already parsed.
+        """
+        sp.add_argument("--server", dest="sub_server", default=None, help=argparse.SUPPRESS)
+        sp.add_argument("--token", dest="sub_token", default=None, help=argparse.SUPPRESS)
+        sp.add_argument("--aes-key", dest="sub_aes_key", default=None, help=argparse.SUPPRESS)
+        sp.add_argument("--no-verify-ssl", dest="sub_no_verify_ssl", action="store_true",
+                        default=False, help=argparse.SUPPRESS)
+
+    connection_flags(sub.add_parser("health", help="check server health"))
 
     for name, help_ in (("run", "run a task and print the collected output"),
                         ("stream", "run a task and stream output live")):
@@ -41,8 +55,18 @@ def main(argv=None) -> int:
         sp.add_argument("project_dir", nargs="?", default=".", help="project directory (default: .)")
         sp.add_argument("--task", default="default", help="pixi task to run (default: default)")
         sp.add_argument("--keep-alive", action="store_true", help="keep the task alive after it finishes")
+        connection_flags(sp)
 
     args = p.parse_args(argv)
+    args.server = (getattr(args, "sub_server", None) or args.server
+                   or os.getenv("RIXI_SERVER", "http://127.0.0.1:9000"))
+    args.token = getattr(args, "sub_token", None) or args.token
+    args.aes_key = getattr(args, "sub_aes_key", None) or args.aes_key
+    args.no_verify_ssl = args.no_verify_ssl or getattr(args, "sub_no_verify_ssl", False)
+    return _dispatch(args)
+
+
+def _dispatch(args) -> int:
     client = _client(args)
 
     try:

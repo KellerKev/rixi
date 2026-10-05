@@ -92,3 +92,41 @@ jobs:
       - name: Run agent tests
         run: pixi run test
         working-directory: agent
+
+  install-from-git:
+    name: Install the way users do
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # rixi is not on PyPI yet, so the documented install is a git URL. Prove that the
+      # built package works on its own: a clean venv, the console script, and a real task
+      # run against a real server.
+      - name: Install into a clean venv (from this checkout, as pip would build it)
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install -q ".[server]"
+      - name: The console script runs and reports the release version
+        run: |
+          /tmp/v/bin/rixi --version
+          test "$(/tmp/v/bin/rixi --version)" = "rixi $(grep -m1 '^version = ' pyproject.toml | cut -d\" -f2)"
+      - name: A task runs end to end through the installed client
+        run: |
+          mkdir -p /tmp/stub /tmp/proj
+          printf '#!/bin/sh\nshift 2\nexec sh run.sh\n' > /tmp/stub/pixi
+          chmod +x /tmp/stub/pixi
+          printf '#!/bin/sh\necho hello from the task\n' > /tmp/proj/run.sh
+          PATH=/tmp/stub:$PATH /tmp/v/bin/python server/rixi_server.py --port 9123 \
+            --log-dir /tmp/logs &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:9123/health && break; sleep 1; done
+          out=$(/tmp/v/bin/rixi run --server http://127.0.0.1:9123 --task run /tmp/proj)
+          echo "$out"
+          echo "$out" | grep -q "hello from the task"
+      - name: Install from the git URL itself (the documented command)
+        if: github.event_name == 'push'
+        run: |
+          python -m venv /tmp/g
+          /tmp/g/bin/pip install -q "git+${{ github.server_url }}/${{ github.repository }}@${{ github.sha }}"
+          /tmp/g/bin/rixi --help > /dev/null

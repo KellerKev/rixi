@@ -25,7 +25,8 @@ environment you tested, with nothing to reproduce and no inbound ports to open.
 ## The 30-second version
 
 ```bash
-pip install rixi
+# Not on PyPI yet — install the pinned release straight from git:
+pip install "git+https://github.com/KellerKev/rixi@v0.2.7"
 ```
 
 ```python
@@ -102,7 +103,7 @@ DAG orchestrator; pair it with your scheduler of choice.
 
 ## See it work
 
-Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install rixi`).
+Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.2.7"` — not on PyPI yet).
 Advanced lifecycle features — offline bundling, attach-history, the interactive redeploy menu —
 use the **full client** in [`clients/`](clients/), shown here as `rixi-client`:
 
@@ -332,7 +333,7 @@ to it:
 cd server && pixi install && pixi run python rixi_server.py --port 9000
 
 # terminal 2 — ship examples/hello to it
-pip install rixi
+pip install "git+https://github.com/KellerKev/rixi@v0.2.7"   # not on PyPI yet
 rixi run --server http://127.0.0.1:9000 --task hello examples/hello
 ```
 
