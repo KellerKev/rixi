@@ -130,7 +130,9 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
     @app.route("/api/templates")
     @app.use(ctxd.caller)
     async def templates(ctx):
-        return {"templates": await _call(svc.templates)}
+        # The release the boxes install, so a caller can pin the client to the same one.
+        return {"templates": await _call(svc.templates), "rixi_ref": cfg.rixi_ref,
+                "rixi_repo": cfg.rixi_repo}
 
     @app.route("/api/boxes", method="POST")
     @app.use(ctxd.caller)
