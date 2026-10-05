@@ -15,4 +15,4 @@ from __future__ import annotations
 from .client import Client, RixiError, RunResult
 
 __all__ = ["Client", "RixiError", "RunResult", "__version__"]
-__version__ = "0.2.1"
+__version__ = "0.2.6"
