@@ -113,14 +113,16 @@ class Store:
         self.db.commit()
 
     def _db_columns(self, table: str) -> set:
-        """What the DATABASE has — not what the model declares, which is always complete."""
-        if self.db._uri.startswith("sqlite"):
-            rows = self.db.executesql(f"PRAGMA table_info({table})")
-            return {r[1] for r in rows or []}
-        rows = self.db.executesql(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
-            placeholders=[table])
-        return {r[0] for r in rows or []}
+        """What the DATABASE has — not what the model declares, which is always complete.
+
+        Uses SQLAlchemy's inspector so SQLite and Postgres take the same path: a
+        dialect-specific query here would only ever be exercised in production.
+        """
+        from sqlalchemy import inspect as sa_inspect
+        insp = sa_inspect(self.db._engine)
+        if table not in insp.get_table_names():
+            return set()
+        return {c["name"] for c in insp.get_columns(table)}
 
     def _add_missing_columns(self) -> None:
         """Add columns a newer release introduced.
