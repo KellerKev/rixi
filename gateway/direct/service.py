@@ -123,9 +123,11 @@ class DirectService:
                            if k in off}})
         return out
 
+    SERVE_KINDS = ("ollama",)
+
     def claim(self, caller: Caller, template: str, zone: Optional[str] = None,
               ttl: Optional[float] = None, idle_timeout: Optional[float] = -1,
-              ssh_key: Optional[str] = None) -> Box:
+              ssh_key: Optional[str] = None, serve: Optional[dict] = None) -> Box:
         tenant = caller.tenant
         if not tenant or not _TENANT.match(tenant):
             raise Denied("token carries no usable tenant claim", 403)
@@ -145,6 +147,14 @@ class DirectService:
             idle_timeout = lim.idle_timeout
         if ssh_key and not cloudinit.valid_ssh_key(ssh_key):
             raise Denied("ssh_key is not an OpenSSH public key", 400)
+        if serve is not None:
+            kind = str(serve.get("kind") or "ollama")
+            if kind not in self.SERVE_KINDS:
+                raise Denied(f"unknown serve kind {kind!r}", 400)
+            if not cloudinit.valid_model(str(serve.get("model") or "")):
+                raise Denied("serve.model is required and must be a model name", 400)
+            serve = {"kind": kind, "model": str(serve["model"]),
+                     "key": str(serve.get("key") or "") or secrets.token_urlsafe(32)}
         rate = self.rate(t)
 
         live = self.store.list(tenant=tenant, live_only=True)
@@ -170,14 +180,19 @@ class DirectService:
                   provider=t.provider, instance_type=t.instance_type, zone=zone,
                   eur_per_hour=rate, hostname=f"b-{box_id}.{self.cfg.box_domain}",
                   state="provisioning", created_at=now, expires_at=now + ttl,
-                  idle_timeout=idle_timeout, hb_hash=_hash(secret))
+                  idle_timeout=idle_timeout, hb_hash=_hash(secret),
+                  serve_kind=serve["kind"] if serve else None,
+                  serve_model=serve["model"] if serve else None)
         user_data = cloudinit.render(self.cfg, box_id=box_id, tenant=tenant,
-                                     hostname=box.hostname, box_secret=secret, ssh_key=ssh_key)
+                                     hostname=box.hostname, box_secret=secret, ssh_key=ssh_key,
+                                     serve=serve)
         self.store.insert(box)
         self.audit("box.claimed", box=box_id, tenant=tenant, sub=caller.sub, template=t.name,
                    zone=zone, eur_per_hour=rate)
         self._begin(box_id)
         self._pool.submit(self._provision, box, t, user_data)
+        if serve:
+            box.endpoint_key = serve["key"]      # returned once; never stored
         return box
 
     def _provision(self, box: Box, t: Template, user_data: str) -> None:
@@ -296,18 +311,27 @@ class DirectService:
         self.audit("token.revoked", box=box.id, tenant=box.tenant, by=caller.sub)
 
     # -- heartbeat --------------------------------------------------------
-    def heartbeat(self, box_id: str, secret: str, active_tasks: int, tls_ready: bool) -> dict:
+    def heartbeat(self, box_id: str, secret: str, active_tasks: int, tls_ready: bool,
+                  requests: int = 0, model_ready: bool = False) -> dict:
         box = self.store.get(box_id)
         if box is None or not secret or not hmac.compare_digest(_hash(secret), box.hb_hash):
             raise Denied("unknown box or bad credential", 401)
         if not box.live or box.state == "releasing":
             return {"state": box.state, "revoked_jti": []}
         now = self.clock()
+        requests = max(0, int(requests))
         changes = {"last_heartbeat": now, "active_tasks": max(0, int(active_tasks))}
-        if active_tasks > 0:
+        if active_tasks > 0 or requests > 0:
             changes["last_busy"] = now
+        if requests:
+            changes["requests_total"] = (box.requests_total or 0) + requests
+            changes["last_request"] = now
+        if box.serve_kind and model_ready and not box.model_ready:
+            changes["model_ready"] = 1
         self.store.update(box_id, **changes)
-        if box.state == "booting" and tls_ready:
+        # A served box is only usable once its model has finished downloading.
+        serving_ready = (not box.serve_kind) or model_ready or bool(box.model_ready)
+        if box.state == "booting" and tls_ready and serving_ready:
             if self.store.transition(box_id, ("booting",), state="ready", ready_at=now,
                                      last_busy=now):
                 self.audit("box.ready", box=box_id, tenant=box.tenant,

@@ -1,4 +1,5 @@
 # Direct mode: tenancy, durable state, reaper, reconciler, heartbeat, EU floor, billing hooks.
+import json
 import os
 import sys
 import time
@@ -517,3 +518,77 @@ def test_a_slow_record_is_audited_but_still_boots():
     _settle(svc)
     assert "box.dns_slow" in events
     assert svc.store.get(box.id).state == "booting"      # still boots; Caddy retries
+
+
+# ── serving a model ─────────────────────────────────────────────────────
+
+def _serve_box(svc, caller=A, model="qwen3:0.6b", **kw):
+    box = svc.claim(caller, "cpu", serve={"kind": "ollama", "model": model}, **kw)
+    _settle(svc)
+    return box
+
+
+def test_a_served_box_carries_its_model_and_a_key_only_it_holds():
+    svc = _svc()
+    box = _serve_box(svc)
+    key = box.endpoint_key                       # handed back once
+    assert len(key) > 20
+    cur = svc.store.get(box.id)
+    assert cur.serve_kind == "ollama" and cur.serve_model == "qwen3:0.6b"
+    assert key not in json.dumps(cur.public())   # never stored or shown again
+    ud = next(iter(svc.providers["dummy"].servers.values()))["user_data"]
+    assert f"RIXI_ENDPOINT_KEY={key}" in ud and "RIXI_SERVE_MODEL=qwen3:0.6b" in ud
+
+
+def test_a_served_box_is_ready_only_once_the_model_is_pulled():
+    svc = _svc()
+    box = _serve_box(svc)
+    secret = _secret_of(svc, box.id)
+    assert svc.heartbeat(box.id, secret, 0, True, model_ready=False)["state"] == "booting"
+    assert svc.heartbeat(box.id, secret, 0, True, model_ready=True)["state"] == "ready"
+    assert svc.store.get(box.id).model_ready == 1
+
+
+def test_requests_keep_an_endpoint_alive_and_are_counted():
+    clock = Clock()
+    svc = _svc(clock=clock)
+    box = _serve_box(svc)
+    secret = _secret_of(svc, box.id)
+    svc.heartbeat(box.id, secret, 0, True, model_ready=True)
+    clock.t += 400
+    svc.heartbeat(box.id, secret, 0, True, requests=12, model_ready=True)   # traffic
+    svc.reap_once()
+    _settle(svc)
+    assert svc.store.get(box.id).live
+    assert svc.store.get(box.id).requests_total == 12
+    clock.t += 601                                   # 10 min of silence, idle_timeout is 10m
+    svc.heartbeat(box.id, secret, 0, True, requests=0, model_ready=True)
+    svc.reap_once()
+    _settle(svc)
+    assert svc.store.get(box.id).end_reason == "idle"
+
+
+def test_serve_requests_are_validated():
+    svc = _svc()
+    with pytest.raises(Denied, match="serve.model"):
+        svc.claim(A, "cpu", serve={"kind": "ollama"})
+    with pytest.raises(Denied, match="serve kind"):
+        svc.claim(A, "cpu", serve={"kind": "vllm", "model": "x"})
+    with pytest.raises(Denied, match="serve.model"):
+        svc.claim(A, "cpu", serve={"kind": "ollama", "model": "evil\nRIXI_JWKS_URL=http://x"})
+
+
+def test_api_returns_the_endpoint_url_and_key_once(gw=None):
+    tc, svc, h = _api()
+    r = tc.post("/api/boxes", json={"template": "cpu", "serve": {"kind": "ollama",
+                                                                 "model": "qwen3:0.6b"}},
+                headers=h("alice", "t-a"))
+    assert r.status_code == 202
+    body = r.json()
+    assert body["endpoint_url"] == "https://%s/v1" % body["hostname"]
+    assert body["endpoint_key"]
+    _settle(svc)
+    again = tc.get("/api/boxes/%s" % body["id"], headers=h("alice", "t-a")).json()
+    assert "endpoint_key" not in again
+    assert tc.post("/api/boxes", json={"template": "cpu", "serve": "ollama"},
+                   headers=h("alice", "t-a")).status_code == 400

@@ -136,12 +136,21 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
     @app.use(ctxd.caller)
     async def claim(ctx):
         body = _body()
+        serve = body.get("serve")
+        if serve is not None and not isinstance(serve, dict):
+            raise json_error(400, "serve must be an object: {kind, model}")
         box = await _call(svc.claim, ctx.caller, _str(body, "template", required=True),
                           zone=_str(body, "zone"), ttl=_num(body, "ttl"),
                           idle_timeout=_num(body, "idle_timeout", default=-1, allow_null=True),
-                          ssh_key=_str(body, "ssh_key"))
+                          ssh_key=_str(body, "ssh_key"), serve=serve)
+        out = box.public(svc.clock())
+        key = getattr(box, "endpoint_key", None)
+        if key:
+            # Shown once: the gateway keeps no copy, only the box has it.
+            out["endpoint_key"] = key
+            out["endpoint_url"] = f"https://{box.hostname}/v1"
         ombott_ng.response.status = 202
-        return box.public(svc.clock())
+        return out
 
     @app.route("/api/boxes")
     @app.use(ctxd.caller)
@@ -187,11 +196,17 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
     @app.route("/gw/heartbeat", method="POST")
     async def heartbeat(ctx):
         body = _body()
-        tasks = body.get("active_tasks", 0)
-        if isinstance(tasks, bool) or not isinstance(tasks, int):
-            raise json_error(400, "active_tasks must be an integer")
+
+        def count(name):
+            v = body.get(name, 0)
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise json_error(400, f"{name} must be an integer")
+            return v
+
         return await _call(svc.heartbeat, _str(body, "box_id", required=True), _bearer() or "",
-                           tasks, bool(body.get("tls_ready")))
+                           count("active_tasks"), bool(body.get("tls_ready")),
+                           requests=count("requests"),
+                           model_ready=bool(body.get("model_ready")))
 
     app.mount()
     return app

@@ -94,6 +94,7 @@ class DirectConfig:
     roles_claim: str = "roles"
     admin_role: str = "admin"
     acme_email: Optional[str] = None
+    ollama_version: str = "v0.35.1"      # pinned; boxes install exactly this
     dns_publish_timeout: float = 180.0   # wait for all nameservers before booting a box
     heartbeat_timeout: float = 10 * 60
     boot_timeout: float = 25 * 60

@@ -8,12 +8,15 @@ one; every write commits immediately.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from sqladal import DAL, Field
+
+log = logging.getLogger("rixi.direct.store")
 
 LIVE_STATES = ("provisioning", "booting", "ready", "releasing")
 ENDED_STATES = ("gone", "failed")
@@ -44,6 +47,12 @@ class Box:
     hb_hash: str = ""               # sha256 of the box's heartbeat secret; the secret is never stored
     end_reason: Optional[str] = None
     error: Optional[str] = None
+    # Serving: the box runs a model behind its own /v1 API instead of waiting for uploads.
+    serve_kind: Optional[str] = None        # None = an ordinary compute box
+    serve_model: Optional[str] = None
+    model_ready: int = 0                    # the model has finished downloading
+    requests_total: int = 0
+    last_request: Optional[float] = None
 
     @property
     def live(self) -> bool:
@@ -62,7 +71,8 @@ class Box:
 
 _FIELDS = [f.name for f in fields(Box)]
 _DOUBLE = {"eur_per_hour", "created_at", "expires_at", "idle_timeout", "ready_at", "ended_at",
-           "last_heartbeat", "last_busy"}
+           "last_heartbeat", "last_busy", "last_request"}
+_INT = {"active_tasks", "model_ready", "requests_total"}
 
 
 def _col(name: str) -> str:
@@ -72,7 +82,7 @@ def _col(name: str) -> str:
 def _field(name: str) -> Field:
     if name in _DOUBLE:
         return Field(name, "double")
-    if name == "active_tasks":
+    if name in _INT:
         return Field(name, "integer", default=0)
     if name == "id":
         return Field("box_id", "string", length=32, unique=True, notnull=True)
@@ -99,7 +109,25 @@ class Store:
                              Field("box_id", "string", length=32, notnull=True),
                              Field("jti", "string", length=128, notnull=True),
                              Field("revoked_at", "double"))
+        self._add_missing_columns()
         self.db.commit()
+
+    def _add_missing_columns(self) -> None:
+        """Add columns a newer release introduced.
+
+        define_table only creates tables that do not exist; an upgrade that adds a field would
+        otherwise query a column the live table has never had.
+        """
+        for table, fields in (("rixi_box", _FIELDS), ):
+            have = {c.name for c in self.db[table]._sa_table.c}
+            for name in fields:
+                col = _col(name)
+                if col in have:
+                    continue
+                kind = ("DOUBLE PRECISION" if name in _DOUBLE else
+                        "INTEGER DEFAULT 0" if name in _INT else "VARCHAR(255)")
+                self.db.executesql(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+                log.info("added column %s.%s", table, col)
 
     def _box(self, row) -> Box:
         return Box(**{n: row[_col(n)] for n in _FIELDS})

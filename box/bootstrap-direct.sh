@@ -11,6 +11,10 @@
 #   RIXI_BOX_SECRET     this box's own heartbeat credential (useless for any other box)
 #   RIXI_REF / RIXI_REPO  pinned rixi release to install
 #   RIXI_ACME_EMAIL     optional Let's Encrypt account email
+#   RIXI_SERVE_KIND     optional "ollama": serve a model behind /v1 instead of only running uploads
+#   RIXI_SERVE_MODEL    the model to pull and serve (e.g. qwen3:8b)
+#   RIXI_ENDPOINT_KEY   bearer key for /v1; only this box has it
+#   RIXI_OLLAMA_VERSION pinned ollama release (e.g. v0.35.1)
 #
 # Result: Caddy terminates TLS for RIXI_HOSTNAME on this box and forwards to the rixi server on
 # loopback, which only accepts tokens scoped to this box and tenant. Traffic never leaves the
@@ -45,7 +49,19 @@ PY="$RIXI_DIR/server/.pixi/envs/default/bin/python"
 touch /etc/rixi/revoked_jti
 chmod 600 /etc/rixi/revoked_jti
 
-# 3. TLS on the box ------------------------------------------------------------
+# 3. optional: the model server ------------------------------------------------
+if [ "${RIXI_SERVE_KIND:-}" = "ollama" ]; then
+  log "installing ollama ${RIXI_OLLAMA_VERSION:-latest}"
+  curl -fsSL --retry 5 https://ollama.com/install.sh | \
+    OLLAMA_VERSION="${RIXI_OLLAMA_VERSION#v}" sh >/dev/null
+  systemctl enable --now ollama
+  # Pull in the background: a large model takes minutes and the box should already be
+  # reachable (and reporting) while it downloads. The agent reports model_ready.
+  nohup bash -c "until ollama pull '$RIXI_SERVE_MODEL'; do sleep 10; done" \
+    >/var/log/rixi-model-pull.log 2>&1 &
+fi
+
+# 4. TLS on the box ------------------------------------------------------------
 mkdir -p /var/lib/caddy
 {
   echo "{"
@@ -53,13 +69,31 @@ mkdir -p /var/lib/caddy
   [ -z "${RIXI_ACME_EMAIL:-}" ] || echo "  email $RIXI_ACME_EMAIL"
   echo "}"
   echo "$RIXI_HOSTNAME {"
-  echo "  reverse_proxy 127.0.0.1:9000 {"
-  echo "    flush_interval -1"
+  if [ -n "${RIXI_SERVE_KIND:-}" ]; then
+    # One line per request, so the agent can count them and tell the gateway when the
+    # endpoint last did any work (an idle endpoint should stop costing money).
+    echo "  log {"
+    echo "    output file /var/log/rixi/access.log"
+    echo "    format json"
+    echo "  }"
+    echo "  handle /v1/* {"
+    echo "    @ok header Authorization \"Bearer $RIXI_ENDPOINT_KEY\""
+    echo "    reverse_proxy @ok 127.0.0.1:11434 {"
+    echo "      flush_interval -1"
+    echo "    }"
+    echo "    respond \"unauthorized\" 401"
+    echo "  }"
+  fi
+  echo "  handle {"
+  echo "    reverse_proxy 127.0.0.1:9000 {"
+  echo "      flush_interval -1"
+  echo "    }"
   echo "  }"
   echo "}"
 } > /etc/rixi/Caddyfile
+mkdir -p /var/log/rixi
 
-# 4. wait for our own name ----------------------------------------------------
+# 5. wait for our own name ----------------------------------------------------
 # Caddy asks for a certificate as soon as it starts, and a failed challenge is cached by
 # the CA. If the zone has a wildcard, an unpublished record resolves to the wildcard's
 # host instead of this box, so wait until the name points at an address we actually hold.
@@ -74,7 +108,7 @@ for _ in $(seq 1 60); do
   sleep 10
 done
 
-# 5. services ----------------------------------------------------------------
+# 6. services ----------------------------------------------------------------
 cat > /etc/systemd/system/rixi-server.service <<UNIT
 [Unit]
 Description=RIXI server (loopback; reached through Caddy)

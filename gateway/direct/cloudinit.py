@@ -22,8 +22,15 @@ def valid_ssh_key(key: str) -> bool:
     return bool(_SSH_KEY.match(key.strip()))
 
 
+_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,100}$")
+
+
+def valid_model(name: str) -> bool:
+    return bool(_MODEL.match(name))
+
+
 def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_secret: str,
-           ssh_key: Optional[str] = None) -> str:
+           ssh_key: Optional[str] = None, serve: Optional[dict] = None) -> str:
     env = {
         "RIXI_BOX_ID": box_id,
         "RIXI_TENANT": tenant,
@@ -36,6 +43,15 @@ def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_se
     }
     if cfg.acme_email:
         env["RIXI_ACME_EMAIL"] = cfg.acme_email
+    if serve:
+        # The box serves a model behind its own /v1, guarded by a key only this box holds.
+        if not valid_model(serve["model"]):
+            raise ValueError("not a usable model name")
+        env["RIXI_SERVE_KIND"] = serve["kind"]
+        env["RIXI_SERVE_MODEL"] = serve["model"]
+        env["RIXI_ENDPOINT_KEY"] = serve["key"]
+        if cfg.ollama_version:
+            env["RIXI_OLLAMA_VERSION"] = cfg.ollama_version
     for k, v in env.items():
         if not _SAFE.match(v):
             raise ValueError(f"{k} contains characters not allowed in box env")
