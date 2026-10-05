@@ -19,6 +19,7 @@ ombott-ng = ">=2.5,<3"
 sqladal = ">=0.8,<0.9"
 greenlet = ">=3"     # sqlalchemy async layer (sqladal imports aio even for the sync DAL)
 dnspython = ">=2.6"  # direct mode: wait for a box record on every authoritative nameserver
+caddy = ">=2.10"     # tests adapt the box Caddyfile with the real binary
 psycopg = ">=3.2"
 
 [pypi-dependencies]

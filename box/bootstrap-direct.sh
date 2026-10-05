@@ -76,11 +76,21 @@ mkdir -p /var/lib/caddy
     echo "    output file /var/log/rixi/access.log"
     echo "    format json"
     echo "  }"
-    echo "  handle /v1/* {"
-    echo "    @ok header Authorization \"Bearer $RIXI_ENDPOINT_KEY\""
-    echo "    reverse_proxy @ok 127.0.0.1:11434 {"
+    # Two mutually exclusive handle blocks, NOT one block with a matcher and a fallback:
+    # inside a single handle, Caddy runs directives in its own order and `respond` comes
+    # before `reverse_proxy`, so the 401 would answer every request, key or not.
+    echo "  @v1ok {"
+    echo "    path /v1/*"
+    echo "    header Authorization \"Bearer $RIXI_ENDPOINT_KEY\""
+    echo "  }"
+    echo "  handle @v1ok {"
+    echo "    reverse_proxy 127.0.0.1:11434 {"
+    # ollama refuses a request whose Host is not local, so present the upstream's own.
+    echo "      header_up Host {upstream_hostport}"
     echo "      flush_interval -1"
     echo "    }"
+    echo "  }"
+    echo "  handle /v1/* {"
     echo "    respond \"unauthorized\" 401"
     echo "  }"
   fi
