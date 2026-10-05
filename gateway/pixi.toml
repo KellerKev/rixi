@@ -18,6 +18,7 @@ websaw-ng = ">=0.1.1,<0.2"
 ombott-ng = ">=2.5,<3"
 sqladal = ">=0.8,<0.9"
 greenlet = ">=3"     # sqlalchemy async layer (sqladal imports aio even for the sync DAL)
+dnspython = ">=2.6"  # direct mode: wait for a box record on every authoritative nameserver
 psycopg = ">=3.2"
 
 [pypi-dependencies]

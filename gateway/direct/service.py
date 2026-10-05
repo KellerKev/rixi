@@ -187,6 +187,12 @@ class DirectService:
             def on_ip(ip: str) -> None:
                 self.store.update(box.id, ip=ip)
                 self.dns.set_a(box.hostname, ip)
+                # Boot only once every authoritative nameserver serves the new record: the box
+                # asks for its certificate seconds after boot, and a zone wildcard would
+                # otherwise answer for it and have the challenge served by the wrong host.
+                if not self.dns.wait_published(box.hostname, ip, self.cfg.dns_publish_timeout):
+                    self.audit("box.dns_slow", box=box.id, tenant=box.tenant,
+                               hostname=box.hostname)
 
             created = provider.create(BoxSpec(box_id=box.id, tenant=box.tenant,
                                               instance_type=box.instance_type, zone=box.zone,

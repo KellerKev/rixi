@@ -94,6 +94,7 @@ class DirectConfig:
     roles_claim: str = "roles"
     admin_role: str = "admin"
     acme_email: Optional[str] = None
+    dns_publish_timeout: float = 180.0   # wait for all nameservers before booting a box
     heartbeat_timeout: float = 10 * 60
     boot_timeout: float = 25 * 60
     reap_interval: float = 30.0
@@ -179,6 +180,7 @@ def parse(data: dict) -> DirectConfig:
         jwt_audience=d.get("jwt_audience") or None,
         tenant_claim=d.get("tenant_claim", "tenant"), roles_claim=d.get("roles_claim", "roles"),
         admin_role=d.get("admin_role", "admin"), acme_email=d.get("acme_email") or None,
+        dns_publish_timeout=_duration(d.get("dns_publish_timeout", "3m")),
         heartbeat_timeout=_duration(d.get("heartbeat_timeout", "10m")),
         boot_timeout=_duration(d.get("boot_timeout", "25m")),
         reap_interval=_duration(d.get("reap_interval", "30s")),

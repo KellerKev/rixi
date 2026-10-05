@@ -252,16 +252,24 @@ class NullDns:
     def delete_a(self, fqdn: str) -> None:
         return None
 
+    def wait_published(self, fqdn: str, ip: str, timeout: float = 180.0) -> bool:
+        return True
+
 
 @dataclass
 class DummyDns:
     records: Dict[str, str] = field(default_factory=dict)
+    published: list = field(default_factory=list)
 
     def set_a(self, fqdn: str, ip: str) -> None:
         self.records[fqdn] = ip
 
     def delete_a(self, fqdn: str) -> None:
         self.records.pop(fqdn, None)
+
+    def wait_published(self, fqdn: str, ip: str, timeout: float = 180.0) -> bool:
+        self.published.append((fqdn, ip))
+        return self.records.get(fqdn) == ip
 
 
 class ScalewayDns:
@@ -296,3 +304,47 @@ class ScalewayDns:
 
     def delete_a(self, fqdn: str) -> None:
         self._patch({"delete": {"id_fields": {"name": self._name(fqdn), "type": "A"}}})
+
+    def wait_published(self, fqdn: str, ip: str, timeout: float = 180.0) -> bool:
+        """Block until EVERY authoritative nameserver answers `fqdn` with `ip`.
+
+        A zone with a wildcard turns "not published yet" into a *wrong* answer rather than
+        a missing one: the box's name resolves to whatever the wildcard points at, the ACME
+        challenge is served by that host instead, and the failure is cached for the
+        wildcard's TTL. Scaleway's own nameservers have been observed disagreeing for
+        minutes after a write, so wait for all of them before the box boots and asks for a
+        certificate. Returns False on timeout; the caller decides whether to continue.
+        """
+        try:
+            import dns.resolver
+        except ImportError:
+            log.warning("dnspython is not installed; not waiting for DNS publication")
+            return True
+        try:
+            servers = [str(r.target).rstrip(".")
+                       for r in dns.resolver.resolve(self.zone, "NS")]
+            addrs = []
+            for ns in servers:
+                addrs.extend(str(a) for a in dns.resolver.resolve(ns, "A"))
+        except Exception as exc:
+            log.warning("cannot list nameservers for %s: %s", self.zone, exc)
+            return True
+        deadline = time.monotonic() + timeout
+        pending = set(addrs)
+        while pending and time.monotonic() < deadline:
+            for addr in list(pending):
+                r = dns.resolver.Resolver(configure=False)
+                r.nameservers = [addr]
+                r.lifetime = r.timeout = 5.0
+                try:
+                    if ip in {str(a) for a in r.resolve(fqdn, "A")}:
+                        pending.discard(addr)
+                except Exception:
+                    pass
+            if pending:
+                time.sleep(3)
+        if pending:
+            log.warning("%s: %d/%d nameservers still do not serve %s",
+                        fqdn, len(pending), len(addrs), ip)
+            return False
+        return True

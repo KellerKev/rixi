@@ -59,7 +59,22 @@ mkdir -p /var/lib/caddy
   echo "}"
 } > /etc/rixi/Caddyfile
 
-# 4. services ----------------------------------------------------------------
+# 4. wait for our own name ----------------------------------------------------
+# Caddy asks for a certificate as soon as it starts, and a failed challenge is cached by
+# the CA. If the zone has a wildcard, an unpublished record resolves to the wildcard's
+# host instead of this box, so wait until the name points at an address we actually hold.
+own_ips="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+for _ in $(seq 1 60); do
+  resolved="$(getent hosts "$RIXI_HOSTNAME" 2>/dev/null | awk '{print $1}' | head -1)"
+  if [ -n "$resolved" ] && echo "$own_ips" | grep -qx "$resolved"; then
+    log "$RIXI_HOSTNAME resolves here ($resolved)"
+    break
+  fi
+  log "waiting for DNS: $RIXI_HOSTNAME -> ${resolved:-nothing} (ours: $(echo $own_ips | tr '\n' ' '))"
+  sleep 10
+done
+
+# 5. services ----------------------------------------------------------------
 cat > /etc/systemd/system/rixi-server.service <<UNIT
 [Unit]
 Description=RIXI server (loopback; reached through Caddy)

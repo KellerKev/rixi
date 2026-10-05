@@ -470,3 +470,50 @@ def test_api_denials_map_to_http_codes():
     assert tc.post("/api/boxes", content=b"[1]", headers={**h("bob", "t-b"),
                    "Content-Type": "application/json"}).status_code == 400
     _settle(svc)
+
+
+def test_a_box_boots_only_after_its_record_is_published(gw_unused=None):
+    """The record must be on every nameserver before the box boots: it asks for its
+    certificate seconds later, and a zone wildcard would otherwise answer for its name."""
+    order = []
+
+    class SlowDns(DummyDns):
+        def set_a(self, fqdn, ip):
+            order.append(("set", fqdn))
+            super().set_a(fqdn, ip)
+
+        def wait_published(self, fqdn, ip, timeout=180.0):
+            order.append(("wait", fqdn))
+            return super().wait_published(fqdn, ip, timeout)
+
+    class WatchingProvider(DummyProvider):
+        def create(self, spec, on_ip):
+            created = super().create(spec, on_ip)
+            order.append(("boot", spec.box_id))
+            return created
+
+    cfg = parse(_conf())
+    store = Store(f"sqlite:///{os.path.join(tempfile.mkdtemp(), 'd.db')}")
+    dns = SlowDns()
+    svc = DirectService(cfg, store, {"dummy": WatchingProvider()}, dns, audit=lambda e, **a: None,
+                        clock=Clock(), workers=2)
+    box = svc.claim(A, "cpu")
+    _settle(svc)
+    assert [o[0] for o in order] == ["set", "wait", "boot"], order
+    assert dns.published == [(box.hostname, svc.store.get(box.id).ip)]
+
+
+def test_a_slow_record_is_audited_but_still_boots():
+    class NeverPublishes(DummyDns):
+        def wait_published(self, fqdn, ip, timeout=180.0):
+            return False
+
+    cfg = parse(_conf())
+    store = Store(f"sqlite:///{os.path.join(tempfile.mkdtemp(), 'd.db')}")
+    events = []
+    svc = DirectService(cfg, store, {"dummy": DummyProvider()}, NeverPublishes(),
+                        audit=lambda e, **a: events.append(e), clock=Clock(), workers=2)
+    box = svc.claim(A, "cpu")
+    _settle(svc)
+    assert "box.dns_slow" in events
+    assert svc.store.get(box.id).state == "booting"      # still boots; Caddy retries
