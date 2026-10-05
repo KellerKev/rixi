@@ -9,10 +9,13 @@ publish DNS first — the box requests its TLS certificate on boot and needs its
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
+
+log = logging.getLogger("rixi.direct.providers")
 
 MANAGED_TAG = "rixi-managed"
 

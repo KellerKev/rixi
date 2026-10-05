@@ -158,3 +158,63 @@ def test_dns_names_are_relative_to_zone_and_stay_inside_it():
     assert s.calls[1][2]["json"]["changes"][0]["delete"]["id_fields"]["name"] == "b-abc.run"
     with pytest.raises(ProviderError):
         dns.set_a("evil.example.org", "1.2.3.4")
+
+
+class FakeDns:
+    """Stands in for the dnspython module inside wait_published."""
+
+    def __init__(self, answers):
+        self.answers = answers          # {nameserver_ip: [addresses]} ; None = query fails
+        self.queries = []
+
+        class Resolver:
+            def __init__(inner, configure=True):
+                inner.nameservers = []
+                inner.lifetime = inner.timeout = 0
+
+            def resolve(inner, name, rdtype):
+                self.queries.append((inner.nameservers[0], name))
+                got = self.answers.get(inner.nameservers[0])
+                if got is None:
+                    raise RuntimeError("no answer")
+                return got
+        self.Resolver = Resolver
+
+    def resolve(self, name, rdtype):
+        if rdtype == "NS":
+            return [type("R", (), {"target": "ns%d.example." % i})() for i in range(2)]
+        return ["10.0.0.%d" % int(name[2])]      # ns0.example -> 10.0.0.0, ns1 -> 10.0.0.1
+
+
+def _with_fake_dns(fake, fn):
+    import sys, types
+    mod = types.ModuleType("dns")
+    mod.resolver = fake
+    old = sys.modules.get("dns"), sys.modules.get("dns.resolver")
+    sys.modules["dns"], sys.modules["dns.resolver"] = mod, fake
+    try:
+        return fn()
+    finally:
+        for k, v in zip(("dns", "dns.resolver"), old):
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+def test_wait_published_requires_every_nameserver():
+    """A wildcard makes a missing record look like a wrong one, so all nameservers must agree."""
+    dns = ScalewayDns("secret", "example.com", session=FakeSession({}))
+    fake = FakeDns({"10.0.0.0": ["51.0.0.7"], "10.0.0.1": ["65.9.9.9"]})   # ns1 still wildcard
+    assert _with_fake_dns(fake, lambda: dns.wait_published("b-x.run.example.com", "51.0.0.7",
+                                                           timeout=0.1)) is False
+    fake_ok = FakeDns({"10.0.0.0": ["51.0.0.7"], "10.0.0.1": ["51.0.0.7"]})
+    assert _with_fake_dns(fake_ok, lambda: dns.wait_published("b-x.run.example.com", "51.0.0.7",
+                                                              timeout=5)) is True
+
+
+def test_wait_published_is_not_fatal_when_dns_cannot_be_queried():
+    dns = ScalewayDns("secret", "example.com", session=FakeSession({}))
+    fake = FakeDns({"10.0.0.0": None, "10.0.0.1": None})
+    assert _with_fake_dns(fake, lambda: dns.wait_published("b-x.run.example.com", "51.0.0.7",
+                                                           timeout=0.1)) is False
