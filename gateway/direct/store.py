@@ -112,22 +112,40 @@ class Store:
         self._add_missing_columns()
         self.db.commit()
 
+    def _db_columns(self, table: str) -> set:
+        """What the DATABASE has — not what the model declares, which is always complete."""
+        if self.db._uri.startswith("sqlite"):
+            rows = self.db.executesql(f"PRAGMA table_info({table})")
+            return {r[1] for r in rows or []}
+        rows = self.db.executesql(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+            placeholders=[table])
+        return {r[0] for r in rows or []}
+
     def _add_missing_columns(self) -> None:
         """Add columns a newer release introduced.
 
-        define_table only creates tables that do not exist; an upgrade that adds a field would
-        otherwise query a column the live table has never had.
+        define_table only creates tables that do not exist, so an upgrade that adds a field
+        would otherwise query a column the live table has never had — and on Postgres the
+        first such query poisons the whole transaction.
         """
-        for table, fields in (("rixi_box", _FIELDS), ):
-            have = {c.name for c in self.db[table]._sa_table.c}
-            for name in fields:
-                col = _col(name)
-                if col in have:
-                    continue
-                kind = ("DOUBLE PRECISION" if name in _DOUBLE else
-                        "INTEGER DEFAULT 0" if name in _INT else "VARCHAR(255)")
-                self.db.executesql(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
-                log.info("added column %s.%s", table, col)
+        have = self._db_columns("rixi_box")
+        if not have:
+            return                      # table was just created with every column
+        for name in _FIELDS:
+            col = _col(name)
+            if col in have:
+                continue
+            kind = ("DOUBLE PRECISION" if name in _DOUBLE else
+                    "INTEGER DEFAULT 0" if name in _INT else "VARCHAR(255)")
+            try:
+                self.db.executesql(f"ALTER TABLE rixi_box ADD COLUMN {col} {kind}")
+                self.db.commit()
+                log.info("added column rixi_box.%s", col)
+            except Exception:
+                self.db.rollback()
+                log.exception("could not add column rixi_box.%s", col)
+                raise
 
     def _box(self, row) -> Box:
         return Box(**{n: row[_col(n)] for n in _FIELDS})

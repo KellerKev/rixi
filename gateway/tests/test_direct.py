@@ -23,7 +23,7 @@ from gateway.direct.web import asgi, build_app  # noqa: E402
 from gateway.direct.config import ConfigError, parse  # noqa: E402
 from gateway.direct.providers import DummyDns, DummyProvider  # noqa: E402
 from gateway.direct.service import Caller, Denied, DirectService, NotFound  # noqa: E402
-from gateway.direct.store import Store  # noqa: E402
+from gateway.direct.store import Box, Store  # noqa: E402
 
 
 def _conf(**direct):
@@ -592,3 +592,30 @@ def test_api_returns_the_endpoint_url_and_key_once(gw=None):
     assert "endpoint_key" not in again
     assert tc.post("/api/boxes", json={"template": "cpu", "serve": "ollama"},
                    headers=h("alice", "t-a")).status_code == 400
+
+
+def test_an_upgrade_adds_columns_the_live_table_is_missing():
+    """A release that adds a field must not query a column the database has never had."""
+    import sqlite3
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "old.db")
+    url = f"sqlite:///{path}"
+    store = Store(url)
+    store.insert(Box(id="old1", tenant="t-a", owner="u1", template="cpu", provider="dummy",
+                     instance_type="DEV1-M", zone="fr-par-2", eur_per_hour=0.02,
+                     hostname="b-old1.run.test", created_at=1.0))
+    store.close()
+    # simulate the older release: the serving columns were not there yet
+    con = sqlite3.connect(path)
+    for col in ("serve_kind", "serve_model", "model_ready", "requests_total", "last_request"):
+        con.execute(f"ALTER TABLE rixi_box DROP COLUMN {col}")
+    con.commit()
+    cols = {r[1] for r in con.execute("PRAGMA table_info(rixi_box)")}
+    con.close()
+    assert "serve_kind" not in cols
+
+    store2 = Store(url)                       # the upgrade opens it
+    live = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(rixi_box)")}
+    assert {"serve_kind", "serve_model", "model_ready", "requests_total"} <= live
+    assert store2.get("old1").serve_kind is None      # existing rows still readable
+    assert store2.list()[0].id == "old1"
