@@ -15,23 +15,29 @@ output back — from Python, no CLI or shell alias required:
 The SDK speaks the same wire format as ``clients/rixi_client.py`` (tar → LZ4 → multipart
 POST /upload, length-prefixed AES-GCM frames back) but exposes it as a library so it works
 in notebooks and other Python code. Transport encryption: pass ``aes_key`` (base64 of a
-32-byte key) to match a server started with ``--aes-key``; otherwise the channel is plain
-HTTP (use it over loopback, an SSH tunnel, the rixi tunnel, or behind TLS).
+32-byte key) to match a server started with ``--aes-key``, or call ``handshake(secret)`` to
+negotiate one with a server started with ``--key-secret``. With a key set, the uploaded package
+and the streamed output are both AES-256-GCM sealed; without one the channel is plain HTTP (use
+it over loopback, an SSH tunnel, the rixi tunnel, or behind TLS).
 """
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import requests
 
-from .crypto import iter_frames
+from .crypto import frame, iter_frames
+
+# Packages are sealed in chunks of this size, each as one length-prefixed AES-GCM frame.
+_SEAL_CHUNK = 1024 * 1024
 
 DEFAULT_IGNORES = {
     ".git", ".pixi", "__pycache__", ".venv", "venv", ".mypy_cache",
@@ -59,14 +65,17 @@ class Client:
     Parameters
     ----------
     server_url: base URL of the rixi server (e.g. ``http://127.0.0.1:9000``).
-    token:      optional JWT bearer token (required when the server has auth enabled).
+    token:      optional JWT bearer token (required when the server has auth enabled), or a
+                zero-argument callable returning one — called per request, so short-lived
+                tokens can be minted fresh each time.
     aes_key:    optional base64 of a 32-byte AES key matching the server's ``--aes-key``.
     verify_ssl: verify TLS certs (default True); set False only for self-signed dev certs.
     timeout:    per-request timeout in seconds for non-streaming calls.
     """
 
     def __init__(self, server_url: str = "http://127.0.0.1:9000", *,
-                 token: Optional[str] = None, aes_key: Optional[str] = None,
+                 token: Union[str, Callable[[], str], None] = None,
+                 aes_key: Optional[str] = None,
                  verify_ssl: bool = True, timeout: float = 30.0) -> None:
         self.server_url = server_url.rstrip("/")
         self.token = token
@@ -82,27 +91,42 @@ class Client:
         r.raise_for_status()
         return r.json()
 
+    def handshake(self, secret: str, *, rotate: bool = False) -> str:
+        """Negotiate a fresh AES-256 key with a server started with ``--key-secret``.
+
+        The server returns an ephemeral RSA public key; the client generates the AES key and
+        sends it back RSA-OAEP-wrapped, so the key never crosses the wire in the clear. Sets
+        this client's key and returns it base64-encoded for the caller to store.
+        """
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        r = requests.post(f"{self.server_url}/handshake",
+                          json={"secret": secret, "rotate": rotate}, headers=self._headers(),
+                          verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"handshake failed: {r.status_code} {r.text}")
+        pub = serialization.load_pem_public_key(r.json()["public_key"].encode())
+        new_key, rotation_secret = os.urandom(32), os.urandom(32)
+        cipher = pub.encrypt(new_key + rotation_secret,
+                             padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),
+                                          algorithm=hashes.SHA256(), label=None))
+        r2 = requests.post(f"{self.server_url}/handshake/finish",
+                           json={"cipher": base64.b64encode(cipher).decode()},
+                           headers=self._headers(), verify=self.verify_ssl,
+                           timeout=self.timeout)
+        if r2.status_code != 200:
+            raise RixiError(f"handshake failed: {r2.status_code} {r2.text}")
+        self.aes_key = new_key
+        return base64.b64encode(new_key).decode()
+
     def stream(self, project_dir: str = ".", *, task: str = "default",
                keep_alive: bool = False,
                ignore: Optional[set] = None) -> Iterator[str]:
         """Package ``project_dir``, run ``task``, and yield output text as it streams."""
-        pkg = self.package(project_dir, ignore=ignore)
-        try:
-            with open(pkg, "rb") as fh:
-                files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
-                data = {"task_name": task, "keep_alive": str(keep_alive).lower()}
-                with requests.post(f"{self.server_url}/upload", files=files, data=data,
-                                   headers=self._headers(), stream=True,
-                                   verify=self.verify_ssl, timeout=None) as r:
-                    if r.status_code != 200:
-                        raise RixiError(f"upload failed: {r.status_code} {r.text}")
-                    for payload in iter_frames(self.aes_key, r.iter_content(chunk_size=4096)):
-                        yield from _texts(payload)
-        finally:
-            try:
-                os.unlink(pkg)
-            except OSError:
-                pass
+        with self._post_package(project_dir, task, keep_alive, ignore) as r:
+            for payload in iter_frames(self.aes_key, r.iter_content(chunk_size=4096)):
+                yield from _texts(payload)
 
     def run(self, project_dir: str = ".", *, task: str = "default",
             keep_alive: bool = False, ignore: Optional[set] = None) -> RunResult:
@@ -165,30 +189,62 @@ class Client:
     # ── internals ──────────────────────────────────────────────────────────
     def _stream_objs(self, project_dir: str, *, task: str, keep_alive: bool,
                      ignore: Optional[set]) -> Iterator[dict]:
+        with self._post_package(project_dir, task, keep_alive, ignore) as r:
+            for payload in iter_frames(self.aes_key, r.iter_content(chunk_size=4096)):
+                yield from _objects(payload)
+
+    @contextlib.contextmanager
+    def _post_package(self, project_dir: str, task: str, keep_alive: bool,
+                      ignore: Optional[set]) -> Iterator[requests.Response]:
+        """Package, upload, and yield the streaming response; temp files are always removed.
+
+        With an AES key the package is sealed (one AES-GCM frame per 1 MiB chunk) and marked
+        ``X-Rixi-Encrypted: 1`` so the server decrypts it; the code never crosses the wire in
+        the clear.
+        """
         pkg = self.package(project_dir, ignore=ignore)
+        paths = [pkg]
         try:
+            headers = self._headers()
+            if self.aes_key:
+                sealed = pkg + ".sealed"
+                paths.append(sealed)
+                _seal_file(self.aes_key, pkg, sealed)
+                pkg = sealed
+                headers["X-Rixi-Encrypted"] = "1"
             with open(pkg, "rb") as fh:
                 files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
                 data = {"task_name": task, "keep_alive": str(keep_alive).lower()}
                 with requests.post(f"{self.server_url}/upload", files=files, data=data,
-                                   headers=self._headers(), stream=True,
+                                   headers=headers, stream=True,
                                    verify=self.verify_ssl, timeout=None) as r:
                     if r.status_code != 200:
                         raise RixiError(f"upload failed: {r.status_code} {r.text}")
-                    for payload in iter_frames(self.aes_key, r.iter_content(chunk_size=4096)):
-                        yield from _objects(payload)
+                    yield r
         finally:
-            try:
-                os.unlink(pkg)
-            except OSError:
-                pass
+            for path in paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        token = self.token() if callable(self.token) else self.token
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 class RixiError(RuntimeError):
     """Raised for client-side and server-side rixi errors."""
+
+
+def _seal_file(key: bytes, src: str, dst: str) -> None:
+    """Write `src` to `dst` as consecutive length-prefixed AES-GCM frames (server: _receive_package)."""
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        while True:
+            chunk = fin.read(_SEAL_CHUNK)
+            if not chunk:
+                break
+            fout.write(frame(key, chunk))
 
 
 _decoder = json.JSONDecoder()
