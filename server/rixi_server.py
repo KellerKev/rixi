@@ -51,7 +51,7 @@ import lz4.frame
 import requests
 import uvicorn
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, Query
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Query
 from fastapi.responses import JSONResponse, StreamingResponse, Response, FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -270,6 +270,12 @@ max_upload_bytes: int = 2048 * 1024 * 1024  # configurable via --max-upload-mb
 
 # ─────────────────────────── AES helpers ──────────────────────────────────
 NONCE_LEN = 12
+# --require-encryption: request bodies (packages, task input, proxied bodies) must be AES-GCM
+# sealed with the negotiated key, and until the key handshake completes only /health and
+# /handshake* answer. Lets a box serve plain HTTP on an open port without leaking code or data.
+require_encryption: bool = False
+# Largest single encrypted upload frame accepted (the SDK seals packages in 1 MiB chunks).
+ENC_FRAME_MAX = 4 * 1024 * 1024 + 64
 # at top
 handshake_secret: str | None = None          # set at startup if provided
 ephemeral_privkey = None                     # RSA private key for current handshake
@@ -1473,12 +1479,81 @@ async def log_requests(request: Request, call_next):
     
     return response
 
+# Paths that must answer before the key handshake has produced an AES key.
+_PRE_KEY_PATHS = {"/health", "/handshake", "/handshake/finish"}
+
+
+@app.middleware("http")
+async def require_key_gate(request: Request, call_next):
+    """With --require-encryption, refuse everything but health + the handshake until a key exists."""
+    if require_encryption and aes_key is None and request.url.path not in _PRE_KEY_PATHS:
+        return JSONResponse({"error": "Awaiting key handshake"}, status_code=503)
+    return await call_next(request)
+
+
+def _is_encrypted_upload(header_value: Optional[str]) -> bool:
+    return (header_value or "").strip() == "1"
+
+
+async def _receive_package(file: UploadFile, dest, encrypted: bool) -> int:
+    """Copy an uploaded package into `dest`, enforcing the size cap; returns bytes received.
+
+    An encrypted upload (``X-Rixi-Encrypted: 1``) is a stream of length-prefixed AES-GCM frames —
+    the same framing the server uses for output — decrypted frame by frame so a large package
+    never sits in memory whole. With --require-encryption a plaintext upload is refused.
+    """
+    if encrypted and not aes_key:
+        raise HTTPException(status_code=400,
+                            detail="Encrypted upload, but no AES key is set on this server")
+    if require_encryption and not encrypted:
+        raise HTTPException(status_code=400,
+                            detail="This server requires encrypted uploads (X-Rixi-Encrypted: 1)")
+    total = 0
+    buf = b""
+    while True:
+        chunk = await file.read(UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_upload_bytes:
+            raise HTTPException(status_code=413,
+                                detail=f"Upload exceeds limit of {max_upload_bytes} bytes")
+        if not encrypted:
+            dest.write(chunk)
+            continue
+        buf += chunk
+        while len(buf) >= 4:
+            need = int.from_bytes(buf[:4], "big")
+            if need > ENC_FRAME_MAX:
+                raise HTTPException(status_code=400, detail="Malformed encrypted upload frame")
+            if len(buf) < 4 + need:
+                break
+            try:
+                dest.write(decrypt(buf[4:4 + need]))
+            except Exception:
+                raise HTTPException(status_code=400,
+                                    detail="Encrypted upload failed authentication")
+            buf = buf[4 + need:]
+    if buf:
+        raise HTTPException(status_code=400, detail="Truncated encrypted upload")
+    return total
+
+
+def _plaintext_body_refused(content_type: str) -> Optional[JSONResponse]:
+    """With --require-encryption, a request body must be AES-sealed (application/octet-stream)."""
+    if require_encryption and "application/octet-stream" not in content_type:
+        return JSONResponse({"error": "This server requires encrypted request bodies"},
+                            status_code=400)
+    return None
+
+
 @app.post("/upload")
 async def upload(
     auth: bool = Depends(verify_authentication),
     file: UploadFile = File(...),
     task_name: str = Form("foobar"),
     keep_alive: str = Form("false"),
+    x_rixi_encrypted: Optional[str] = Header(None),
 ):
     _validate_task_name(task_name)
     keep = keep_alive.lower() == "true"
@@ -1494,18 +1569,7 @@ async def upload(
     })
 
     try:
-        total_bytes = 0
-        while True:
-            chunk = await file.read(UPLOAD_CHUNK_SIZE)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            if total_bytes > max_upload_bytes:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Upload exceeds limit of {max_upload_bytes} bytes",
-                )
-            temp.write(chunk)
+        total_bytes = await _receive_package(file, temp, _is_encrypted_upload(x_rixi_encrypted))
         temp.close()
 
         logger.info("Package upload completed", extra={
@@ -1600,6 +1664,9 @@ async def send_input_to_task(
         # Get raw request body
         body = await request.body()
         content_type = request.headers.get("content-type", "")
+        refused = _plaintext_body_refused(content_type)
+        if refused is not None:
+            return refused
 
         # Process based on content type and encryption
         if aes_key and "application/octet-stream" in content_type:
@@ -1729,6 +1796,9 @@ async def task_http_proxy(
         # Prepare request data
         if method in ['POST', 'PUT', 'PATCH']:
             content_type = request.headers.get("content-type", "")
+            refused = _plaintext_body_refused(content_type)
+            if refused is not None:
+                return refused
 
             if aes_key and "application/octet-stream" in content_type:
                 body = await request.body()
@@ -2178,6 +2248,7 @@ async def redeploy_task(
     tid: str,
     auth: bool = Depends(verify_authentication),
     file: UploadFile = File(...),
+    x_rixi_encrypted: Optional[str] = Header(None),
 ):
     if tid not in running_tasks:
         return JSONResponse({"error": "Task not found"}, status_code=404)
@@ -2209,18 +2280,8 @@ async def redeploy_task(
     temp_tar.close()
     try:
         try:
-            total_bytes = 0
-            while True:
-                chunk = await file.read(UPLOAD_CHUNK_SIZE)
-                if not chunk:
-                    break
-                total_bytes += len(chunk)
-                if total_bytes > max_upload_bytes:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Upload exceeds limit of {max_upload_bytes} bytes",
-                    )
-                tmp_pkg.write(chunk)
+            total_bytes = await _receive_package(file, tmp_pkg,
+                                                 _is_encrypted_upload(x_rixi_encrypted))
             tmp_pkg.close()
 
             await asyncio.to_thread(_decompress_lz4, tmp_pkg.name, temp_tar.name)
@@ -2450,6 +2511,10 @@ if __name__ == "__main__":
     p.add_argument("--key-secret",
                     help="Pre-shared secret used for first AES key handshake "
                          "(falls back to RIXI_KEY_SECRET env var)")
+    p.add_argument("--require-encryption", action="store_true",
+                    help="Require AES-sealed request bodies (uploads, task input, proxied "
+                         "bodies). Until the key handshake completes, only /health and "
+                         "/handshake answer. Needs --key-secret or --aes-key")
     p.add_argument("--max-upload-mb", type=int, default=2048,
                     help="Maximum upload size in MB (default: 2048)")
     p.add_argument("--tls-cert",
@@ -2497,9 +2562,16 @@ if __name__ == "__main__":
         raise SystemExit(f"ERROR: {exc}")
     key_secret = args.key_secret or os.environ.get("RIXI_KEY_SECRET")
     setup_handshake(key_secret, args.key_secret_uses)
+    if args.require_encryption:
+        if aes_key is None and not key_secret:
+            raise SystemExit("ERROR: --require-encryption needs an AES key: pass --aes-key or "
+                             "--key-secret (the client then negotiates one via the handshake)")
+        require_encryption = True
+        print("🔐 Encryption required: plaintext request bodies are refused")
 
     loopback_hosts = {"127.0.0.1", "localhost", "::1"}
-    if args.host not in loopback_hosts and not tls_enabled and aes_key is None:
+    if (args.host not in loopback_hosts and not tls_enabled and aes_key is None
+            and not require_encryption):
         logger.warning("Serving plaintext HTTP on a non-loopback host",
                        extra={"host": args.host})
         print("⚠️  Transport is plaintext HTTP. Use --tls-cert/--tls-key, an AES key "
