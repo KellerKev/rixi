@@ -47,6 +47,29 @@ uploaded it over an encrypted channel, ran the `train` task on the remote box in
 subprocess, and streamed stdout back to you. No Dockerfile. No image push. No dependency drift.
 Start a server locally in one line to try it — see [Quickstart](#quickstart).
 
+## No server yet? One command makes one
+
+Give `rixi up` a cloud API key and a size, and it creates the server, installs RIXI on it, and saves
+a connection profile — the next `rixi run` just works:
+
+```bash
+rixi up --provider hetzner --size sample-cpu --name mybox    # HCLOUD_TOKEN in the environment
+rixi run --task train .                                      # runs on mybox (the default profile)
+rixi profiles                                                # what's running, and what it has cost
+rixi down mybox                                              # destroy it — billing stops
+```
+
+| Size | Hetzner | Scaleway | AWS *(experimental)* |
+|---|---|---|---|
+| `sample-cpu` — builds, tests, light jobs | `cx23` | `DEV1-M` | `t3.medium` |
+| `sample-gpu` — basic ML and model inference | — | `L4-1-24G` (24 GB) | `g6.xlarge` |
+
+The box serves plain HTTP on an open port, and RIXI secures it end to end: every request carries a
+two-minute token signed by a key that never leaves your machine, and code, inputs, and output travel
+AES-256-GCM-sealed under a key negotiated over RSA right after boot. Credentials come from flags or
+the provider's usual env vars (`HCLOUD_TOKEN`, `SCW_SECRET_KEY` + `SCW_DEFAULT_PROJECT_ID`, …); see
+`rixi up --help`. Requires rixi 0.2.8+.
+
 ## Hard problems RIXI makes easy
 
 Each of these is normally a project of its own. In RIXI each is one command — because they all fall
