@@ -9,6 +9,11 @@ Each subdirectory is self-contained; the ones with their own `pixi.toml` install
 - [Pixi](https://pixi.sh/) installed; `pip install rixi` for the SDK/CLI examples.
 - For the deployment demos, a running RIXI server — see the top-level
   [Quickstart](../README.md#quickstart): `cd server && pixi run python rixi_server.py --port 9000`.
+  Or create a cloud one in a single command with
+  [`rixi up`](../README.md#no-server-yet-one-command-makes-one)
+  (`rixi up --provider hetzner --size sample-cpu`, or `--provider scaleway --size sample-gpu` for an
+  L4). Any example run with `rixi run` then works on it — drop `--server` and the saved profile is
+  used. `rixi down <name>` destroys the box.
 - The `agent-demos` import the agent engine in [`../agent/`](../agent/) (the scripts add it to
   `sys.path` automatically) and expect its deps installed (`cd ../agent && pixi install`).
 
@@ -47,7 +52,9 @@ and streams logs back.
 
 ```bash
 pip install rixi
-rixi run --server http://127.0.0.1:9000 --task finetune ./finetune-qlora
+rixi up --provider scaleway --size sample-gpu --name gpu   # a 24 GB L4, or use your own server
+rixi run --task finetune ./finetune-qlora
+rixi down gpu
 ```
 
 ### `inference-openai/` — serve a model behind an OpenAI-compatible API

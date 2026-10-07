@@ -24,6 +24,15 @@ On a remote RIXI server (ships this dir + its env, runs there, streams back):
 rixi run --server http://127.0.0.1:9000 --task pipeline .
 ```
 
+No server handy? Make a small cloud one with `rixi up` (Hetzner `cx23`, about a cent an hour),
+run the pipeline on it, and destroy it:
+
+```bash
+rixi up --provider hetzner --size sample-cpu --name etl   # HCLOUD_TOKEN in the environment
+rixi run --task pipeline .
+rixi down etl
+```
+
 ## Knobs
 
 | Env var | Default | Meaning |

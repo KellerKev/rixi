@@ -13,28 +13,38 @@ tiny instruction dataset, and saves the adapter — the canonical "remote GPU jo
 
 ## Run it on a GPU box
 
-1. **Provision a GPU server** (or point at an existing one). The bundled helper creates a
-   Scaleway L4 (24 GB) and installs the rixi server:
-
-   ```bash
-   ./provision-scaleway-gpu.sh                 # loopback-secure; prints an SSH-tunnel command
-   # …or expose it authenticated; see the script header for options
-   ```
-
-2. **Ship this directory and run the `finetune` task** with the SDK or CLI:
+1. **Get a GPU box.** `rixi up` creates a Scaleway L4 (24 GB), installs the rixi server, and
+   saves a connection profile — one command, with your Scaleway key in the environment:
 
    ```bash
    pip install rixi
-   rixi run --server http://127.0.0.1:9000 --task finetune ./examples/finetune-qlora
+   export SCW_SECRET_KEY=… SCW_ACCESS_KEY=…     # or pass --scw-secret-key / --scw-access-key
+   rixi up --provider scaleway --size sample-gpu --name gpu
+   ```
+
+   Already have a rixi server on a GPU? Skip this step and add `--server <url>` below.
+
+2. **Ship this directory and run the `finetune` task** — the profile supplies the address, a
+   fresh token per request, and the encryption key:
+
+   ```bash
+   rixi run --task finetune ./examples/finetune-qlora
    ```
 
    or from Python / a notebook:
 
    ```python
-   from rixi import Client
-   for line in Client("http://127.0.0.1:9000").stream(
-           "examples/finetune-qlora", task="finetune"):
+   from rixi.cloud import ProfileStore
+   client = ProfileStore().resolve("gpu").client()     # or Client("http://…") for your own server
+   for line in client.stream("examples/finetune-qlora", task="finetune"):
        print(line, end="")
+   ```
+
+3. **Destroy the box** when you're done, so billing stops. The adapter is written to
+   `adapter-out/` on the box, so use it (for example, serve it) before you destroy the box:
+
+   ```bash
+   rixi down gpu
    ```
 
 The server resolves the Pixi env on the box (PyTorch GPU, transformers, peft, bitsandbytes),

@@ -6,7 +6,7 @@
 > **How RIXI does it:** one lifecycle — provision → fine-tune → serve → tear down — with the same
 > `rixi` primitive at every step.
 
-This is the marquee walkthrough. It chains the other examples into the full story:
+This is the marquee walkthrough. It chains the other examples into one complete workflow:
 
 1. **Provision** a GPU box (or bring your own).
 2. **Fine-tune** on it — [`finetune-qlora`](../finetune-qlora/) ships its exact env and QLoRA-trains
@@ -25,6 +25,11 @@ This is the marquee walkthrough. It chains the other examples into the full stor
   export RIXI_SERVER=http://127.0.0.1:9000 # the tunnelled port
   ```
   (Any reachable rixi server works — set `RIXI_SERVER` to it however you got it.)
+
+  This walkthrough uses `provision-scaleway-gpu.sh` rather than `rixi up` because its serving step
+  goes through the full client and the proxy, which don't yet speak the per-request tokens and
+  encrypted request bodies that `rixi up` boxes require. To **train only**, `rixi up` is the quicker
+  path — see [`finetune-qlora`](../finetune-qlora/).
 
 ## Run it
 

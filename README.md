@@ -70,6 +70,11 @@ AES-256-GCM-sealed under a key negotiated over RSA right after boot. Credentials
 the provider's usual env vars (`HCLOUD_TOKEN`, `SCW_SECRET_KEY` + `SCW_DEFAULT_PROJECT_ID`, …); see
 `rixi up --help`. Requires rixi 0.2.8+.
 
+`rixi run`, `rixi stream`, and the Python SDK work with these boxes directly (and so does any example
+that uses them — drop `--server` and the profile is used). The full client's interactive lifecycle
+features and serving through the proxy use a server you start yourself or one from
+[the gateway](#scale-it-up-the-gateway) for now.
+
 ## Hard problems RIXI makes easy
 
 Each of these is normally a project of its own. In RIXI each is one command — because they all fall
@@ -82,7 +87,7 @@ out of a single primitive: *ship a project + its environment to a box and run it
 | **"The box is behind a firewall with no inbound ports."** | The box dials **out** over an encrypted reverse tunnel; you then drive it as `http://localhost:…`. No inbound holes, ever. |
 | **"The remote job needs to read/write files on my laptop."** | An MCP back-channel exposes your **local** filesystem to the remote task as a tool — so a job running on the GPU box writes its results straight back to your machine. |
 | **"My laptop chokes on this compile / test suite."** | Any `pixi.toml` task runs on the remote box, one command, streamed live. It's not just for ML — it's for any heavy workload. |
-| **"I want throwaway GPU boxes, spun up on demand and gone when idle."** | Declare boxes by name in TOML; the gateway provisions them on demand (OpenTofu) and **auto-tears-down** on idle / TTL / release. |
+| **"I want throwaway GPU boxes, spun up on demand and gone when idle."** | For one box, `rixi up --size sample-gpu` creates it and `rixi down` destroys it. For a fleet, declare boxes by name in TOML; the gateway provisions them on demand (OpenTofu) and **auto-tears-down** on idle / TTL / release. |
 | **"Serve my fine-tuned model behind an API my tools already speak."** | Deploy the model as a keep-alive task, put the proxy in front, and call it from **OpenAI, Anthropic, or Ollama** clients — one model, three API surfaces. |
 | **"Kick off a long run, close my laptop, check back later."** | `--keep-alive` hands you a task id; reattach from anywhere and replay the output, or push a code change to the *running* task without tearing it down. |
 | **"I want a Metaflow step to run on my own box — a GPU, an on-prem server, whatever I can reach."** | Add `@rixi` to a step — it runs on a rixi box (one you point at, or gateway-provisioned), artifacts flow through S3, and the rest of the flow stays local. See [Metaflow: `@rixi`](#metaflow-compute-backend-rixi). |
@@ -114,6 +119,7 @@ Plenty of tools run code on remote machines. What's genuinely unique here:
 | **Ships your resolved env** (Pixi/conda) | the `.pixi/` folder travels with the code — nothing to rebuild on the box |
 | **Reaches firewalled / NAT'd boxes** | boxes dial out over a reverse tunnel — no inbound ports to open |
 | **Air-gapped / offline bundle** | the resolved env rides along in the upload; zero network on the target |
+| **One-command cloud boxes** | `rixi up` creates a Hetzner, Scaleway, or AWS box with rixi installed and a saved, secured profile |
 | **On-demand provisioning + auto-teardown** | declare boxes in TOML; the gateway spins them up and reclaims them |
 | **Cheapest-box scheduling + budget caps** | request the cheapest box matching a spec; cap the fleet's hourly and total spend |
 | **Multi-API inference front door** | serve a model as a task, call it from OpenAI / Anthropic / Ollama clients |
@@ -362,6 +368,10 @@ rixi run --server http://127.0.0.1:9000 --task hello examples/hello
 
 Prefer a container? `docker build -t rixi-server . && docker run --rm -p 9000:9000 -e RIXI_ALLOW_INSECURE=1 rixi-server`
 (see [`Dockerfile`](Dockerfile) for authenticated/TLS options).
+
+Prefer a cloud box? `rixi up --provider hetzner --size sample-cpu` creates one with rixi already
+running and saves the connection; then `rixi run --task hello examples/hello` needs no `--server`.
+See [No server yet?](#no-server-yet-one-command-makes-one).
 
 ## Learn more
 
