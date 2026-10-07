@@ -20,16 +20,32 @@ SECRET = "gw-secret"
 
 
 async def _echo(tag: bytes):
+    conns = set()
+
     async def handle(reader, writer):
-        while True:
-            data = await reader.read(4096)
-            if not data:
-                break
-            writer.write(tag + data)
-            await writer.drain()
-        writer.close()
+        conns.add(writer)
+        try:
+            while True:
+                data = await reader.read(4096)
+                if not data:
+                    break
+                writer.write(tag + data)
+                await writer.drain()
+        finally:
+            conns.discard(writer)
+            writer.close()
     s = await asyncio.start_server(handle, "127.0.0.1", 0)
+    s.open_conns = conns
     return s, s.sockets[0].getsockname()[1]
+
+
+async def _stop_echo(server):
+    """Since Python 3.12, Server.wait_closed() waits for every open connection to close. The fake
+    server agent below never closes its connection to the echo server, so close those first."""
+    server.close()
+    for writer in list(server.open_conns):
+        writer.close()
+    await asyncio.wait_for(server.wait_closed(), timeout=5)
 
 
 async def _server_agent(ws_url, target_port, node_id):
@@ -118,8 +134,7 @@ def test_brokered_round_trip_through_client_agent():
                 await sa[0].close()
             ws_server.close()
             await ws_server.wait_closed()
-            echo.close()
-            await echo.wait_closed()
+            await _stop_echo(echo)
 
     asyncio.run(run())
 
@@ -148,8 +163,7 @@ def test_claim_redemption_signals_waiting_client():
                 await sa[0].close()
             ws_server.close()
             await ws_server.wait_closed()
-            echo.close()
-            await echo.wait_closed()
+            await _stop_echo(echo)
 
     asyncio.run(run())
 
@@ -176,8 +190,7 @@ def test_control_list_and_route():
                 await sa[0].close()
             ws_server.close()
             await ws_server.wait_closed()
-            echo.close()
-            await echo.wait_closed()
+            await _stop_echo(echo)
 
     asyncio.run(run())
 
