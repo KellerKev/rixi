@@ -754,3 +754,190 @@ def test_released_boxes_leave_no_dns_behind():
     svc.release(box.id, "test", caller=A)
     _settle(svc)
     assert svc.dns.records == {}
+
+
+# ── persistence: volumes, stop / start ──────────────────────────────────
+
+def _make_ready(svc, box):
+    _settle(svc)
+    svc.heartbeat(box.id, _secret_of(svc, box.id), 0, True)
+    assert svc.store.get(box.id).state == "ready"
+
+
+def _volume(svc, caller=A, name="data", size=20, zone=None):
+    v = svc.create_volume(caller, name, size, zone)
+    _settle_volumes(svc)
+    return svc.store.get_volume(v.id)
+
+
+def _settle_volumes(svc):
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        with svc._lock:
+            if not any(k.startswith("vol:") for k in svc._inflight):
+                return
+        time.sleep(0.01)
+
+
+def test_a_volume_outlives_its_box_and_moves_to_the_next():
+    svc = _svc()
+    v = _volume(svc)
+    assert v.state == "available" and v.provider_id and v.public()["mount"] == "/workspace/data/data"
+    box = svc.claim(A, "cpu", volumes=[v.id])
+    assert box.zone == v.zone                                  # the box goes where its volume is
+    assert svc.store.get_volume(v.id).state == "attached"
+    _settle(svc)
+    ud = next(iter(svc.providers["dummy"].servers.values()))["user_data"]
+    assert f"RIXI_VOLUMES={v.provider_id}:data" in ud
+    with pytest.raises(Denied, match="not available"):
+        svc.claim(A, "cpu", volumes=[v.id])                   # one box at a time
+    svc.release(box.id, "test", caller=A)
+    _settle(svc)
+    assert svc.store.get_volume(v.id).state == "available"     # freed, not deleted
+    assert v.provider_id in svc.providers["dummy"].volumes
+    second = svc.claim(A, "cpu", volumes=[v.id])
+    _settle(svc)
+    assert svc.store.get_volume(v.id).box_id == second.id
+
+
+def test_volumes_are_private_validated_and_limited():
+    svc = _svc()
+    v = _volume(svc)
+    with pytest.raises(Denied, match="no volume"):
+        svc.claim(B, "cpu", volumes=[v.id])                   # someone else's
+    with pytest.raises(NotFound):
+        svc.delete_volume(B, v.id)
+    for name, size in (("Bad Name", 10), ("ok", 0), ("ok", 5000), ("ok", "10")):
+        with pytest.raises(Denied):
+            svc.create_volume(A, name, size)
+    with pytest.raises(Denied, match="already have"):
+        svc.create_volume(A, "data", 10)
+    with pytest.raises(Denied, match="the box must be there"):
+        svc.claim(A, "gpu", zone="fr-par-2", volumes=[_volume(svc, name="far", zone="pl-waw-2").id])
+
+
+def test_a_volume_in_use_cannot_be_deleted_and_deleting_stops_its_billing():
+    clock = Clock()
+    svc = _svc(clock=clock)
+    v = _volume(svc, size=100)
+    box = svc.claim(A, "cpu", volumes=[v.id])
+    _settle(svc)
+    with pytest.raises(Denied, match="release its box"):
+        svc.delete_volume(A, v.id)
+    svc.release(box.id, "test", caller=A)
+    _settle(svc)
+    clock.t += 3600
+    svc.delete_volume(A, v.id)
+    _settle_volumes(svc)
+    assert svc.store.get_volume(v.id).state == "deleted"
+    assert v.provider_id not in svc.providers["dummy"].volumes
+    clock.t += 3600                                            # no longer billed
+    row = svc.volume_usage(ADMIN, 0)[0]
+    assert row["gb_hours"] == pytest.approx(100.0) and row["eur_per_gb_hour"] > 0
+
+
+def test_stop_and_start_keep_the_box_and_bill_compute_only_while_it_runs():
+    clock = Clock()
+    svc = _svc(clock=clock)
+    box = svc.claim(A, "cpu", ttl=3600)
+    _make_ready(svc, box)
+    clock.t += 600
+    svc.stop_box(A, box.id)
+    _settle(svc)
+    assert svc.store.get(box.id).state == "stopped"
+    srv = next(iter(svc.providers["dummy"].servers.values()))
+    assert srv["state"] == "stopped"
+    assert svc.heartbeat(box.id, _secret_of(svc, box.id), 0, True)["state"] == "stopped"
+    clock.t += 3 * 3600                                        # past its ttl, while stopped
+    svc.reap_once()
+    _settle(svc)
+    assert svc.store.get(box.id).state == "stopped"            # ttl counts running time only
+    svc.start_box(A, box.id)
+    assert svc.store.get(box.id).state == "starting" and srv["state"] == "running"
+    assert svc.heartbeat(box.id, _secret_of(svc, box.id), 0, True)["state"] == "ready"
+    clock.t += 300
+    row = svc.usage(ADMIN, 0)[0]
+    assert row["minutes"] == pytest.approx(15.0)               # 10 before + 5 after
+    assert row["stopped_minutes"] == pytest.approx(180.0)
+    assert row["stopped_eur_per_hour"] > 0
+    cur = svc.store.get(box.id)
+    assert cur.expires_at == pytest.approx(cur.created_at + 3600 + 3 * 3600)
+
+
+def test_only_ready_boxes_stop_and_only_stopped_boxes_start():
+    svc = _svc()
+    box = svc.claim(A, "cpu")
+    _settle(svc)
+    with pytest.raises(Denied, match="only a ready box"):
+        svc.stop_box(A, box.id)
+    with pytest.raises(Denied, match="only a stopped box"):
+        svc.start_box(A, box.id)
+    with pytest.raises(NotFound):
+        svc.stop_box(B, box.id)
+
+
+def test_an_idle_box_can_stop_instead_of_going_away():
+    clock = Clock()
+    svc = _svc(clock=clock)
+    box = svc.claim(A, "cpu", on_idle="stop")
+    _make_ready(svc, box)
+    clock.t += 601
+    svc.heartbeat(box.id, _secret_of(svc, box.id), 0, True)    # alive, but nothing running
+    svc.reap_once()
+    _settle(svc)
+    assert svc.store.get(box.id).state == "stopped"
+    clock.t += 8 * 24 * 3600                                   # max_stopped is 7 days
+    svc.reap_once()
+    _settle(svc)
+    assert svc.store.get(box.id).end_reason == "stopped_too_long"
+    with pytest.raises(Denied, match="on_idle"):
+        svc.claim(A, "cpu", on_idle="sleep")
+
+
+def test_a_start_that_never_comes_back_is_stopped_again():
+    clock = Clock()
+    svc = _svc(clock=clock)
+    box = svc.claim(A, "cpu")
+    _make_ready(svc, box)
+    svc.stop_box(A, box.id)
+    _settle(svc)
+    svc.start_box(A, box.id)
+    clock.t += svc.cfg.boot_timeout + 1
+    svc.reap_once()
+    _settle(svc)
+    cur = svc.store.get(box.id)
+    assert cur.state == "stopped" and "come back" in cur.error
+
+
+def test_a_stopped_box_does_not_count_toward_the_spend_limit():
+    svc = _svc(limits={"max_boxes": 2, "max_eur_per_hour": 1.9, "default_ttl": "1h",
+                       "max_ttl": "4h", "idle_timeout": "10m"})
+    a = svc.claim(A, "cpu")                                     # 0.5 €/h, limit 1.9
+    _make_ready(svc, a)
+    svc.stop_box(A, a.id)
+    _settle(svc)
+    svc.claim(A, "gpu")                                         # 1.5 €/h: fits next to a stopped box
+    with pytest.raises(Denied, match="spend limit"):
+        svc.start_box(A, a.id)                                  # 1.5 + 0.5 would not
+
+
+def test_api_volumes_and_stop_start(gw=None):
+    tc, svc, h = _api()
+    r = tc.post("/api/volumes", json={"name": "cache", "size_gb": 10}, headers=h("alice", "t-a"))
+    assert r.status_code == 202
+    _settle_volumes(svc)
+    vid = r.json()["id"]
+    assert tc.get("/api/volumes", headers=h("bob", "t-b")).json()["volumes"] == []
+    r = tc.post("/api/boxes", json={"template": "cpu", "volumes": [vid], "on_idle": "stop"},
+                headers=h("alice", "t-a"))
+    assert r.status_code == 202 and r.json()["volumes"] == [vid]
+    box_id = r.json()["id"]
+    _settle(svc)
+    svc.heartbeat(box_id, _secret_of(svc, box_id), 0, True)
+    assert tc.post(f"/api/boxes/{box_id}/stop", headers=h("alice", "t-a")).status_code == 200
+    _settle(svc)
+    assert tc.post(f"/api/boxes/{box_id}/start", headers=h("alice", "t-a")).json()["state"] == \
+        "starting"
+    assert tc.post(f"/api/boxes/{box_id}/stop", headers=h("bob", "t-b")).status_code == 404
+    usage = tc.get("/api/usage", headers=h("alice", "t-a")).json()
+    assert usage["volumes"][0]["volume"] == vid and "stopped_minutes" in usage["usage"][0]

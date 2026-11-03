@@ -45,6 +45,7 @@ class BoxSpec:
     user_data: str
     root_volume_gb: Optional[int] = None
     dedicated_firewall: bool = False     # a policy will be applied to this box's own firewall
+    volumes: List[str] = field(default_factory=list)   # provider ids of persistent volumes to attach
 
 
 @dataclass
@@ -75,6 +76,7 @@ class DummyProvider:
         self._n = 0
         self._lock = threading.Lock()      # boxes are created from a worker pool
         self.firewalls: Dict[str, object] = {}     # box id -> the compiled policy applied
+        self.volumes: Dict[str, dict] = {}         # provider id -> {zone, size_gb, tags, server}
 
     def create(self, spec: BoxSpec, on_ip: Callable[[str], None]) -> Created:
         with self._lock:
@@ -85,19 +87,54 @@ class DummyProvider:
         if self.fail_create:
             raise ProviderError("dummy: create failed")
         sid = f"srv-{n}"
+        for vid in spec.volumes:
+            vol = self.volumes.get(vid)
+            if vol is None or vol["zone"] != spec.zone or vol["server"]:
+                raise ProviderError(f"dummy: volume {vid} cannot be attached")
+            vol["server"] = sid
         self.servers[sid] = {"zone": spec.zone, "tags": box_tags(spec.box_id, spec.tenant),
-                             "user_data": spec.user_data, "type": spec.instance_type}
+                             "user_data": spec.user_data, "type": spec.instance_type,
+                             "state": "running", "volumes": list(spec.volumes)}
         return Created(provider_id=sid, ip=ip,
                        firewall_id=f"fw-{spec.box_id}" if spec.dedicated_firewall else None)
 
     def apply_firewall(self, box_id: str, zone: str, compiled) -> None:
         self.firewalls[box_id] = compiled
 
+    def _box_servers(self, box_id: str, zone: str) -> List[str]:
+        return [s for s, v in self.servers.items()
+                if box_id_from_tags(v["tags"]) == box_id and v["zone"] == zone]
+
     def destroy(self, box_id: str, zone: str) -> None:
-        for sid in [s for s, v in self.servers.items()
-                    if box_id_from_tags(v["tags"]) == box_id and v["zone"] == zone]:
+        for sid in self._box_servers(box_id, zone):
+            for vol in self.volumes.values():          # persistent volumes are detached, kept
+                if vol["server"] == sid:
+                    vol["server"] = None
             del self.servers[sid]
         self.firewalls.pop(box_id, None)
+
+    def stop(self, box_id: str, zone: str) -> None:
+        for sid in self._box_servers(box_id, zone):
+            self.servers[sid]["state"] = "stopped"
+
+    def start(self, box_id: str, zone: str) -> None:
+        for sid in self._box_servers(box_id, zone):
+            self.servers[sid]["state"] = "running"
+
+    def create_volume(self, volume_id: str, tenant: str, name: str, zone: str,
+                      size_gb: int) -> str:
+        pid = f"vol-{volume_id}"
+        self.volumes[pid] = {"zone": zone, "size_gb": size_gb, "server": None,
+                             "tags": [MANAGED_TAG, f"rixi-volume={volume_id}",
+                                      f"rixi-tenant={tenant}"]}
+        return pid
+
+    def delete_volume(self, volume_id: str, zone: str) -> None:
+        for pid in [p for p, v in self.volumes.items()
+                    if f"rixi-volume={volume_id}" in v["tags"] and v["zone"] == zone]:
+            if self.volumes[pid]["server"]:
+                raise ProviderError("dummy: volume is attached")
+            del self.volumes[pid]
 
     def list_managed(self, zones) -> List[Managed]:
         return [Managed(box_id_from_tags(v["tags"]), v["zone"], "server", sid)
@@ -192,6 +229,8 @@ class ScalewayProvider:
         if spec.root_volume_gb:
             body["volumes"] = {"0": {"size": int(spec.root_volume_gb) * 10**9,
                                      "volume_type": "sbs_volume"}}
+        for i, vid in enumerate(spec.volumes, start=1):
+            body.setdefault("volumes", {})[str(i)] = {"id": vid, "volume_type": "sbs_volume"}
         server = self._call("POST", f"{z}/servers", json=body)["server"]
         self._call("PATCH", f"{z}/servers/{server['id']}/user_data/cloud-init",
                    data=spec.user_data.encode(), headers={"Content-Type": "text/plain"})
@@ -271,6 +310,16 @@ class ScalewayProvider:
         for srv in self._servers(zone, tag):
             sbs = [v["id"] for v in (srv.get("volumes") or {}).values()
                    if v.get("volume_type") == "sbs_volume"]
+            keep = self._persistent(zone, sbs)
+            if keep:
+                # Deleting a server deletes the volumes attached to it: take persistent volumes
+                # off first. Detaching needs the server stopped.
+                self._power(zone, srv, "poweroff", "stopped")
+                for vid in keep:
+                    self._call("POST", f"{z}/servers/{srv['id']}/detach-volume",
+                               json={"volume_id": vid}, ok=(200, 201, 202, 204, 404))
+                sbs = [v for v in sbs if v not in keep]
+                srv = self._call("GET", f"{z}/servers/{srv['id']}")["server"]
             if srv.get("state") in ("running", "stopped in place", "starting"):
                 self._call("POST", f"{z}/servers/{srv['id']}/action", json={"action": "terminate"},
                            ok=(200, 201, 202, 204, 404))
@@ -285,6 +334,67 @@ class ScalewayProvider:
         # the box's own firewall can only go once no server uses it
         for g in self._box_groups(zone, box_id):
             self._call("DELETE", f"{z}/security_groups/{g['id']}", ok=(204, 404))
+
+    # -- persistence ------------------------------------------------------
+    def _block(self, zone: str) -> str:
+        return f"/block/v1alpha1/zones/{zone}"
+
+    def _persistent(self, zone: str, sbs_ids: List[str]) -> List[str]:
+        """Which of these block volumes are persistent rixi volumes (never deleted with a box)."""
+        keep = []
+        for vid in sbs_ids:
+            try:
+                v = self._call("GET", f"{self._block(zone)}/volumes/{vid}")
+            except ProviderError:
+                continue
+            if any(str(t).startswith("rixi-volume=") for t in v.get("tags") or []):
+                keep.append(vid)
+        return keep
+
+    def _power(self, zone: str, srv: dict, action: str, want: str) -> None:
+        z = self._inst(zone)
+        if srv.get("state") == want:
+            return
+        self._call("POST", f"{z}/servers/{srv['id']}/action", json={"action": action},
+                   ok=(200, 201, 202, 204))
+        deadline = time.monotonic() + self.poll_timeout
+        while time.monotonic() < deadline:
+            state = self._call("GET", f"{z}/servers/{srv['id']}")["server"].get("state")
+            if state == want:
+                return
+            time.sleep(self.poll_interval)
+        raise ProviderError(f"server {srv['id']} did not become {want} in time")
+
+    def stop(self, box_id: str, zone: str) -> None:
+        """Power off: compute billing stops; disks, IP and firewall stay."""
+        for srv in self._servers(zone, f"rixi-box={box_id}"):
+            self._power(zone, srv, "poweroff", "stopped")
+
+    def start(self, box_id: str, zone: str) -> None:
+        for srv in self._servers(zone, f"rixi-box={box_id}"):
+            self._call("POST", f"{self._inst(zone)}/servers/{srv['id']}/action",
+                       json={"action": "poweron"}, ok=(200, 201, 202, 204))
+
+    def create_volume(self, volume_id: str, tenant: str, name: str, zone: str,
+                      size_gb: int) -> str:
+        v = self._call("POST", f"{self._block(zone)}/volumes", json={
+            "name": f"rixi-vol-{volume_id}", "project_id": self.project_id,
+            "from_empty": {"size": int(size_gb) * 10**9}, "perf_iops": 5000,
+            "tags": [MANAGED_TAG, f"rixi-volume={volume_id}", f"rixi-tenant={tenant}"]})
+        deadline = time.monotonic() + self.poll_timeout
+        while v.get("status") != "available" and time.monotonic() < deadline:
+            time.sleep(self.poll_interval)
+            v = self._call("GET", f"{self._block(zone)}/volumes/{v['id']}")
+        if v.get("status") != "available":
+            raise ProviderError(f"volume {v['id']} is {v.get('status')}, not available")
+        return v["id"]
+
+    def delete_volume(self, volume_id: str, zone: str) -> None:
+        d = self._call("GET", f"{self._block(zone)}/volumes",
+                       params={"tags": f"rixi-volume={volume_id}", "project_id": self.project_id})
+        for v in d.get("volumes", []):
+            if f"rixi-volume={volume_id}" in (v.get("tags") or []):
+                self._call("DELETE", f"{self._block(zone)}/volumes/{v['id']}", ok=(204, 404))
 
     def _wait_gone(self, zone: str, server_id: str) -> None:
         deadline = time.monotonic() + self.poll_timeout

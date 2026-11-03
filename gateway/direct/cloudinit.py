@@ -60,7 +60,7 @@ def valid_llm(llm: dict) -> bool:
 
 def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_secret: str,
            ssh_key: Optional[str] = None, serve: Optional[dict] = None,
-           llm: Optional[dict] = None) -> str:
+           llm: Optional[dict] = None, volumes: Optional[list] = None) -> str:
     env = {
         "RIXI_BOX_ID": box_id,
         "RIXI_TENANT": tenant,
@@ -93,6 +93,10 @@ def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_se
         if llm["anthropic_base_url"]:
             env["RIXI_LLM_ANTHROPIC_URL"] = llm["anthropic_base_url"]
         env["RIXI_LLM_TOKEN"] = llm["token"]
+    if volumes:
+        # provider id:name pairs; the box finds each disk by id and mounts it under
+        # /workspace/data/<name>, formatting it only the first time.
+        env["RIXI_VOLUMES"] = "+".join(f"{pid}:{name}" for pid, name in volumes)
     for k, v in env.items():
         if not _SAFE.match(v):
             raise ValueError(f"{k} contains characters not allowed in box env")

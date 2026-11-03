@@ -6,7 +6,9 @@
     GET    /api/boxes/<id>
     DELETE /api/boxes/<id>                release it now
     POST   /api/boxes/<id>/revoke         {jti} — the box refuses that token from its next heartbeat
-    GET    /api/usage?since=              billable box time (admin: all tenants, or ?tenant=)
+    GET    /api/usage?since=              billable box time and volume GB-hours (admin: all, or ?tenant=)
+    POST   /api/boxes/<id>/stop · /start   power a ready box off (disk kept) · back on
+    POST   /api/volumes · GET · DELETE /api/volumes/<id>   persistent volumes
     POST   /api/tenants/<tenant>/stop     admin: release every box of a tenant
     POST   /gw/heartbeat                  box → gateway; authenticated by the box's own secret
     GET    /healthz
@@ -147,10 +149,14 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         llm = body.get("llm")
         if llm is not None and not isinstance(llm, dict):
             raise json_error(400, "llm must be an object: {base_url, token}")
+        volumes = body.get("volumes") or []
+        if not isinstance(volumes, list) or not all(isinstance(v, str) for v in volumes):
+            raise json_error(400, "volumes must be a list of volume ids")
         box = await _call(svc.claim, ctx.caller, _str(body, "template", required=True),
                           zone=_str(body, "zone"), ttl=_num(body, "ttl"),
                           idle_timeout=_num(body, "idle_timeout", default=-1, allow_null=True),
-                          ssh_key=_str(body, "ssh_key"), serve=serve, policy=policy, llm=llm)
+                          ssh_key=_str(body, "ssh_key"), serve=serve, policy=policy, llm=llm,
+                          volumes=volumes, on_idle=_str(body, "on_idle") or "release")
         out = box.public(svc.clock())
         key = getattr(box, "endpoint_key", None)
         if key:
@@ -185,6 +191,35 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         await _call(svc.revoke, ctx.caller, box_id, _str(_body(), "jti", required=True))
         return {"revoked": True}
 
+    @app.route("/api/boxes/<box_id>/stop", method="POST")
+    @app.use(ctxd.caller)
+    async def stop(ctx, box_id):
+        return (await _call(svc.stop_box, ctx.caller, box_id)).public(svc.clock())
+
+    @app.route("/api/boxes/<box_id>/start", method="POST")
+    @app.use(ctxd.caller)
+    async def start(ctx, box_id):
+        return (await _call(svc.start_box, ctx.caller, box_id)).public(svc.clock())
+
+    @app.route("/api/volumes", method="POST")
+    @app.use(ctxd.caller)
+    async def create_volume(ctx):
+        body = _body()
+        v = await _call(svc.create_volume, ctx.caller, body.get("name"), body.get("size_gb"),
+                        _str(body, "zone"))
+        ombott_ng.response.status = 202
+        return v.public()
+
+    @app.route("/api/volumes")
+    @app.use(ctxd.caller)
+    async def volumes(ctx):
+        return {"volumes": [v.public() for v in await _call(svc.list_volumes, ctx.caller)]}
+
+    @app.route("/api/volumes/<volume_id>", method="DELETE")
+    @app.use(ctxd.caller)
+    async def delete_volume(ctx, volume_id):
+        return (await _call(svc.delete_volume, ctx.caller, volume_id)).public()
+
     @app.route("/api/usage")
     @app.use(ctxd.caller)
     async def usage(ctx):
@@ -194,7 +229,8 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         except ValueError:
             raise json_error(400, "since must be a unix timestamp")
         rows = await _call(svc.usage, ctx.caller, since, q.get("tenant") or None)
-        return {"now": svc.clock(), "usage": rows}
+        vols = await _call(svc.volume_usage, ctx.caller, since, q.get("tenant") or None)
+        return {"now": svc.clock(), "usage": rows, "volumes": vols}
 
     @app.route("/api/tenants/<tenant>/stop", method="POST")
     @app.use(ctxd.admin)

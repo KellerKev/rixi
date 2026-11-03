@@ -73,6 +73,9 @@ class Limits:
     default_ttl: float = 2 * 3600
     max_ttl: float = 12 * 3600
     idle_timeout: Optional[float] = 30 * 60
+    max_volumes: int = 10                  # persistent volumes per tenant
+    max_volume_gb: int = 1000              # size of one volume
+    max_stopped: float = 7 * 24 * 3600     # a stopped box is released after this long
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,9 @@ class DirectConfig:
     boot_timeout: float = 25 * 60
     reap_interval: float = 30.0
     reconcile_interval: float = 300.0
+    # Storage: persistent volumes, and the disk of a stopped box, are billed per GB-hour.
+    volume_eur_per_gb_hour: float = 0.00013   # Scaleway SBS 5K IOPS, fr-par (catalog, 2026-11)
+    root_disk_gb: int = 20                     # a template's disk when it does not set one
     limits: Limits = field(default_factory=Limits)
     providers: Dict[str, dict] = field(default_factory=dict)
     dns: dict = field(default_factory=dict)
@@ -145,6 +151,9 @@ def parse(data: dict) -> DirectConfig:
         max_ttl=_duration(lim.get("max_ttl", "12h")),
         idle_timeout=_duration(lim.get("idle_timeout", "30m")) if lim.get(
             "idle_timeout", "30m") not in (0, "0", "off") else None,
+        max_volumes=int(lim.get("max_volumes", 10)),
+        max_volume_gb=int(lim.get("max_volume_gb", 1000)),
+        max_stopped=_duration(lim.get("max_stopped", "7d")),
     )
     if limits.default_ttl > limits.max_ttl:
         raise ConfigError("[direct.limits] default_ttl exceeds max_ttl")
@@ -188,6 +197,8 @@ def parse(data: dict) -> DirectConfig:
         boot_timeout=_duration(d.get("boot_timeout", "25m")),
         reap_interval=_duration(d.get("reap_interval", "30s")),
         reconcile_interval=_duration(d.get("reconcile_interval", "5m")),
+        volume_eur_per_gb_hour=float(d.get("volume_eur_per_gb_hour", 0.00013)),
+        root_disk_gb=int(d.get("root_disk_gb", 20)),
         limits=limits, providers=dict(d.get("providers") or {}), dns=dict(d.get("dns") or {}),
         templates=templates)
 

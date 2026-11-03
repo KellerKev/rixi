@@ -29,6 +29,32 @@ export HOME=/root
 RIXI_DIR=/opt/rixi
 log() { echo "[rixi-direct] $*"; }
 
+# 0. persistent volumes -----------------------------------------------------------
+# RIXI_VOLUMES = <disk id>:<name>+…  Each disk is found by its id, formatted only if it has no
+# filesystem yet (a volume moving between boxes keeps its data), and mounted at
+# /workspace/data/<name>, also after a stop/start (fstab, nofail).
+if [ -n "${RIXI_VOLUMES:-}" ]; then
+  mkdir -p /workspace/data
+  IFS='+' read -ra rixi_vols <<< "$RIXI_VOLUMES"
+  for entry in "${rixi_vols[@]}"; do
+    vid="${entry%%:*}"; name="${entry##*:}"
+    dev=""
+    for _ in $(seq 1 60); do
+      dev="$(ls /dev/disk/by-id/*"$vid"* 2>/dev/null | head -1)"
+      [ -n "$dev" ] && break
+      sleep 2
+    done
+    if [ -z "$dev" ]; then log "volume $vid ($name) did not appear"; continue; fi
+    blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -q -L "rixi-${name:0:10}" "$dev"
+    mkdir -p "/workspace/data/$name"
+    uuid="$(blkid -s UUID -o value "$dev")"
+    grep -q "UUID=$uuid " /etc/fstab || \
+      echo "UUID=$uuid /workspace/data/$name ext4 defaults,nofail 0 2" >> /etc/fstab
+    mountpoint -q "/workspace/data/$name" || mount "/workspace/data/$name"
+    log "volume $name mounted at /workspace/data/$name"
+  done
+fi
+
 # 1. pixi + caddy -------------------------------------------------------------
 if [ ! -x "$HOME/.pixi/bin/pixi" ]; then
   log "installing pixi"
