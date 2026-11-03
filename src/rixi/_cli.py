@@ -124,10 +124,9 @@ def main(argv=None) -> int:
                     help="sample-cpu or sample-gpu; on eutonomous also cpu-s, cpu-l, gpu-l4, "
                          "gpu-l40s")
     up.add_argument("--model-access", choices=["governed", "direct", "none"],
-                    help="eutonomous: how the box's workloads reach models — governed (through "
-                         "eutonomous + malgra, a box-only token), direct (your own endpoint and "
-                         "key, nothing in between) or none. Default: governed if your account "
-                         "linked an eutonomous key, else none")
+                    help="eutonomous, for jobs that call models: governed (through eutonomous "
+                         "+ malgra, a box-only token), direct (your own endpoint and key, nothing "
+                         "in between) or none (the default)")
     up.add_argument("--model-url", help="direct: OpenAI-compatible base URL (https://…/v1)")
     up.add_argument("--model-anthropic-url", help="direct: Anthropic-compatible base URL")
     up.add_argument("--model-key", help="direct: the endpoint's API key (or RIXI_MODEL_KEY)")

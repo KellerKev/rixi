@@ -97,7 +97,7 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
         body["policy"] = policy.to_dict()
     if model_access is not None:
         # governed: through eutonomous + malgra with a box-only token; direct: straight to your
-        # own endpoint with your own key; none. Omitted: governed if your account linked a key.
+        # own endpoint with your own key; none. Omitted: none.
         body["model_access"] = model_access
 
     price = f" (€{t['eur_per_hour']}/h)" if t.get("eur_per_hour") else ""
