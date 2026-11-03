@@ -73,8 +73,8 @@ def rpc(server, method, params=None, mid=1):
     return server.handle({"jsonrpc": "2.0", "id": mid, "method": method, "params": params or {}})
 
 
-def call(server, name, **args):
-    r = rpc(server, "tools/call", {"name": name, "arguments": args})["result"]
+def call(server, _tool, **args):
+    r = rpc(server, "tools/call", {"name": _tool, "arguments": args})["result"]
     return r["content"][0]["text"], r["isError"]
 
 
@@ -166,3 +166,36 @@ def test_previews_over_tools():
     assert call(s, "open_preview", box="b1", port=5173)[0] == \
         "private preview: https://5173.b-x.run.test/?t=1"
     assert call(s, "open_preview", box="b1", port="80")[1] is True
+
+
+def test_persistence_over_tools():
+    class Api:
+        def __init__(self):
+            self.vols = {}
+
+        def volumes(self):
+            return list(self.vols.values())
+
+        def create_volume(self, name, size_gb, zone=None):
+            self.vols["v1"] = {"id": "v1", "name": name, "size_gb": size_gb,
+                               "zone": zone or "fr-par-2", "state": "creating", "box_id": None}
+            return self.vols["v1"]
+
+        def delete_volume(self, vid):
+            self.vols.pop(vid)
+
+    class StoppableBox(Box):
+        def stop(self):
+            self.stopped = True
+
+        def resume(self):
+            self.stopped = False
+    box = StoppableBox()
+    api = Api()
+    s = Server(Tools(store=_store_with(), sandbox_for=lambda name: box, api=api))
+    assert "v1 (data, 50 GB" in call(s, "create_volume", name="data", size_gb=50)[0]
+    assert "v1: data 50 GB" in call(s, "list_volumes")[0]
+    assert call(s, "create_volume", name="x", size_gb="big")[1] is True
+    assert call(s, "stop_box", box="b1")[0].startswith("stopping") and box.stopped
+    assert call(s, "resume_box", box="b1")[0] == "running again" and not box.stopped
+    assert call(s, "delete_volume", volume_id="v1")[0] == "deleting" and api.vols == {}

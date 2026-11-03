@@ -64,7 +64,8 @@ class Sandbox:
                policy: Optional[dict] = None, allow_from: str = "0.0.0.0/0",
                region: Optional[str] = None, instance_type: Optional[str] = None,
                creds: Optional[Dict[str, Optional[str]]] = None, ssh_key: Optional[str] = None,
-               ttl_hours: Optional[float] = None, model_access=None, wait_timeout: float = 900.0, store=None, echo=None) -> "Sandbox":
+               ttl_hours: Optional[float] = None, model_access=None,
+               volumes: Optional[List[str]] = None, on_idle: Optional[str] = None, wait_timeout: float = 900.0, store=None, echo=None) -> "Sandbox":
         """Provision a box, wait until it is ready (and sealed, with a policy), return it.
 
         Credentials come from `creds`, else the provider's usual env vars, else saved ones.
@@ -78,6 +79,7 @@ class Sandbox:
             provider=provider, size=size, name=name or f"sb-{secrets.token_hex(4)}",
             creds=resolved, instance_type=instance_type, region=region, allow_from=allow_from,
             ssh_key=ssh_key, policy=policy, ttl_hours=ttl_hours, model_access=model_access,
+            volumes=volumes, on_idle=on_idle,
             make_default=False, wait_timeout=wait_timeout,
             store=store, echo=echo or log.info)
         return cls(profile, owned=True, creds=resolved, store=store)
@@ -102,6 +104,18 @@ class Sandbox:
         self.destroyed = True
         with _owned_lock:
             _owned.pop(self.name, None)
+
+    def stop(self) -> None:
+        """Hosted boxes: power off, keeping the disk and its files (compute not billed)."""
+        from .cloud import hosted
+        hosted.stop(self.profile, echo=log.info)
+        self._client = None
+
+    def resume(self) -> None:
+        """Hosted boxes: start a stopped box again and wait until it is ready. (``start``
+        starts a task, as on the Client.)"""
+        from .cloud import hosted
+        hosted.start(self.profile, echo=log.info)
 
     def __enter__(self) -> "Sandbox":
         return self

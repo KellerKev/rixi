@@ -140,3 +140,57 @@ def test_model_access_on_your_own_cloud_points_to_exec_env():
     with pytest.raises(up_mod.UpError, match="exec --env"):
         up_mod.up(provider="hetzner", name="own", creds={"token": "t"}, model_access="governed",
                   _check=False, echo=lambda m: None)
+
+
+class PersistApi(FakeApi):
+    def __init__(self):
+        super().__init__(ready_after=0)
+        self.actions, self.vols = [], {}
+
+    def stop(self, box_id):
+        self.actions.append(("stop", box_id))
+
+    def start(self, box_id):
+        self.actions.append(("start", box_id))
+
+    def volumes(self):
+        return list(self.vols.values())
+
+    def create_volume(self, name, size_gb, zone=None):
+        v = {"id": "v1", "name": name, "size_gb": size_gb, "zone": zone or "fr-par-2",
+             "state": "creating", "box_id": None}
+        self.vols["v1"] = v
+        return v
+
+    def delete_volume(self, volume_id):
+        self.vols.pop(volume_id)
+
+
+def test_volumes_and_idle_stop_ride_along_with_the_launch():
+    api = PersistApi()
+    _up(api, volumes=["v1"], on_idle="stop")
+    assert api.launched[0]["volumes"] == ["v1"] and api.launched[0]["on_idle"] == "stop"
+
+
+def test_stop_and_start_a_hosted_profile():
+    api = PersistApi()
+    profile = _up(api)
+    hosted.stop(profile, echo=lambda m: None, _api=api)
+    hosted.start(profile, echo=lambda m: None, _api=api, _sleep=lambda s: None)
+    assert api.actions == [("stop", "bx1"), ("start", "bx1")]
+
+
+def test_own_cloud_boxes_do_not_take_volumes_yet():
+    with pytest.raises(up_mod.UpError, match="hosted service"):
+        up_mod.up(provider="hetzner", name="own", creds={"token": "t"}, volumes=["v1"],
+                  _check=False, echo=lambda m: None)
+
+
+def test_cli_volumes(monkeypatch, capsys):
+    from rixi import _cli
+    api = PersistApi()
+    monkeypatch.setattr(hosted, "api_from_env", lambda url=None: api)
+    assert _cli.main(["volumes", "create", "data", "--size", "50"]) == 0
+    assert "v1  data  50 GB" in capsys.readouterr().out
+    assert _cli.main(["volumes"]) == 0 and "data" in capsys.readouterr().out
+    assert _cli.main(["volumes", "rm", "v1"]) == 0 and api.vols == {}

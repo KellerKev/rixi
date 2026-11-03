@@ -65,8 +65,14 @@ tenant:
    The reconciler destroys tagged cloud resources the store does not own and stops billing boxes
    the cloud no longer has.
 
-Billing stays outside: `GET /api/usage?since=` returns each box's rate (snapshotted at claim) and
-its billable interval, and an optional authorizer URL must approve every claim. A tenant can be
+Persistence: `POST /api/volumes {name, size_gb, zone?}` creates a disk that outlives boxes;
+a claim's `volumes: [id]` attaches up to four (the box goes to their zone), mounted at
+`/workspace/data/<name>`. `POST /api/boxes/<id>/stop` and `/start` power a ready box off and
+on with its disk, name, firewall and volumes; `on_idle: "stop"` does that instead of releasing
+an idle box. A stopped box is released after `limits.max_stopped` (7 days).
+
+Billing stays outside: `GET /api/usage?since=` returns each box's rate (snapshotted at claim), its running
+and stopped minutes (and the stopped disk's rate), and each volume's GB-hours, and an optional authorizer URL must approve every claim. A tenant can be
 stopped with `POST /api/tenants/<t>/stop`.
 
 ## Resource catalog — declare compute in TOML (no OpenTofu required)

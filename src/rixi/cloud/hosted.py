@@ -67,6 +67,46 @@ class Api:
     def token(self, box_id: str, label: str = "rixi cli") -> dict:
         return self._call("POST", f"/api/boxes/{box_id}/tokens", {"label": label})
 
+    def stop(self, box_id: str) -> dict:
+        return self._call("POST", f"/api/boxes/{box_id}/stop", {})
+
+    def start(self, box_id: str) -> dict:
+        return self._call("POST", f"/api/boxes/{box_id}/start", {})
+
+    def volumes(self) -> list:
+        return self._call("GET", "/api/volumes")["volumes"]
+
+    def create_volume(self, name: str, size_gb: int, zone: Optional[str] = None) -> dict:
+        body = {"name": name, "size_gb": int(size_gb)}
+        if zone:
+            body["zone"] = zone
+        return self._call("POST", "/api/volumes", body)
+
+    def delete_volume(self, volume_id: str) -> dict:
+        return self._call("DELETE", f"/api/volumes/{volume_id}")
+
+
+def api_from_env(api_url: Optional[str] = None) -> Api:
+    from .up import resolve_credentials
+    creds = resolve_credentials("eutonomous", {})
+    return Api(creds.get("api_key"), api_url or creds.get("api_url"))
+
+
+def stop(profile: Profile, echo: Echo = print, _api: Optional[Api] = None) -> None:
+    """Power the box off: its disk, files, name and volumes stay; compute stops billing."""
+    api = _api or api_from_env(profile.api_url)
+    api.stop(profile.box_id)
+    echo(f"✔ stopping {profile.name!r} — start it again with `rixi start {profile.name}`")
+
+
+def start(profile: Profile, wait_timeout: float = 900.0, echo: Echo = print,
+          _api: Optional[Api] = None, _sleep=time.sleep) -> None:
+    api = _api or api_from_env(profile.api_url)
+    api.start(profile.box_id)
+    echo(f"▶ starting {profile.name!r}…")
+    _wait_ready(api, profile.box_id, wait_timeout, echo, _sleep)
+    echo(f"✔ ready again → {profile.server_url}")
+
 
 def _template(api: Api, size: str, instance_type: Optional[str]) -> dict:
     name = instance_type or SIZE_ALIASES.get(size, size)
@@ -83,7 +123,7 @@ def _template(api: Api, size: str, instance_type: Optional[str]) -> dict:
 def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileStore,
        instance_type: Optional[str] = None, region: Optional[str] = None,
        policy: Optional[netpolicy.NetworkPolicy] = None, ttl_hours: Optional[float] = None,
-       model_access=None,
+       model_access=None, volumes: Optional[list] = None, on_idle: Optional[str] = None,
        make_default: bool = True, wait_timeout: float = 900.0, echo: Echo = print,
        _api: Optional[Api] = None, _sleep=time.sleep) -> Profile:
     api = _api or Api(creds.get("api_key"), creds.get("api_url"))
@@ -95,6 +135,10 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
         body["ttl"] = int(ttl_hours * 3600)
     if policy is not None and not policy.is_default:
         body["policy"] = policy.to_dict()
+    if volumes:
+        body["volumes"] = list(volumes)       # mounted at /workspace/data/<name>
+    if on_idle:
+        body["on_idle"] = on_idle             # "stop": keep the disk instead of shutting down
     if model_access is not None:
         # governed: through eutonomous + malgra with a box-only token; direct: straight to your
         # own endpoint with your own key; none. Omitted: none.
@@ -140,7 +184,7 @@ def _wait_ready(api: Api, box_id: str, timeout: float, echo: Echo, sleep) -> dic
         box = api.box(box_id)
         if box["state"] == "ready":
             return box
-        if not box.get("live") or box["state"] in ("releasing", "gone", "failed"):
+        if not box.get("live") or box["state"] in ("releasing", "gone", "failed", "stopped"):
             raise HostedError(f"the box ended while starting: {box.get('end_reason') or box['state']}")
         waited = time.monotonic() - start
         if waited - last_note >= 30:

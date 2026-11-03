@@ -76,11 +76,34 @@ TOOLS: List[dict] = [
                           "description": "with allowlist: IPs/CIDRs, optional :port"},
          "model_access": {"type": "string", "enum": ["none", "governed"],
                           "description": "eutonomous: governed gives the box OPENAI_BASE_URL "
-                                         "through malgra (needs a linked key); default none"}}}},
+                                         "through malgra (needs a linked key); default none"},
+         "volumes": {"type": "array", "items": {"type": "string"},
+                     "description": "eutonomous: volume ids to attach, mounted at "
+                                    "/workspace/data/<name>"},
+         "on_idle": {"type": "string", "enum": ["release", "stop"],
+                     "description": "eutonomous: when idle, shut down (default) or stop and "
+                                    "keep the disk"}}}},
     {"name": "list_boxes", "description": "The boxes you have (all profiles), with status.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "destroy_box", "description": "Destroy a box; billing stops and its files are gone.",
      "inputSchema": {"type": "object", "properties": {"box": _BOX}, "required": ["box"]}},
+    {"name": "stop_box",
+     "description": "Hosted boxes: power off, keeping the disk and its files; compute stops "
+                    "billing until resume_box.",
+     "inputSchema": {"type": "object", "properties": {"box": _BOX}, "required": ["box"]}},
+    {"name": "resume_box", "description": "Hosted boxes: start a stopped box and wait for it.",
+     "inputSchema": {"type": "object", "properties": {"box": _BOX}, "required": ["box"]}},
+    {"name": "list_volumes", "description": "Hosted: your persistent volumes.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "create_volume",
+     "description": "Hosted: a persistent disk that outlives boxes (datasets, caches). Attach "
+                    "it with create_box volumes=[id]. Billed per GB while it exists.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string"}, "size_gb": {"type": "integer"},
+         "zone": {"type": "string"}}, "required": ["name", "size_gb"]}},
+    {"name": "delete_volume", "description": "Hosted: delete a volume and its data.",
+     "inputSchema": {"type": "object", "properties": {"volume_id": {"type": "string"}},
+                     "required": ["volume_id"]}},
     {"name": "exec",
      "description": "Run a shell command in the box's workspace and wait for it. Returns exit "
                     "code, stdout and stderr. For servers and long jobs use spawn instead.",
@@ -146,11 +169,11 @@ class Tools:
 
     def __init__(self, store=None, sandbox_for: Optional[Callable] = None,
                  up: Optional[Callable] = None, down: Optional[Callable] = None,
-                 sleep=time.sleep):
+                 sleep=time.sleep, api=None):
         from .cloud.profiles import ProfileStore
         self.store = store or ProfileStore()
         self._sandbox_for = sandbox_for
-        self._up, self._down, self._sleep = up, down, sleep
+        self._up, self._down, self._sleep, self._api = up, down, sleep, api
 
     def sandbox(self, name: str):
         if self._sandbox_for:
@@ -177,6 +200,10 @@ class Tools:
             access = _str(a, "model_access", False)
             if access:
                 kw["model_access"] = access
+            if a.get("volumes"):
+                kw["volumes"] = [str(v) for v in a["volumes"]]
+            if a.get("on_idle"):
+                kw["on_idle"] = _str(a, "on_idle")
         up = self._up or up_mod.up
         kw["creds"] = up_mod.resolve_credentials(provider, {})
         try:
@@ -210,6 +237,39 @@ class Tools:
         down(name, up_mod.resolve_credentials(provider, {}), store=self.store,
              echo=lambda m: print(m, file=sys.stderr))
         return f"box {name!r} destroyed"
+
+    def _hosted_api(self):
+        if self._api is not None:
+            return self._api
+        from .cloud import hosted
+        return hosted.api_from_env()
+
+    def stop_box(self, a: dict) -> str:
+        self.sandbox(_str(a, "box")).stop()
+        return "stopping; the disk is kept (resume_box to start it again)"
+
+    def resume_box(self, a: dict) -> str:
+        self.sandbox(_str(a, "box")).resume()
+        return "running again"
+
+    def list_volumes(self, a: dict) -> str:
+        vols = self._hosted_api().volumes()
+        if not vols:
+            return "no volumes"
+        return "\n".join(f"{v['id']}: {v['name']} {v['size_gb']} GB {v['zone']} "
+                         f"{('attached to ' + v['box_id']) if v.get('box_id') else v['state']}"
+                         for v in vols)
+
+    def create_volume(self, a: dict) -> str:
+        size = a.get("size_gb")
+        if isinstance(size, bool) or not isinstance(size, int):
+            raise ToolError("size_gb must be a whole number of GB")
+        v = self._hosted_api().create_volume(_str(a, "name"), size, _str(a, "zone", False))
+        return f"volume {v['id']} ({v['name']}, {v['size_gb']} GB, {v['zone']}) is {v['state']}"
+
+    def delete_volume(self, a: dict) -> str:
+        self._hosted_api().delete_volume(_str(a, "volume_id"))
+        return "deleting"
 
     # ── commands and tasks ────────────────────────────────────────────────
     def exec(self, a: dict) -> str:

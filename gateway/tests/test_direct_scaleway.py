@@ -306,3 +306,88 @@ def test_wait_published_is_not_fatal_when_dns_cannot_be_queried():
     fake = FakeDns({"10.0.0.0": None, "10.0.0.1": None})
     assert _with_fake_dns(fake, lambda: dns.wait_published("b-x.run.example.com", "51.0.0.7",
                                                            timeout=0.1)) is False
+
+
+B = "/block/v1alpha1/zones/fr-par-2"
+
+
+def test_a_volume_is_created_tagged_and_waited_for():
+    polls = {"n": 0}
+
+    def get_vol(path, kw):
+        polls["n"] += 1
+        return Resp(200, {"id": "sbs-1", "status": "available" if polls["n"] > 1 else "creating"})
+    p, s = _provider({
+        ("POST", f"{B}/volumes"): Resp(200, {"id": "sbs-1", "status": "creating"}),
+        ("GET", f"{B}/volumes/sbs-1"): get_vol,
+    })
+    assert p.create_volume("v1", "t-1", "data", "fr-par-2", 50) == "sbs-1"
+    body = next(kw["json"] for m, path, kw in s.calls if m == "POST")
+    assert body["from_empty"] == {"size": 50 * 10**9} and body["perf_iops"] == 5000
+    assert "rixi-volume=v1" in body["tags"] and "rixi-tenant=t-1" in body["tags"]
+
+
+def test_volumes_are_attached_after_the_root_disk():
+    routes = {
+        ("GET", "/marketplace/v2/local-images"): Resp(200, {"local_images": [
+            {"id": "img-1", "compatible_commercial_types": ["DEV1-S"]}]}),
+        ("GET", f"{Z}/security_groups"): Resp(200, {"security_groups": [
+            {"id": "sg-1", "name": "rixi-direct"}]}),
+        ("POST", f"{Z}/ips"): Resp(201, {"ip": {"id": "ip-1", "address": "51.0.0.7"}}),
+        ("POST", f"{Z}/servers/"): Resp(202, {}),
+        ("POST", f"{Z}/servers"): Resp(201, {"server": {"id": "srv-1"}}),
+        ("PATCH", f"{Z}/servers/srv-1/user_data/cloud-init"): Resp(204),
+    }
+    p, s = _provider(routes)
+    p.create(BoxSpec("abc", "t-1", "DEV1-S", "fr-par-2", "ubuntu_noble", "#cc\n{}",
+                     root_volume_gb=20, volumes=["sbs-a", "sbs-b"]), on_ip=lambda ip: None)
+    vols = next(kw["json"]["volumes"] for m, path, kw in s.calls
+                if m == "POST" and path == f"{Z}/servers")
+    assert vols["0"]["size"] == 20 * 10**9
+    assert vols["1"] == {"id": "sbs-a", "volume_type": "sbs_volume"}
+    assert vols["2"] == {"id": "sbs-b", "volume_type": "sbs_volume"}
+
+
+def test_destroy_detaches_a_persistent_volume_before_deleting_the_server():
+    state = {"srv": "running", "gets": 0}
+
+    def server_get(path, kw):
+        state["gets"] += 1
+        if state["srv"] == "gone":
+            return Resp(404)
+        return Resp(200, {"server": {"id": "srv-1", "state": state["srv"], "volumes": {}}})
+
+    def action(path, kw):
+        if kw["json"]["action"] == "poweroff":
+            state["srv"] = "stopped"
+        return Resp(202, {})
+
+    def delete_server(path, kw):
+        state["srv"] = "gone"
+        return Resp(204)
+    routes = {
+        ("GET", f"{Z}/servers/srv-1"): server_get,
+        ("GET", f"{Z}/servers"): Resp(200, {"servers": [{
+            "id": "srv-1", "state": "running", "volumes": {
+                "0": {"id": "root-1", "volume_type": "sbs_volume"},
+                "1": {"id": "keep-1", "volume_type": "sbs_volume"}}}]}),
+        ("GET", f"{B}/volumes/root-1"): Resp(200, {"id": "root-1", "tags": ["rixi-box=abc"]}),
+        ("GET", f"{B}/volumes/keep-1"): Resp(200, {"id": "keep-1", "tags": ["rixi-volume=v1"]}),
+        ("POST", f"{Z}/servers/srv-1/action"): action,
+        ("POST", f"{Z}/servers/srv-1/detach-volume"): Resp(200, {}),
+        ("DELETE", f"{Z}/servers/srv-1"): delete_server,
+        ("DELETE", f"{B}/volumes/root-1"): Resp(204),
+        ("GET", f"{Z}/ips"): Resp(200, {"ips": []}),
+        ("GET", f"{Z}/security_groups"): Resp(200, {"security_groups": []}),
+    }
+    p, s = _provider(routes)
+    p.destroy("abc", "fr-par-2")
+    calls = [(m, path) for m, path, _ in s.calls]
+    detach = next(kw["json"] for m, path, kw in s.calls if path.endswith("detach-volume"))
+    assert detach == {"volume_id": "keep-1"}
+    assert calls.index(("POST", f"{Z}/servers/srv-1/detach-volume")) < \
+        calls.index(("DELETE", f"{Z}/servers/srv-1"))
+    assert ("DELETE", f"{B}/volumes/root-1") in calls
+    assert ("DELETE", f"{B}/volumes/keep-1") not in calls          # the data survives
+    actions = [kw["json"]["action"] for m, path, kw in s.calls if path.endswith("/action")]
+    assert actions == ["poweroff"]                                 # stopped, then deleted

@@ -178,6 +178,11 @@ def main(argv=None) -> int:
     up.add_argument("--model-url", help="direct: OpenAI-compatible base URL (https://…/v1)")
     up.add_argument("--model-anthropic-url", help="direct: Anthropic-compatible base URL")
     up.add_argument("--model-key", help="direct: the endpoint's API key (or RIXI_MODEL_KEY)")
+    up.add_argument("--volume", action="append", default=[], metavar="ID",
+                    help="eutonomous: attach a volume (rixi volumes), mounted at "
+                         "/workspace/data/<name>; repeatable")
+    up.add_argument("--on-idle", choices=["release", "stop"],
+                    help="eutonomous: when idle, shut down (default) or stop and keep the disk")
     up.add_argument("--ttl", type=float,
                     help="eutonomous: hours until the box shuts itself down (service default)")
     up.add_argument("--name", help="profile/box name (default: <provider>-<size>)")
@@ -205,6 +210,19 @@ def main(argv=None) -> int:
     up.add_argument("--timeout", type=float, default=15, help="minutes to wait for the box (15)")
     _cred_flags(up)
 
+    for name, help_ in (("stop", "stop a hosted box: disk and files kept, compute not billed"),
+                        ("start", "start a stopped hosted box again")):
+        sp = sub.add_parser(name, help=help_)
+        sp.add_argument("name", nargs="?", help="profile (default: the default)")
+    vo = sub.add_parser("volumes", help="persistent volumes on the hosted service",
+                        description="rixi volumes [ls] · rixi volumes create NAME --size GB "
+                                    "[--zone Z] · rixi volumes rm ID")
+    vo.add_argument("action", nargs="?", default="ls", choices=["ls", "create", "rm"])
+    vo.add_argument("target", nargs="?", help="create: the name; rm: the volume id")
+    vo.add_argument("--size", type=int, default=20, help="GB (default 20)")
+    vo.add_argument("--zone", help="region (default: the service's first)")
+    _cred_flags(vo)
+
     down = sub.add_parser("down", help="destroy a box created with `rixi up` and forget its profile")
     down.add_argument("name", nargs="?", help="profile name (default: the default profile)")
     _cred_flags(down)
@@ -219,7 +237,7 @@ def main(argv=None) -> int:
     args.aes_key = getattr(args, "sub_aes_key", None) or args.aes_key
     args.profile = getattr(args, "sub_profile", None) or args.profile
     args.no_verify_ssl = args.no_verify_ssl or getattr(args, "sub_no_verify_ssl", False)
-    if args.cmd in ("up", "down", "profiles", "use"):
+    if args.cmd in ("up", "down", "profiles", "use", "stop", "start", "volumes"):
         return _cloud(args)
     if args.cmd == "mcp":
         from .mcp_server import main as mcp_main
@@ -277,7 +295,8 @@ def _cloud(args) -> int:
                 provider=args.provider, size=args.size, name=args.name, creds=creds,
                 instance_type=args.instance_type, region=args.region,
                 allow_from=args.allow_from, policy=policy, ttl_hours=args.ttl,
-                model_access=model_access,
+                model_access=model_access, volumes=args.volume or None,
+                on_idle=args.on_idle,
                 ssh_key=None if args.ssh_key == "none" else args.ssh_key,
                 rixi_ref=args.rixi_ref, save_creds=args.save_credentials,
                 make_default=not args.no_default, wait_timeout=args.timeout * 60,
@@ -285,6 +304,45 @@ def _cloud(args) -> int:
             flag = "" if store.default_name() == profile.name else f" --profile {profile.name}"
             print(f"\n  try it:   rixi run{flag} --task hello examples/hello")
             print(f"  destroy:  rixi down {profile.name}")
+            return 0
+        if args.cmd in ("stop", "start"):
+            from .cloud import hosted
+            name = args.name or store.default_name()
+            profile = store.get(name) if name else None
+            if profile is None or profile.provider != "eutonomous":
+                print("rixi: stop/start work on hosted boxes (rixi up --provider eutonomous)",
+                      file=sys.stderr)
+                return 1
+            try:
+                (hosted.stop if args.cmd == "stop" else hosted.start)(profile)
+            except hosted.HostedError as exc:
+                print(f"rixi: {exc}", file=sys.stderr)
+                return 1
+            return 0
+        if args.cmd == "volumes":
+            from .cloud import hosted
+            vals = _cred_values(args)
+            os.environ.update({k: v for k, v in (("RIXI_API_KEY", vals.get("api_key")),
+                                                  ("RIXI_API_URL", vals.get("api_url"))) if v})
+            try:
+                api = hosted.api_from_env()
+                if args.action == "create":
+                    if not args.target:
+                        print("rixi: volumes create needs a NAME", file=sys.stderr)
+                        return 1
+                    v = api.create_volume(args.target, args.size, args.zone)
+                    print(f"{v['id']}  {v['name']}  {v['size_gb']} GB  {v['zone']}  {v['state']}")
+                elif args.action == "rm":
+                    api.delete_volume(args.target or "")
+                    print(f"deleting {args.target}")
+                else:
+                    for v in api.volumes():
+                        where = f"attached to {v['box_id']}" if v.get("box_id") else v["state"]
+                        print(f"{v['id']}  {v['name']:<16} {v['size_gb']:>5} GB  {v['zone']:<9} "
+                              f"{where}")
+            except hosted.HostedError as exc:
+                print(f"rixi: {exc}", file=sys.stderr)
+                return 1
             return 0
         if args.cmd == "down":
             name = args.name or store.default_name()
