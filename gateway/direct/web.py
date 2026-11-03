@@ -144,10 +144,13 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         policy = body.get("policy")
         if policy is not None and not isinstance(policy, dict):
             raise json_error(400, "policy must be an object: {egress, ingress}")
+        llm = body.get("llm")
+        if llm is not None and not isinstance(llm, dict):
+            raise json_error(400, "llm must be an object: {base_url, token}")
         box = await _call(svc.claim, ctx.caller, _str(body, "template", required=True),
                           zone=_str(body, "zone"), ttl=_num(body, "ttl"),
                           idle_timeout=_num(body, "idle_timeout", default=-1, allow_null=True),
-                          ssh_key=_str(body, "ssh_key"), serve=serve, policy=policy)
+                          ssh_key=_str(body, "ssh_key"), serve=serve, policy=policy, llm=llm)
         out = box.public(svc.clock())
         key = getattr(box, "endpoint_key", None)
         if key:

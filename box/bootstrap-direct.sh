@@ -119,6 +119,21 @@ for _ in $(seq 1 60); do
 done
 
 # 6. services ----------------------------------------------------------------
+# Governed model calls: every command, task and login on the box sees an OpenAI- and
+# Anthropic-compatible endpoint and a token that only works for this box. The real key stays
+# with the gateway that swaps it in.
+: > /etc/rixi/workload.env
+if [ -n "${RIXI_LLM_TOKEN:-}" ]; then
+  {
+    echo "OPENAI_BASE_URL=$RIXI_LLM_BASE_URL/v1"
+    echo "OPENAI_API_KEY=$RIXI_LLM_TOKEN"
+    echo "ANTHROPIC_BASE_URL=$RIXI_LLM_BASE_URL"
+    echo "ANTHROPIC_API_KEY=$RIXI_LLM_TOKEN"
+  } > /etc/rixi/workload.env
+  echo 'set -a; . /etc/rixi/workload.env; set +a' > /etc/profile.d/rixi-llm.sh
+fi
+chmod 600 /etc/rixi/workload.env
+
 cat > /etc/systemd/system/rixi-server.service <<UNIT
 [Unit]
 Description=RIXI server (loopback; reached through Caddy)
@@ -129,6 +144,7 @@ Type=simple
 WorkingDirectory=$RIXI_DIR/server
 Environment=PATH=$HOME/.pixi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=$HOME
+EnvironmentFile=-/etc/rixi/workload.env
 ExecStart=$PY rixi_server.py --host 127.0.0.1 --port 9000 --jwks-url $RIXI_JWKS_URL --audience box-$RIXI_BOX_ID --required-claim tenant=$RIXI_TENANT --revoked-jti-file /etc/rixi/revoked_jti
 Restart=always
 RestartSec=3

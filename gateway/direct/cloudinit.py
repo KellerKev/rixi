@@ -29,8 +29,19 @@ def valid_model(name: str) -> bool:
     return bool(_MODEL.match(name))
 
 
+_LLM_URL = re.compile(r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)*$")
+_LLM_TOKEN = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
+
+
+def valid_llm(llm: dict) -> bool:
+    """A model-gateway address the box's workloads call, and the box-only token they use."""
+    return bool(_LLM_URL.fullmatch(str(llm.get("base_url") or ""))
+                and _LLM_TOKEN.fullmatch(str(llm.get("token") or "")))
+
+
 def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_secret: str,
-           ssh_key: Optional[str] = None, serve: Optional[dict] = None) -> str:
+           ssh_key: Optional[str] = None, serve: Optional[dict] = None,
+           llm: Optional[dict] = None) -> str:
     env = {
         "RIXI_BOX_ID": box_id,
         "RIXI_TENANT": tenant,
@@ -52,6 +63,13 @@ def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_se
         env["RIXI_ENDPOINT_KEY"] = serve["key"]
         if cfg.ollama_version:
             env["RIXI_OLLAMA_VERSION"] = cfg.ollama_version
+    if llm:
+        # Model calls leave through a gateway that holds the real key; the box gets a token
+        # that is worthless anywhere else and once the box is gone.
+        if not valid_llm(llm):
+            raise ValueError("not a usable llm gateway")
+        env["RIXI_LLM_BASE_URL"] = llm["base_url"]
+        env["RIXI_LLM_TOKEN"] = llm["token"]
     for k, v in env.items():
         if not _SAFE.match(v):
             raise ValueError(f"{k} contains characters not allowed in box env")

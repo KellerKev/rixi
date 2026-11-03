@@ -703,3 +703,28 @@ def test_an_upgrade_adds_columns_the_live_table_is_missing():
     assert {"serve_kind", "serve_model", "model_ready", "requests_total"} <= live
     assert store2.get("old1").serve_kind is None      # existing rows still readable
     assert store2.list()[0].id == "old1"
+
+
+# ── governed model calls ────────────────────────────────────────────────
+
+def test_a_box_gets_a_model_gateway_and_token_but_the_store_keeps_neither():
+    svc = _svc()
+    tok = "rxl_" + "a" * 40
+    box = svc.claim(A, "cpu", llm={"base_url": "https://rixi.example.test/llm", "token": tok})
+    _settle(svc)
+    ud = next(iter(svc.providers["dummy"].servers.values()))["user_data"]
+    assert "RIXI_LLM_BASE_URL=https://rixi.example.test/llm" in ud
+    assert f"RIXI_LLM_TOKEN={tok}" in ud
+    assert tok not in json.dumps(svc.store.get(box.id).public())
+
+
+@pytest.mark.parametrize("llm", [
+    {"base_url": "http://plain.example/llm", "token": "x" * 30},       # TLS only
+    {"base_url": "https://x.example/llm", "token": "short"},
+    {"base_url": "https://x.example/llm\nRIXI_JWKS_URL=http://evil", "token": "x" * 30},
+    {"base_url": "https://x.example/llm", "token": "x" * 30 + "\n"},
+    {"token": "x" * 30},
+])
+def test_llm_settings_are_validated(llm):
+    with pytest.raises(Denied, match="llm"):
+        _svc().claim(A, "cpu", llm=llm)

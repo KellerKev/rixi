@@ -133,7 +133,7 @@ class DirectService:
     def claim(self, caller: Caller, template: str, zone: Optional[str] = None,
               ttl: Optional[float] = None, idle_timeout: Optional[float] = -1,
               ssh_key: Optional[str] = None, serve: Optional[dict] = None,
-              policy: Optional[dict] = None) -> Box:
+              policy: Optional[dict] = None, llm: Optional[dict] = None) -> Box:
         tenant = caller.tenant
         if not tenant or not _TENANT.match(tenant):
             raise Denied("token carries no usable tenant claim", 403)
@@ -161,6 +161,8 @@ class DirectService:
                 raise Denied("serve.model is required and must be a model name", 400)
             serve = {"kind": kind, "model": str(serve["model"]),
                      "key": str(serve.get("key") or "") or secrets.token_urlsafe(32)}
+        if llm is not None and not cloudinit.valid_llm(llm):
+            raise Denied("llm must be {base_url: https://…, token: 20-128 url-safe chars}", 400)
         rate = self.rate(t)
 
         live = self.store.list(tenant=tenant, live_only=True)
@@ -200,7 +202,7 @@ class DirectService:
                   policy=None if net.is_default else json.dumps(net.to_dict()))
         user_data = cloudinit.render(self.cfg, box_id=box_id, tenant=tenant,
                                      hostname=box.hostname, box_secret=secret, ssh_key=ssh_key,
-                                     serve=serve)
+                                     serve=serve, llm=llm)
         self.store.insert(box)
         self.audit("box.claimed", box=box_id, tenant=tenant, sub=caller.sub, template=t.name,
                    zone=zone, eur_per_hour=rate)
