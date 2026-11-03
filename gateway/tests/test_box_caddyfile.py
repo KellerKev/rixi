@@ -14,6 +14,7 @@ import pytest
 
 BOOTSTRAP = Path(__file__).resolve().parent.parent.parent / "box" / "bootstrap-direct.sh"
 KEY = "test-key-AbC123_-xyz"
+GATE = "0a1b2c3d4e5f"
 
 
 def render(tmp_path, serve=True) -> str:
@@ -23,7 +24,7 @@ def render(tmp_path, serve=True) -> str:
     end = src.index("mkdir -p /var/log/rixi")
     body = src[start:end].replace("/etc/rixi/Caddyfile", str(tmp_path / "Caddyfile"))
     env = {"RIXI_HOSTNAME": "b-abc.run.example.com", "RIXI_ACME_EMAIL": "ops@example.com",
-           "PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+           "RIXI_PREVIEW_GATE": GATE, "PATH": os.environ["PATH"], "HOME": str(tmp_path)}
     if serve:
         env.update(RIXI_SERVE_KIND="ollama", RIXI_ENDPOINT_KEY=KEY)
     body = body.replace("mkdir -p /var/lib/caddy", "mkdir -p %s/caddy" % tmp_path)
@@ -58,3 +59,24 @@ def test_caddy_accepts_the_generated_config(tmp_path):
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert "11434" in out.stdout
+
+
+def test_previews_get_certificates_on_demand_and_every_request_is_checked(tmp_path):
+    conf = render(tmp_path, serve=False)
+    assert f"ask http://127.0.0.1:9000/preview/ask?gate={GATE}" in conf
+    site = conf.split("*.b-abc.run.example.com {")[1].split("\nb-abc.run.example.com {")[0]
+    assert "on_demand" in site
+    assert "forward_auth 127.0.0.1:9000" in site and f"X-Rixi-Preview-Gate {GATE}" in site
+    # b-abc.run.example.com has 4 labels, so <port>.b-abc… has the port at label 4
+    assert "reverse_proxy 127.0.0.1:{http.request.host.labels.4}" in site
+    main = conf.split("\nb-abc.run.example.com {")[1]
+    assert main.index("handle @previewgate") < main.index("reverse_proxy 127.0.0.1:9000")
+
+
+@pytest.mark.skipif(not shutil.which("caddy"), reason="needs the caddy binary")
+def test_caddy_accepts_the_preview_config(tmp_path):
+    render(tmp_path, serve=False)
+    out = subprocess.run(["caddy", "adapt", "--config", str(tmp_path / "Caddyfile")],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert '"on_demand":true' in out.stdout.replace(" ", "") or "on_demand" in out.stdout

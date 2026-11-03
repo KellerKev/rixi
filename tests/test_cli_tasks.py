@@ -85,3 +85,30 @@ def test_logs_input_restart_kill_redeploy(fake, capsys):
                           ("input", "t-run", {"command": "generate"}, False),
                           ("restart", "t-run"), ("kill", "t-run"),
                           ("redeploy", "t-run", "proj")]
+
+
+class PreviewClient(FakeClient):
+    def open_preview(self, port, public=False):
+        self.calls.append(("open", port, public))
+        url = f"https://{port}.b-x.run.test/"
+        return {"port": port, "public": public, "url": url,
+                "share_url": url if public else url + "?rixi_preview=tok"}
+
+    def previews(self):
+        return [self.open_preview(8000)]
+
+    def close_preview(self, port):
+        self.calls.append(("close", port))
+
+
+def test_preview_open_list_close(monkeypatch, capsys):
+    c = PreviewClient()
+    monkeypatch.setattr(_cli, "_client", lambda args: c)
+    assert _cli.main(["preview", "8000"]) == 0
+    assert capsys.readouterr().out.strip() == "https://8000.b-x.run.test/?rixi_preview=tok"
+    _cli.main(["preview", "3000", "--public"])
+    assert capsys.readouterr().out.strip() == "https://3000.b-x.run.test/"
+    _cli.main(["preview", "--list"])
+    assert "8000  private" in capsys.readouterr().out
+    _cli.main(["preview", "8000", "--close"])
+    assert ("close", 8000) in c.calls

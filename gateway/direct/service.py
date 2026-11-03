@@ -220,6 +220,9 @@ class DirectService:
             def on_ip(ip: str) -> None:
                 self.store.update(box.id, ip=ip)
                 self.dns.set_a(box.hostname, ip)
+                # <port>.<hostname>: preview URLs for ports the box chooses to open. Each gets
+                # its own certificate on the box, issued only for ports opened as previews.
+                self.dns.set_a("*." + box.hostname, ip)
                 # Boot only once every authoritative nameserver serves the new record: the box
                 # asks for its certificate seconds after boot, and a zone wildcard would
                 # otherwise answer for it and have the challenge served by the wrong host.
@@ -281,6 +284,7 @@ class DirectService:
             self.providers[box.provider].destroy(box.id, box.zone)
             try:
                 self.dns.delete_a(box.hostname)
+                self.dns.delete_a("*." + box.hostname)
             except Exception as exc:          # a stale record is harmless; the box is gone
                 log.warning("dns cleanup for %s failed: %s", box.id, exc)
             final = "failed" if box.end_reason == "provision_failed" else "gone"

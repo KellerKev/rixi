@@ -49,6 +49,10 @@ class Box:
     def list_files(self, path="."):
         return [{"name": n, "type": "file", "size": len(c)} for n, c in self.files.items()]
 
+    def preview(self, port, public=False):
+        url = f"https://{port}.b-x.run.test/"
+        return {"port": port, "public": public, "share_url": url + ("" if public else "?t=1")}
+
 
 def _store_with(name="b1"):
     store = ProfileStore()
@@ -155,3 +159,10 @@ def test_stdio_carries_only_protocol_lines():
     replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert [r.get("id") for r in replies] == [1, None, 2]
     assert replies[1]["error"]["code"] == -32700
+
+
+def test_previews_over_tools():
+    s, _ = _server()
+    assert call(s, "open_preview", box="b1", port=5173)[0] == \
+        "private preview: https://5173.b-x.run.test/?t=1"
+    assert call(s, "open_preview", box="b1", port="80")[1] is True

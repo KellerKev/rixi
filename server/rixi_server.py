@@ -2870,6 +2870,116 @@ def generate_aes_key():
     print("# AES-256 Key (base64):")
     print(base64.b64encode(key).decode())
 
+# ─────────────────────────── Preview URLs ─────────────────────────────────
+# A port on the box, opened on purpose, gets its own HTTPS name: https://<port>.<box name>.
+# Caddy fronts it: it asks /preview/ask before getting a certificate for a name (so only opened
+# ports ever get one) and /preview/auth before every request (a private preview needs its token,
+# once as ?rixi_preview=… in a share link, then from a cookie scoped to that one host). Both
+# endpoints answer only to Caddy, which holds the box's preview gate secret.
+
+PREVIEW_DOMAIN = os.environ.get("RIXI_PREVIEW_DOMAIN", "")   # the box's name; set on hosted boxes
+PREVIEW_GATE = os.environ.get("RIXI_PREVIEW_GATE", "")
+PREVIEW_COOKIE = "rixi_preview"
+SERVER_PORT = 9000
+_PREVIEW_RESERVED = {22, 80, 443, 2019, 11434}
+previews: Dict[int, dict] = {}
+
+
+def _preview_url(port: int) -> str:
+    return f"https://{port}.{PREVIEW_DOMAIN}/"
+
+
+def _preview_view(port: int, pv: dict) -> dict:
+    url = _preview_url(port)
+    return {"port": port, "public": pv["public"], "url": url,
+            "share_url": url if pv["public"] else f"{url}?{PREVIEW_COOKIE}={pv['token']}",
+            "created_at": pv["created_at"]}
+
+
+@app.post("/previews")
+async def open_preview(request: Request, auth: bool = Depends(verify_authentication)):
+    """Open a port as https://<port>.<box>/ — private (share link) unless public=true."""
+    if not PREVIEW_DOMAIN:
+        raise HTTPException(status_code=404, detail="previews need a box with its own name "
+                                                    "(hosted or direct-mode boxes)")
+    data = await _json_body(request)
+    port = data.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="port must be a number 1-65535")
+    if port in _PREVIEW_RESERVED or port == SERVER_PORT:
+        raise HTTPException(status_code=400, detail=f"port {port} cannot be previewed")
+    public = bool(data.get("public"))
+    pv = previews.get(port)
+    if pv is None:
+        pv = previews[port] = {"token": base64.urlsafe_b64encode(os.urandom(24)).decode()
+                               .rstrip("="), "created_at": time.time()}
+    pv["public"] = public
+    return _sealed_response(json.dumps(_preview_view(port, pv)).encode(), "application/json")
+
+
+@app.get("/previews")
+async def list_previews(auth: bool = Depends(verify_authentication)):
+    return _sealed_response(json.dumps(
+        [_preview_view(p, v) for p, v in sorted(previews.items())]).encode(), "application/json")
+
+
+@app.delete("/previews/{port}")
+async def close_preview(port: int, auth: bool = Depends(verify_authentication)):
+    if previews.pop(port, None) is None:
+        raise HTTPException(status_code=404, detail="no preview on that port")
+    return JSONResponse({"closed": port})
+
+
+def _gate_ok(sent: str) -> bool:
+    return bool(PREVIEW_GATE) and hmac.compare_digest(sent or "", PREVIEW_GATE)
+
+
+def _preview_port(host: str) -> Optional[int]:
+    host = (host or "").split(":")[0].lower()
+    suffix = "." + PREVIEW_DOMAIN.lower()
+    if not PREVIEW_DOMAIN or not host.endswith(suffix):
+        return None
+    label = host[: -len(suffix)]
+    return int(label) if label.isdigit() and int(label) in previews else None
+
+
+@app.get("/preview/ask")
+async def preview_ask(domain: str = "", gate: str = ""):
+    """Caddy, before getting a certificate for a name: only names of opened previews."""
+    if not _gate_ok(gate) or _preview_port(domain) is None:
+        return Response(status_code=404)
+    return Response(status_code=200)
+
+
+@app.get("/preview/auth")
+async def preview_auth(request: Request):
+    """Caddy, before every preview request (forward_auth)."""
+    h = request.headers
+    if not _gate_ok(h.get("x-rixi-preview-gate", "")):
+        return Response(status_code=404)
+    port = _preview_port(h.get("x-rixi-host", ""))
+    if port is None:
+        return Response("No preview is open on this port.", status_code=404)
+    pv = previews[port]
+    uri = h.get("x-forwarded-uri", "/")
+    if pv["public"] or hmac.compare_digest(request.cookies.get(PREVIEW_COOKIE, ""), pv["token"]):
+        _note_activity()          # someone is using the box through its preview
+        return Response(status_code=200)
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    parts = urlsplit(uri)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    sent = [v for k, v in query if k == PREVIEW_COOKIE]
+    if sent and hmac.compare_digest(sent[0], pv["token"]):
+        # A share link: remember it in a cookie for this host, and drop it from the address.
+        clean = urlunsplit(("", "", parts.path or "/",
+                            urlencode([(k, v) for k, v in query if k != PREVIEW_COOKIE]), ""))
+        return Response(status_code=302, headers={
+            "Location": clean,
+            "Set-Cookie": f"{PREVIEW_COOKIE}={pv['token']}; Path=/; Max-Age=86400; "
+                          f"HttpOnly; Secure; SameSite=Lax"})
+    return Response("This preview is private: open it with its share link.", status_code=401)
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Start LZ4 Pixi Runner with HTTP Proxy, MCP Support + Offline Deployment + JSON Logging")
     p.add_argument("--public-key")
@@ -2903,6 +3013,9 @@ if __name__ == "__main__":
                     help="Require AES-sealed request bodies (uploads, task input, proxied "
                          "bodies). Until the key handshake completes, only /health and "
                          "/handshake answer. Needs --key-secret or --aes-key")
+    p.add_argument("--preview-domain", default=os.environ.get("RIXI_PREVIEW_DOMAIN", ""),
+                   help="The box's own name: opened ports are served as https://<port>.<name>/ "
+                        "(needs Caddy in front, as on hosted boxes)")
     p.add_argument("--workspace", default=os.environ.get("RIXI_WORKSPACE", "/workspace"),
                     help="Root for the exec and files API (default: /workspace or RIXI_WORKSPACE)")
     p.add_argument("--max-upload-mb", type=int, default=2048,
@@ -2934,6 +3047,8 @@ if __name__ == "__main__":
 
     max_upload_bytes = args.max_upload_mb * 1024 * 1024
     WORKSPACE_ROOT = args.workspace
+    PREVIEW_DOMAIN = args.preview_domain
+    SERVER_PORT = args.port
 
     if bool(args.tls_cert) != bool(args.tls_key):
         raise SystemExit("ERROR: --tls-cert and --tls-key must be provided together.")

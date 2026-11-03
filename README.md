@@ -26,7 +26,7 @@ environment you tested, with nothing to reproduce and no inbound ports to open.
 
 ```bash
 # Not on PyPI yet — install the pinned release straight from git:
-pip install "git+https://github.com/KellerKev/rixi@v0.7.0"
+pip install "git+https://github.com/KellerKev/rixi@v0.8.0"
 ```
 
 ```python
@@ -118,6 +118,12 @@ The same from Python: `Client.start()`, `spawn()`, `tasks()`, `attach()`, `send_
 `restart()`, `redeploy()`, `kill()`, `output()` — and on a sandbox, `sb.spawn()` /
 `sb.follow(id)`. Requires rixi 0.7.0+.
 
+**Preview URLs.** `rixi preview 8000` serves port 8000 of a hosted box at
+`https://8000.b-<id>.run.eutonomous.eu/` with its own certificate, issued on the box. It is
+private by default: the printed link carries a token, and opening it once sets a cookie for that
+host. `--public` lets anyone with the URL in, and `--close` ends it. Ports that were not opened,
+the box's own API among them, never answer. From Python: `sb.preview(8000)`. Requires rixi 0.8.0+.
+
 **Boxes as tools for your agent (MCP).** `rixi mcp` serves boxes over the Model Context
 Protocol: an agent can create a box, run commands and background processes on it, move files,
 ship a Pixi project, and destroy the box. It runs on your machine and talks to the boxes directly,
@@ -192,7 +198,7 @@ DAG orchestrator; pair it with your scheduler of choice.
 
 ## See it work
 
-Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.7.0"` — not on PyPI yet).
+Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.8.0"` — not on PyPI yet).
 Advanced lifecycle features — offline bundling, attach-history, the interactive redeploy menu —
 use the **full client** in [`clients/`](clients/), shown here as `rixi-client`:
 
@@ -422,7 +428,7 @@ to it:
 cd server && pixi install && pixi run python rixi_server.py --port 9000
 
 # terminal 2 — ship examples/hello to it
-pip install "git+https://github.com/KellerKev/rixi@v0.7.0"   # not on PyPI yet
+pip install "git+https://github.com/KellerKev/rixi@v0.8.0"   # not on PyPI yet
 rixi run --server http://127.0.0.1:9000 --task hello examples/hello
 ```
 

@@ -261,6 +261,32 @@ class Client:
         if r.status_code != 200:
             raise RixiError(f"kill failed: {r.status_code} {_detail(r)}")
 
+    # ── preview URLs ───────────────────────────────────────────────────────
+    def open_preview(self, port: int, *, public: bool = False) -> dict:
+        """Serve a port of the box as ``https://<port>.<box name>/``.
+
+        Private by default: ``share_url`` carries a token, opening it once sets a cookie for
+        that host; ``public=True`` lets anyone with the URL in. Hosted (named) boxes only."""
+        data, headers = self._seal_json({"port": int(port), "public": bool(public)})
+        r = requests.post(f"{self.server_url}/previews", data=data, headers=headers,
+                          verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"preview failed: {r.status_code} {_detail(r)}")
+        return json.loads(self._unseal(r))
+
+    def previews(self) -> List[dict]:
+        r = requests.get(f"{self.server_url}/previews", headers=self._headers(),
+                         verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"list previews failed: {r.status_code} {_detail(r)}")
+        return json.loads(self._unseal(r))
+
+    def close_preview(self, port: int) -> None:
+        r = requests.delete(f"{self.server_url}/previews/{int(port)}", headers=self._headers(),
+                            verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"close preview failed: {r.status_code} {_detail(r)}")
+
     def _get_json(self, path: str, what: str):
         r = requests.get(f"{self.server_url}{path}", headers=self._headers(),
                          verify=self.verify_ssl, timeout=self.timeout)

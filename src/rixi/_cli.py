@@ -113,6 +113,15 @@ def main(argv=None) -> int:
                                "Boxes default to the hosted eutonomous provider (RIXI_API_KEY); "
                                "set RIXI_MCP_PROVIDER for your own cloud account.")
 
+    pv = sub.add_parser("preview", help="serve a port of the box at https://<port>.<box>/",
+                        description="Private by default: share the printed link (it sets a "
+                                    "cookie for that host). Hosted boxes only.")
+    pv.add_argument("port", nargs="?", type=int)
+    pv.add_argument("--public", action="store_true", help="anyone with the URL may open it")
+    pv.add_argument("--list", action="store_true", help="list open previews")
+    pv.add_argument("--close", action="store_true", help="close the preview on PORT")
+    connection_flags(pv)
+
     # long-running work: follow, feed, restart and stop tasks by id
     connection_flags(sub.add_parser("tasks", help="list the tasks on the box"))
     at = sub.add_parser("attach", help="follow a task's output until it ends (Ctrl-C detaches)")
@@ -364,6 +373,21 @@ def _dispatch(args) -> int:
             for e in client.list_files(args.path):
                 mark = "/" if e["type"] == "dir" else ""
                 print(f"{e['size']:>12}  {e['name']}{mark}")
+            return 0
+        if args.cmd == "preview":
+            if args.list or args.port is None:
+                for v in client.previews():
+                    print(f"{v['port']:>5}  {'public ' if v['public'] else 'private'}  "
+                          f"{v['share_url']}")
+                return 0
+            if args.close:
+                client.close_preview(args.port)
+                print(f"closed {args.port}")
+                return 0
+            v = client.open_preview(args.port, public=args.public)
+            print(v["share_url"])
+            if not v["public"]:
+                sys.stderr.write("private: whoever opens this link can use the preview\n")
             return 0
         if args.cmd == "tasks":
             rows = client.tasks()

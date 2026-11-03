@@ -81,6 +81,12 @@ out — are refused. With an AES key, bodies and responses are sealed (`X-Rixi-E
 output does not keep a box busy), and every authenticated request bumps `activity`, so a box an
 agent is driving with short commands is not mistaken for idle.
 
+Preview URLs (on a box with its own name and Caddy in front, as hosted boxes have;
+`--preview-domain`): `POST /previews {port, public?}` serves the port at
+`https://<port>.<name>/` and returns a share link; `GET /previews`, `DELETE /previews/{port}`.
+Caddy gets certificates on demand only for opened ports (`/preview/ask`) and checks every
+request (`/preview/auth`); both answer only to Caddy, which holds the box's gate secret.
+
 From the SDK: `Client.exec()`, `exec_stream()`, `write_file()`, `read_file()`, `list_files()`,
 `delete_file()`. From the CLI: `rixi exec`, `rixi put`, `rixi get`, `rixi ls`.
 

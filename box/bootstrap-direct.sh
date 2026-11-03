@@ -62,13 +62,48 @@ if [ "${RIXI_SERVE_KIND:-}" = "ollama" ]; then
 fi
 
 # 4. TLS on the box ------------------------------------------------------------
+# Previews: https://<port>.<this name>/ for ports the server opens on purpose. Caddy and the
+# server share a gate secret, so only Caddy can ask "may this name have a certificate?" and
+# "may this request through?".
+if [ ! -s /etc/rixi/preview.env ]; then
+  {
+    echo "RIXI_PREVIEW_DOMAIN=$RIXI_HOSTNAME"
+    echo "RIXI_PREVIEW_GATE=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  } > /etc/rixi/preview.env
+  chmod 600 /etc/rixi/preview.env
+fi
+. /etc/rixi/preview.env
 mkdir -p /var/lib/caddy
 {
+  # The port is the first label of a preview name: as many labels from the right as the
+  # box's own name has.
+  port_label=$(echo "$RIXI_HOSTNAME" | tr '.' '\n' | wc -l)
   echo "{"
   echo "  admin off"
   [ -z "${RIXI_ACME_EMAIL:-}" ] || echo "  email $RIXI_ACME_EMAIL"
+  echo "  on_demand_tls {"
+  echo "    ask http://127.0.0.1:9000/preview/ask?gate=$RIXI_PREVIEW_GATE"
+  echo "  }"
+  echo "}"
+  echo "*.$RIXI_HOSTNAME {"
+  echo "  tls {"
+  echo "    on_demand"
+  echo "  }"
+  echo "  forward_auth 127.0.0.1:9000 {"
+  echo "    uri /preview/auth"
+  echo "    header_up X-Rixi-Host {host}"
+  echo "    header_up X-Rixi-Preview-Gate $RIXI_PREVIEW_GATE"
+  echo "  }"
+  echo "  reverse_proxy 127.0.0.1:{http.request.host.labels.$port_label} {"
+  echo "    flush_interval -1"
+  echo "  }"
   echo "}"
   echo "$RIXI_HOSTNAME {"
+  # The preview gates answer Caddy on loopback only, never through the box's own name.
+  echo "  @previewgate path /preview/ask /preview/auth"
+  echo "  handle @previewgate {"
+  echo "    respond 404"
+  echo "  }"
   if [ -n "${RIXI_SERVE_KIND:-}" ]; then
     # One line per request, so the agent can count them and tell the gateway when the
     # endpoint last did any work (an idle endpoint should stop costing money).
@@ -150,6 +185,7 @@ WorkingDirectory=$RIXI_DIR/server
 Environment=PATH=$HOME/.pixi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=$HOME
 EnvironmentFile=-/etc/rixi/workload.env
+EnvironmentFile=-/etc/rixi/preview.env
 ExecStart=$PY rixi_server.py --host 127.0.0.1 --port 9000 --jwks-url $RIXI_JWKS_URL --audience box-$RIXI_BOX_ID --required-claim tenant=$RIXI_TENANT --revoked-jti-file /etc/rixi/revoked_jti
 Restart=always
 RestartSec=3

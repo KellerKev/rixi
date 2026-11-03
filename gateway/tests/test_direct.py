@@ -128,6 +128,7 @@ def test_claim_provisions_box_with_dns_and_scoped_user_data():
     cur = svc.store.get(box.id)
     assert cur.state == "booting" and cur.ip and cur.provider_id
     assert svc.dns.records[cur.hostname] == cur.ip
+    assert svc.dns.records["*." + cur.hostname] == cur.ip      # preview URLs per port
     assert cur.hostname == f"b-{box.id}.run.example.test"
     ud = next(iter(svc.providers["dummy"].servers.values()))["user_data"]
     assert f"RIXI_BOX_ID={box.id}" in ud and "RIXI_TENANT=t-a" in ud
@@ -500,7 +501,8 @@ def test_a_box_boots_only_after_its_record_is_published(gw_unused=None):
                         clock=Clock(), workers=2)
     box = svc.claim(A, "cpu")
     _settle(svc)
-    assert [o[0] for o in order] == ["set", "wait", "boot"], order
+    assert [o[0] for o in order] == ["set", "set", "wait", "boot"], order
+    assert order[1][1] == "*." + order[0][1]                  # preview names, before boot
     assert dns.published == [(box.hostname, svc.store.get(box.id).ip)]
 
 
@@ -743,3 +745,12 @@ def test_a_box_can_call_the_customers_own_endpoint_directly():
     assert "RIXI_LLM_OPENAI_URL=https://models.customer.example/v1" in ud
     assert "RIXI_LLM_ANTHROPIC_URL" not in ud and f"RIXI_LLM_TOKEN={key}" in ud
     assert key not in json.dumps(svc.store.get(box.id).public())
+
+
+def test_released_boxes_leave_no_dns_behind():
+    svc = _svc()
+    box = svc.claim(A, "cpu")
+    _settle(svc)
+    svc.release(box.id, "test", caller=A)
+    _settle(svc)
+    assert svc.dns.records == {}

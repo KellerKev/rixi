@@ -112,6 +112,13 @@ TOOLS: List[dict] = [
     {"name": "kill_task", "description": "Stop a task and forget it.",
      "inputSchema": {"type": "object", "properties": {
          "box": _BOX, "task_id": {"type": "string"}}, "required": ["box", "task_id"]}},
+    {"name": "open_preview",
+     "description": "Serve a port of the box (a web app you started with spawn) at its own "
+                    "HTTPS URL. Private by default: the returned link carries a token; "
+                    "public=true lets anyone with the URL in.",
+     "inputSchema": {"type": "object", "properties": {
+         "box": _BOX, "port": {"type": "integer"}, "public": {"type": "boolean"}},
+         "required": ["box", "port"]}},
     {"name": "write_file", "description": "Write a text file in the box's workspace.",
      "inputSchema": {"type": "object", "properties": {
          "box": _BOX, "path": {"type": "string"}, "content": {"type": "string"}},
@@ -265,6 +272,13 @@ class Tools:
         r = sb.run(project, task=task)
         return f"exit code: {r.exit_code}\noutput:\n" + _clip(r.output) + \
             (f"\nerror: {r.error}" if r.error else "")
+
+    def open_preview(self, a: dict) -> str:
+        port = a.get("port")
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise ToolError("port must be a number")
+        v = self.sandbox(_str(a, "box")).preview(port, public=bool(a.get("public")))
+        return f"{'public' if v['public'] else 'private'} preview: {v['share_url']}"
 
     # ── files ─────────────────────────────────────────────────────────────
     def write_file(self, a: dict) -> str:

@@ -187,3 +187,14 @@ class Sandbox:
 
     def kill(self, task_id: str) -> None:
         self.client.kill(task_id)
+
+    # ── preview URLs ───────────────────────────────────────────────────────
+    def preview(self, port: int, *, public: bool = False) -> dict:
+        """Serve a port as https://<port>.<box>/ (see ``Client.open_preview``)."""
+        return self.client.open_preview(port, public=public)
+
+    def previews(self) -> List[dict]:
+        return self.client.previews()
+
+    def close_preview(self, port: int) -> None:
+        self.client.close_preview(port)
