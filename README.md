@@ -26,7 +26,7 @@ environment you tested, with nothing to reproduce and no inbound ports to open.
 
 ```bash
 # Not on PyPI yet — install the pinned release straight from git:
-pip install "git+https://github.com/KellerKev/rixi@v0.8.0"
+pip install "git+https://github.com/KellerKev/rixi@v0.9.0"
 ```
 
 ```python
@@ -118,6 +118,11 @@ The same from Python: `Client.start()`, `spawn()`, `tasks()`, `attach()`, `send_
 `restart()`, `redeploy()`, `kill()`, `output()` — and on a sandbox, `sb.spawn()` /
 `sb.follow(id)`. Requires rixi 0.7.0+.
 
+**A terminal on the box.** `rixi shell` opens an interactive login shell in the workspace (a PTY
+over a WebSocket; window resizes follow, the exit code passes through). On hosted boxes the
+portal's box page has the same terminal in the browser, connected to the box directly. Requires
+rixi 0.9.0+.
+
 **Preview URLs.** `rixi preview 8000` serves port 8000 of a hosted box at
 `https://8000.b-<id>.run.eutonomous.eu/` with its own certificate, issued on the box. It is
 private by default: the printed link carries a token, and opening it once sets a cookie for that
@@ -198,7 +203,7 @@ DAG orchestrator; pair it with your scheduler of choice.
 
 ## See it work
 
-Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.8.0"` — not on PyPI yet).
+Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.9.0"` — not on PyPI yet).
 Advanced lifecycle features — offline bundling, attach-history, the interactive redeploy menu —
 use the **full client** in [`clients/`](clients/), shown here as `rixi-client`:
 
@@ -428,7 +433,7 @@ to it:
 cd server && pixi install && pixi run python rixi_server.py --port 9000
 
 # terminal 2 — ship examples/hello to it
-pip install "git+https://github.com/KellerKev/rixi@v0.8.0"   # not on PyPI yet
+pip install "git+https://github.com/KellerKev/rixi@v0.9.0"   # not on PyPI yet
 rixi run --server http://127.0.0.1:9000 --task hello examples/hello
 ```
 

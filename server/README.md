@@ -81,6 +81,11 @@ out — are refused. With an AES key, bodies and responses are sealed (`X-Rixi-E
 output does not keep a box busy), and every authenticated request bumps `activity`, so a box an
 agent is driving with short commands is not mistaken for idle.
 
+Interactive terminal: `GET /pty` as a WebSocket (`?cols=&rows=&cwd=`, the token as a bearer
+header or `?token=` for browsers) runs a login shell on a PTY in the workspace. Binary messages,
+first byte 0 data / 1 resize `{"cols","rows"}` / 2 exit `{"exit_code"}`; sealed with the AES key
+when there is one. `rixi shell` is the client.
+
 Preview URLs (on a box with its own name and Caddy in front, as hosted boxes have;
 `--preview-domain`): `POST /previews {port, public?}` serves the port at
 `https://<port>.<name>/` and returns a share link; `GET /previews`, `DELETE /previews/{port}`.

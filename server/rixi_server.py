@@ -58,6 +58,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from fastapi import Body
 from fastapi import Request
+from fastapi import WebSocket
 
 class HandshakeReq(BaseModel):
     secret: str
@@ -2869,6 +2870,139 @@ def generate_aes_key():
     key = os.urandom(32)
     print("# AES-256 Key (base64):")
     print(base64.b64encode(key).decode())
+
+# ─────────────────────────── Interactive terminal (PTY over WebSocket) ────────
+# GET /pty upgraded to a WebSocket: a login shell on a pseudo-terminal in the workspace. Binary
+# messages, the first byte says what it is: 0 data (keystrokes in, screen out), 1 resize
+# ({"cols", "rows"}), 2 exit ({"exit_code"}, server to client, last message). With an AES key
+# every message after that byte is sealed, like everything else. A browser cannot set an
+# Authorization header on a WebSocket, so the token may also come as ?token=.
+
+PTY_DATA, PTY_RESIZE, PTY_EXIT = 0, 1, 2
+
+
+def _pty_pack(kind: int, payload: bytes) -> bytes:
+    return bytes([kind]) + (encrypt(payload) if aes_key else payload)
+
+
+def _pty_unpack(message: bytes):
+    if not message:
+        return None, b""
+    payload = message[1:]
+    return message[0], (decrypt(payload) if aes_key else payload)
+
+
+def _set_winsize(fd: int, cols: int, rows: int) -> None:
+    import fcntl
+    import struct
+    import termios
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0))
+
+
+@app.websocket("/pty")
+async def pty_session(ws: WebSocket):
+    global active_execs
+    token = ws.query_params.get("token") or ""
+    auth_header = ws.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+    if auth_settings.enabled:
+        ok, _ = await validate_token(token) if token else (False, None)
+        if not ok:
+            await ws.close(code=4401)
+            return
+    if require_encryption and not aes_key:
+        await ws.close(code=4400)
+        return
+    _note_activity()
+    await ws.accept()
+    import pty as _pty
+    try:
+        cols = int(ws.query_params.get("cols") or 120)
+        rows = int(ws.query_params.get("rows") or 32)
+        cwd = _workspace_path(ws.query_params.get("cwd") or ".")
+    except (ValueError, HTTPException):
+        await ws.close(code=4400)
+        return
+    cwd.mkdir(parents=True, exist_ok=True)
+    master, slave = _pty.openpty()
+    _set_winsize(master, cols, rows)
+    env = {**os.environ, "TERM": "xterm-256color", "HOME": os.environ.get("HOME", "/root")}
+    proc = subprocess.Popen(["/bin/bash", "-l"], stdin=slave, stdout=slave, stderr=slave,
+                            cwd=str(cwd), env=env, start_new_session=True, close_fds=True)
+    os.close(slave)
+    os.set_blocking(master, False)
+    loop = asyncio.get_running_loop()
+    out: asyncio.Queue = asyncio.Queue()
+
+    def readable():
+        try:
+            data = os.read(master, 65536)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            data = b""
+        out.put_nowait(data)
+        if not data:
+            loop.remove_reader(master)
+
+    loop.add_reader(master, readable)
+    active_execs += 1
+
+    async def pump_out():
+        while True:
+            data = await out.get()
+            if not data:
+                return
+            await ws.send_bytes(_pty_pack(PTY_DATA, data))
+            _note_activity()
+
+    async def pump_in():
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                return
+            raw = msg.get("bytes")
+            if raw is None and msg.get("text") is not None:
+                raw = msg["text"].encode()
+            try:
+                kind, payload = _pty_unpack(raw or b"")
+            except Exception:
+                return                      # unsealed or tampered: end the session
+            if kind == PTY_DATA:
+                os.write(master, payload)
+            elif kind == PTY_RESIZE:
+                size = json.loads(payload or b"{}")
+                _set_winsize(master, int(size.get("cols", cols)), int(size.get("rows", rows)))
+
+    tasks = [asyncio.ensure_future(pump_out()), asyncio.ensure_future(pump_in())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+        try:
+            loop.remove_reader(master)
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGHUP)
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        code = proc.wait()
+        os.close(master)
+        active_execs -= 1
+        try:
+            await ws.send_bytes(_pty_pack(PTY_EXIT, json.dumps({"exit_code": code}).encode()))
+            await ws.close()
+        except Exception:
+            pass
+
 
 # ─────────────────────────── Preview URLs ─────────────────────────────────
 # A port on the box, opened on purpose, gets its own HTTPS name: https://<port>.<box name>.

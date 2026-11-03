@@ -140,3 +140,31 @@ def test_a_pixi_task_started_in_the_background_can_be_attached(plain):
     assert "Hello from RIXI!" in out and end["exit_code"] == 0
     assert c.tasks()[tid]["status"] == "completed"           # kept for its output
     c.kill(tid)
+
+
+def _shell(client, script: bytes, cwd=None):
+    """Drive `rixi.shell.interactive` with piped (non-tty) input; collect what it prints."""
+    import subprocess as sp
+    code = (
+        "import sys, os; sys.path.insert(0, %r)\n"
+        "from rixi import Client\n"
+        "from rixi.shell import interactive\n"
+        "c = Client(%r, aes_key=%r)\n"
+        "sys.exit(interactive(c, cwd=%r))\n"
+    ) % (str(HERE.parent / "src"), client.server_url,
+         __import__("base64").b64encode(client.aes_key).decode() if client.aes_key else None, cwd)
+    r = sp.run([sys.executable, "-c", code], input=script, capture_output=True, timeout=60)
+    return r.returncode, r.stdout
+
+
+def test_an_interactive_shell_over_the_websocket(plain):
+    c, ws = plain
+    code, out = _shell(c, b"echo SHELL-$((40+2))\nexit 7\n", cwd="term")
+    assert b"SHELL-42" in out and code == 7
+    assert os.path.isdir(os.path.join(ws, "term"))
+
+
+def test_the_shell_is_sealed_with_a_key(sealed):
+    c, _, _ = sealed
+    code, out = _shell(c, b"echo SEALED-$((1+1))\nexit\n")
+    assert b"SEALED-2" in out and code == 0

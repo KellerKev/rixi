@@ -113,6 +113,10 @@ def main(argv=None) -> int:
                                "Boxes default to the hosted eutonomous provider (RIXI_API_KEY); "
                                "set RIXI_MCP_PROVIDER for your own cloud account.")
 
+    sh = sub.add_parser("shell", help="an interactive terminal on the box (exit or Ctrl-D ends it)")
+    sh.add_argument("--cwd", help="start in this directory of the workspace")
+    connection_flags(sh)
+
     pv = sub.add_parser("preview", help="serve a port of the box at https://<port>.<box>/",
                         description="Private by default: share the printed link (it sets a "
                                     "cookie for that host). Hosted boxes only.")
@@ -374,6 +378,9 @@ def _dispatch(args) -> int:
                 mark = "/" if e["type"] == "dir" else ""
                 print(f"{e['size']:>12}  {e['name']}{mark}")
             return 0
+        if args.cmd == "shell":
+            from .shell import interactive
+            return interactive(client, cwd=args.cwd)
         if args.cmd == "preview":
             if args.list or args.port is None:
                 for v in client.previews():

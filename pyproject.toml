@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rixi"
-version = "0.8.0"
+version = "0.9.0"
 description = "Secure remote execution for Pixi projects — client SDK and CLI"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -25,6 +25,7 @@ dependencies = [
     "cryptography>=44",
     "lz4>=4.0",
     "pyjwt>=2.8",          # `rixi up` profiles sign a short-lived ES256 token per request
+    "websockets>=13",      # `rixi shell`: the box's terminal
 ]
 
 [project.urls]
