@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import base64
 import hmac
 import json
@@ -428,11 +429,13 @@ async def verify_authentication(
     authorization: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     if not auth_settings.enabled:
+        _note_activity()
         return True
     bearer = authorization.credentials if authorization and authorization.scheme.lower() == "bearer" else None
     for tok in filter(None, (bearer,)):
         is_valid, payload = await validate_token(tok)
         if is_valid:
+            _note_activity()
             return payload  # Return payload for use in log retrieval
     logger.warning("Authentication failed", extra={"endpoint": "verify_authentication"})
     raise HTTPException(status_code=401, detail="Invalid or missing authentication token.")
@@ -1976,7 +1979,8 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "uptime_seconds": time.time() - server_start_time,
         "service": "pixi-runner-server",
-        "active_tasks": len(running_tasks),   # a count only; task details need a token
+        "active_tasks": len(running_tasks) + active_execs,   # counts only; details need a token
+        "activity": activity_seq,     # authenticated requests so far; the agent reports the delta
         "features": [
             "http_proxy", 
             "aes_encryption", 
@@ -2475,6 +2479,267 @@ async def list_tasks(auth: bool = Depends(verify_authentication)):
     
     return JSONResponse(tasks)
 
+# ─────────────────────────── Sandboxed environments: exec + files ─────────
+# An agent drives a sandboxed environment with two primitives: run a command and move files.
+# Both work under one workspace root, need the same token as everything else, and honour the
+# negotiated AES key: request bodies sealed (X-Rixi-Encrypted: 1, or application/octet-stream
+# for JSON), responses sealed the same way.
+
+WORKSPACE_ROOT = os.environ.get("RIXI_WORKSPACE", "/workspace")
+EXEC_TIMEOUT_DEFAULT = 600.0
+EXEC_TIMEOUT_MAX = 12 * 3600.0
+FILE_MAX_BYTES = 256 * 1024 * 1024
+activity_seq = 0          # authenticated requests served; the box agent reports the delta
+active_execs = 0          # commands running right now (counted as busy, like tasks)
+
+
+def _note_activity() -> None:
+    global activity_seq
+    activity_seq += 1
+
+
+def _workspace_root() -> pathlib.Path:
+    root = pathlib.Path(WORKSPACE_ROOT)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"workspace unavailable: {exc}")
+    return root.resolve()
+
+
+def _workspace_path(rel: str) -> pathlib.Path:
+    """A path inside the workspace. Absolute paths are accepted only if they are inside it;
+    `..` and symlinks that lead outside are refused (resolve() follows symlinks first)."""
+    if not isinstance(rel, str) or "\x00" in rel:
+        raise HTTPException(status_code=400, detail="path must be a string")
+    root = _workspace_root()
+    candidate = pathlib.Path(rel)
+    p = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    if p != root and root not in p.parents:
+        raise HTTPException(status_code=400, detail="path is outside the workspace")
+    return p
+
+
+def _sealed_header(request: Request) -> bool:
+    return (request.headers.get("x-rixi-encrypted") == "1"
+            or "application/octet-stream" in request.headers.get("content-type", ""))
+
+
+async def _body_bytes(request: Request, limit: int) -> bytes:
+    body = await request.body()
+    if len(body) > limit + 64:
+        raise HTTPException(status_code=413, detail=f"body exceeds {limit} bytes")
+    sealed = request.headers.get("x-rixi-encrypted") == "1"
+    if require_encryption and not sealed:
+        raise HTTPException(status_code=400, detail="This server requires encrypted request bodies")
+    if sealed:
+        if not aes_key:
+            raise HTTPException(status_code=400, detail="body is sealed but no key is negotiated")
+        try:
+            body = decrypt(body)
+        except Exception:
+            raise HTTPException(status_code=400, detail="could not decrypt the body")
+    return body
+
+
+async def _json_body(request: Request) -> dict:
+    raw = await request.body()
+    sealed = _sealed_header(request)
+    if require_encryption and not sealed:
+        raise HTTPException(status_code=400, detail="This server requires encrypted request bodies")
+    if sealed and aes_key:
+        try:
+            raw = decrypt(raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="could not decrypt the body")
+    try:
+        data = json.loads(raw or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    return data
+
+
+def _sealed_response(payload: bytes, media_type: str) -> Response:
+    if aes_key:
+        return Response(encrypt(payload), media_type="application/octet-stream",
+                        headers={"X-Rixi-Encrypted": "1"})
+    return Response(payload, media_type=media_type)
+
+
+@app.post("/exec")
+async def exec_command(request: Request, auth: bool = Depends(verify_authentication)):
+    """Run one command in the workspace and stream its output; the last frame is the exit code.
+
+    `cmd` as a string runs through `bash -lc` (what an agent writes is shell); as a list it is
+    executed directly. Frames: {"stdout": …} / {"stderr": …} as output arrives, then
+    {"exit_code": n, "status": "completed" | "failed" | "timeout", "duration_s": …}.
+    """
+    data = await _json_body(request)
+    cmd = data.get("cmd")
+    if isinstance(cmd, str) and cmd.strip():
+        argv = ["bash", "-lc", cmd]
+    elif isinstance(cmd, list) and cmd and all(isinstance(c, str) for c in cmd):
+        argv = list(cmd)
+    else:
+        raise HTTPException(status_code=400, detail="cmd must be a non-empty string or list")
+    cwd = _workspace_path(data.get("cwd") or ".")
+    cwd.mkdir(parents=True, exist_ok=True)
+    extra_env = data.get("env") or {}
+    if not isinstance(extra_env, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in extra_env.items()):
+        raise HTTPException(status_code=400, detail="env must map strings to strings")
+    try:
+        timeout = float(data.get("timeout") or EXEC_TIMEOUT_DEFAULT)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="timeout must be a number of seconds")
+    if not 0 < timeout <= EXEC_TIMEOUT_MAX:
+        raise HTTPException(status_code=400, detail=f"timeout must be 0..{EXEC_TIMEOUT_MAX:.0f} s")
+    stdin = data.get("stdin")
+    if stdin is not None and not isinstance(stdin, str):
+        raise HTTPException(status_code=400, detail="stdin must be a string")
+    env = {**os.environ, **extra_env}
+    return StreamingResponse(_exec_stream(argv, cwd, env, timeout, stdin),
+                             media_type="application/octet-stream" if aes_key
+                             else "application/json")
+
+
+async def _exec_stream(argv, cwd, env, timeout, stdin):
+    global active_execs
+    started = time.time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=str(cwd), env=env,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
+    except (FileNotFoundError, PermissionError) as exc:
+        yield send_frame((json.dumps({"exit_code": 127, "status": "failed",
+                                      "error": str(exc)}) + "\n").encode())
+        return
+    active_execs += 1
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump(stream, name):
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            await queue.put((name, chunk.decode("utf-8", "replace")))
+        await queue.put((name, None))
+
+    readers = [asyncio.create_task(pump(proc.stdout, "stdout")),
+               asyncio.create_task(pump(proc.stderr, "stderr"))]
+    if stdin is not None:
+        proc.stdin.write(stdin.encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+    status, open_streams = "completed", 2
+    deadline = started + timeout
+    try:
+        while open_streams:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                status = "timeout"
+                break
+            try:
+                name, text = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                status = "timeout"
+                break
+            if text is None:
+                open_streams -= 1
+                continue
+            yield send_frame((json.dumps({name: text}) + "\n").encode())
+        if status == "timeout":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        rc = await proc.wait()
+        for r in readers:
+            r.cancel()
+        if status != "timeout":
+            status = "completed" if rc == 0 else "failed"
+        yield send_frame((json.dumps({"exit_code": rc if status != "timeout" else 124,
+                                      "status": status,
+                                      "duration_s": round(time.time() - started, 3)})
+                          + "\n").encode())
+    finally:
+        active_execs -= 1
+        if proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)   # the client went away mid-command
+            except ProcessLookupError:
+                pass
+
+
+@app.put("/files")
+async def put_file(request: Request, path: str, auth: bool = Depends(verify_authentication)):
+    """Write a file (parents created). Atomic: readers never see a half-written file."""
+    target = _workspace_path(path)
+    if target == _workspace_root():
+        raise HTTPException(status_code=400, detail="path names the workspace itself")
+    data = await _body_bytes(request, FILE_MAX_BYTES)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".rixi-upload-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, target)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return JSONResponse({"path": str(target.relative_to(_workspace_root())), "bytes": len(data)})
+
+
+@app.get("/files")
+async def get_file(path: str, auth: bool = Depends(verify_authentication)):
+    target = _workspace_path(path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="no such file")
+    size = target.stat().st_size
+    if size > FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"file is {size} bytes; limit {FILE_MAX_BYTES}")
+    return _sealed_response(target.read_bytes(), "application/octet-stream")
+
+
+@app.get("/files/list")
+async def list_files(path: str = ".", auth: bool = Depends(verify_authentication)):
+    target = _workspace_path(path)
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail="no such directory")
+    root = _workspace_root()
+    entries = []
+    for child in sorted(target.iterdir(), key=lambda c: c.name):
+        try:
+            st = child.lstat()
+        except OSError:
+            continue
+        kind = "dir" if child.is_dir() and not child.is_symlink() else (
+            "link" if child.is_symlink() else "file")
+        entries.append({"name": child.name, "path": str(child.relative_to(root)),
+                        "type": kind, "size": st.st_size, "mtime": st.st_mtime})
+    return _sealed_response(json.dumps({"path": str(target.relative_to(root)) or ".",
+                                        "entries": entries}).encode(), "application/json")
+
+
+@app.delete("/files")
+async def delete_file(path: str, auth: bool = Depends(verify_authentication)):
+    target = _workspace_path(path)
+    if target == _workspace_root():
+        raise HTTPException(status_code=400, detail="refusing to delete the workspace")
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+    elif target.exists() or target.is_symlink():
+        target.unlink()
+    else:
+        raise HTTPException(status_code=404, detail="no such file")
+    return JSONResponse({"deleted": str(target.relative_to(_workspace_root()))})
+
+
 # ─────────────────────────── AES key util & main ──────────────────────────
 
 def generate_aes_key():
@@ -2515,6 +2780,8 @@ if __name__ == "__main__":
                     help="Require AES-sealed request bodies (uploads, task input, proxied "
                          "bodies). Until the key handshake completes, only /health and "
                          "/handshake answer. Needs --key-secret or --aes-key")
+    p.add_argument("--workspace", default=os.environ.get("RIXI_WORKSPACE", "/workspace"),
+                    help="Root for the exec and files API (default: /workspace or RIXI_WORKSPACE)")
     p.add_argument("--max-upload-mb", type=int, default=2048,
                     help="Maximum upload size in MB (default: 2048)")
     p.add_argument("--tls-cert",
@@ -2543,6 +2810,7 @@ if __name__ == "__main__":
     setup_logging(args.log_level, args.log_dir, args.log_size_mb, args.log_backup_count)
 
     max_upload_bytes = args.max_upload_mb * 1024 * 1024
+    WORKSPACE_ROOT = args.workspace
 
     if bool(args.tls_cert) != bool(args.tls_key):
         raise SystemExit("ERROR: --tls-cert and --tls-key must be provided together.")

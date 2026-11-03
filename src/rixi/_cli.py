@@ -93,6 +93,27 @@ def main(argv=None) -> int:
         sp.add_argument("--keep-alive", action="store_true", help="keep the task alive after it finishes")
         connection_flags(sp)
 
+    ex = sub.add_parser("exec", help="run a command in the box's workspace (exit code passes through)",
+                        description="One argument runs through bash (`rixi exec 'ls -la | wc -l'`); "
+                                    "several are run as-is without a shell (`rixi exec -- python -V`).")
+    ex.add_argument("command", nargs="+", help="the command")
+    ex.add_argument("--cwd", help="working directory inside the workspace")
+    ex.add_argument("--timeout", type=float, help="seconds before the command is killed (default 600)")
+    ex.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="extra variable (repeatable)")
+    connection_flags(ex)
+
+    put = sub.add_parser("put", help="copy a local file into the box's workspace")
+    put.add_argument("local")
+    put.add_argument("remote", nargs="?", help="path in the workspace (default: the file name)")
+    connection_flags(put)
+    get = sub.add_parser("get", help="copy a file from the box's workspace")
+    get.add_argument("remote")
+    get.add_argument("local", nargs="?", help="local path (default: the file name; - for stdout)")
+    connection_flags(get)
+    ls = sub.add_parser("ls", help="list a directory in the box's workspace")
+    ls.add_argument("path", nargs="?", default=".")
+    connection_flags(ls)
+
     up = sub.add_parser("up", help="create a cloud box with rixi installed + save a profile",
                         description=_UP_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     up.add_argument("--provider", required=True, choices=["hetzner", "scaleway", "aws"])
@@ -225,6 +246,49 @@ def _dispatch(args) -> int:
             for chunk in client.stream(args.project_dir, task=args.task, keep_alive=args.keep_alive):
                 sys.stdout.write(chunk)
                 sys.stdout.flush()
+            return 0
+        if args.cmd == "exec":
+            env = {}
+            for item in args.env:
+                k, sep, v = item.partition("=")
+                if not sep or not k:
+                    raise RixiError(f"--env expects KEY=VALUE, got {item!r}")
+                env[k] = v
+            cmd = args.command[0] if len(args.command) == 1 else args.command
+            code = 1
+            for kind, value in client.exec_stream(cmd, cwd=args.cwd, env=env or None,
+                                                  timeout=args.timeout):
+                if kind == "stdout":
+                    sys.stdout.write(value)
+                    sys.stdout.flush()
+                elif kind == "stderr":
+                    sys.stderr.write(value)
+                    sys.stderr.flush()
+                else:
+                    if value.get("status") == "timeout":
+                        sys.stderr.write("\nrixi: command timed out\n")
+                    code = value.get("exit_code", 1)
+            return code if isinstance(code, int) else 1
+        if args.cmd == "put":
+            remote = args.remote or os.path.basename(args.local)
+            with open(args.local, "rb") as fh:
+                info = client.write_file(remote, fh.read())
+            print(f"{args.local} -> {info['path']} ({info['bytes']} bytes)")
+            return 0
+        if args.cmd == "get":
+            data = client.read_file(args.remote)
+            if args.local == "-":
+                sys.stdout.buffer.write(data)
+            else:
+                dest = args.local or os.path.basename(args.remote)
+                with open(dest, "wb") as fh:
+                    fh.write(data)
+                print(f"{args.remote} -> {dest} ({len(data)} bytes)")
+            return 0
+        if args.cmd == "ls":
+            for e in client.list_files(args.path):
+                mark = "/" if e["type"] == "dir" else ""
+                print(f"{e['size']:>12}  {e['name']}{mark}")
             return 0
         if args.cmd == "run":
             result = client.run(args.project_dir, task=args.task, keep_alive=args.keep_alive)

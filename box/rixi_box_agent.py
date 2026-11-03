@@ -32,11 +32,28 @@ def _get_json(url: str, timeout: float = 5.0):
         return json.loads(r.read() or b"{}")
 
 
-def active_tasks(server_url: str) -> int:
+_activity = {"last": None}
+
+
+def server_state(server_url: str):
+    """(running tasks and commands, authenticated requests since the last beat).
+
+    Short exec calls finish between beats, so a box an agent is actively driving would show
+    zero running tasks at every beat and be reaped as idle; the request delta says otherwise.
+    """
     try:
-        return int(_get_json(f"{server_url}/health").get("active_tasks", 0))
+        h = _get_json(f"{server_url}/health")
     except Exception:
-        return 0
+        return 0, 0
+    seq = int(h.get("activity", 0))
+    last = _activity["last"]
+    _activity["last"] = seq
+    delta = 0 if last is None or seq < last else seq - last     # a server restart resets it
+    return int(h.get("active_tasks", 0)), delta
+
+
+def active_tasks(server_url: str) -> int:
+    return server_state(server_url)[0]
 
 
 _log_pos = {"offset": 0, "inode": None}
@@ -102,15 +119,17 @@ def write_revoked(path: str, jtis) -> None:
 
 
 def beat(env: dict) -> dict:
+    tasks, activity = server_state(env.get("RIXI_SERVER_URL", "http://127.0.0.1:9000"))
     body = {
         "box_id": env["RIXI_BOX_ID"],
-        "active_tasks": active_tasks(env.get("RIXI_SERVER_URL", "http://127.0.0.1:9000")),
+        "active_tasks": tasks,
+        "requests": activity,
         "tls_ready": tls_ready(env["RIXI_HOSTNAME"]),
         "version": VERSION,
     }
     if env.get("RIXI_SERVE_KIND"):
         api = env.get("RIXI_MODEL_API", "http://127.0.0.1:11434")
-        body["requests"] = requests_since_last_beat(
+        body["requests"] += requests_since_last_beat(
             env.get("RIXI_ACCESS_LOG", "/var/log/rixi/access.log"))
         body["model_ready"] = model_ready(api, env.get("RIXI_SERVE_MODEL", ""))
     payload = json.dumps(body).encode()

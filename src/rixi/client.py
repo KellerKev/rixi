@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import requests
 
-from .crypto import frame, iter_frames
+from .crypto import decrypt, encrypt, frame, iter_frames
 
 # Packages are sealed in chunks of this size, each as one length-prefixed AES-GCM frame.
 _SEAL_CHUNK = 1024 * 1024
@@ -57,6 +57,21 @@ class RunResult:
     @property
     def ok(self) -> bool:
         return self.error is None and self.exit_code in (None, 0)
+
+
+@dataclass
+class ExecResult:
+    """Result of one command run with ``Client.exec``."""
+    exit_code: Optional[int] = None
+    status: str = ""                       # completed | failed | timeout
+    stdout: str = ""
+    stderr: str = ""
+    duration_s: Optional[float] = None
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_code == 0 and self.error is None
 
 
 class Client:
@@ -149,6 +164,106 @@ class Client:
                 result.exit_code = obj["exit_code"]
         return result
 
+    # ── sandboxed environments: commands and files ─────────────────────────
+    def exec(self, cmd: Union[str, List[str]], *, cwd: Optional[str] = None,
+             env: Optional[Dict[str, str]] = None, timeout: Optional[float] = None,
+             stdin: Optional[str] = None) -> ExecResult:
+        """Run one command in the box's workspace and wait for it.
+
+        A string runs through ``bash -lc``; a list is executed as-is (no shell). Returns the
+        exit code with stdout and stderr collected separately.
+        """
+        result = ExecResult()
+        for kind, value in self.exec_stream(cmd, cwd=cwd, env=env, timeout=timeout,
+                                            stdin=stdin):
+            if kind == "stdout":
+                result.stdout += value
+            elif kind == "stderr":
+                result.stderr += value
+            else:
+                result.exit_code = value.get("exit_code")
+                result.status = value.get("status", "")
+                result.duration_s = value.get("duration_s")
+                result.error = value.get("error")
+        return result
+
+    def exec_stream(self, cmd: Union[str, List[str]], *, cwd: Optional[str] = None,
+                    env: Optional[Dict[str, str]] = None, timeout: Optional[float] = None,
+                    stdin: Optional[str] = None) -> Iterator[tuple]:
+        """Run a command and yield ``("stdout", text)`` / ``("stderr", text)`` as output
+        arrives, then ``("exit", {...})`` with the exit code and status."""
+        body = {"cmd": cmd}
+        if cwd is not None:
+            body["cwd"] = cwd
+        if env:
+            body["env"] = env
+        if timeout is not None:
+            body["timeout"] = timeout
+        if stdin is not None:
+            body["stdin"] = stdin
+        data, headers = self._seal_json(body)
+        with requests.post(f"{self.server_url}/exec", data=data, headers=headers, stream=True,
+                           verify=self.verify_ssl, timeout=None) as r:
+            if r.status_code != 200:
+                raise RixiError(f"exec failed: {r.status_code} {_detail(r)}")
+            for payload in iter_frames(self.aes_key, r.iter_content(chunk_size=4096)):
+                for obj in _objects(payload):
+                    if "stdout" in obj:
+                        yield "stdout", obj["stdout"]
+                    elif "stderr" in obj:
+                        yield "stderr", obj["stderr"]
+                    elif "exit_code" in obj:
+                        yield "exit", obj
+
+    def write_file(self, path: str, data: Union[bytes, str]) -> dict:
+        """Write a file in the workspace (parent directories are created)."""
+        raw = data.encode() if isinstance(data, str) else data
+        headers = self._headers()
+        if self.aes_key:
+            raw, headers["X-Rixi-Encrypted"] = encrypt(self.aes_key, raw), "1"
+        headers["Content-Type"] = "application/octet-stream"
+        r = requests.put(f"{self.server_url}/files", params={"path": path}, data=raw,
+                         headers=headers, verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"write {path} failed: {r.status_code} {_detail(r)}")
+        return r.json()
+
+    def read_file(self, path: str) -> bytes:
+        r = requests.get(f"{self.server_url}/files", params={"path": path},
+                         headers=self._headers(), verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"read {path} failed: {r.status_code} {_detail(r)}")
+        return self._unseal(r)
+
+    def list_files(self, path: str = ".") -> List[dict]:
+        r = requests.get(f"{self.server_url}/files/list", params={"path": path},
+                         headers=self._headers(), verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"list {path} failed: {r.status_code} {_detail(r)}")
+        return json.loads(self._unseal(r))["entries"]
+
+    def delete_file(self, path: str) -> None:
+        r = requests.delete(f"{self.server_url}/files", params={"path": path},
+                            headers=self._headers(), verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"delete {path} failed: {r.status_code} {_detail(r)}")
+
+    def _seal_json(self, body: dict):
+        raw = json.dumps(body).encode()
+        headers = self._headers()
+        if self.aes_key:
+            headers.update({"X-Rixi-Encrypted": "1", "Content-Type": "application/octet-stream"})
+            return encrypt(self.aes_key, raw), headers
+        headers["Content-Type"] = "application/json"
+        return raw, headers
+
+    def _unseal(self, r: requests.Response) -> bytes:
+        if r.headers.get("X-Rixi-Encrypted") == "1":
+            if not self.aes_key:
+                raise RixiError("the server sealed its answer but this client has no key")
+            return decrypt(self.aes_key, r.content)
+        return r.content
+
     def package(self, project_dir: str = ".", *,
                 ignore: Optional[set] = None) -> str:
         """Tar + LZ4 a project directory into a temp file; returns its path.
@@ -235,6 +350,14 @@ class Client:
 
 class RixiError(RuntimeError):
     """Raised for client-side and server-side rixi errors."""
+
+
+def _detail(r: requests.Response) -> str:
+    try:
+        body = r.json()
+        return body.get("detail") or body.get("error") or r.text
+    except ValueError:
+        return r.text[:300]
 
 
 def _seal_file(key: bytes, src: str, dst: str) -> None:

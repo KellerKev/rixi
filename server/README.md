@@ -62,6 +62,26 @@ curl http://localhost:9000/health
 Secrets can be supplied out-of-band via the `RIXI_KEY_SECRET` and `RIXI_AES_KEY` environment
 variables instead of CLI flags, so they don't appear in `ps` or shell history.
 
+## Commands and files (sandboxed environments)
+
+An agent drives a box with two primitives, both confined to one workspace root
+(`--workspace`, default `/workspace`) and needing the same token as everything else:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /exec` `{cmd, cwd?, env?, timeout?, stdin?}` | Run a command (a string goes through `bash -lc`, a list runs without a shell); streams `{"stdout"}`/`{"stderr"}` frames, then `{"exit_code", "status", "duration_s"}`. Killed at `timeout` (default 600 s). |
+| `PUT /files?path=` | Write a file (parents created, written atomically) |
+| `GET /files?path=` · `GET /files/list?path=` · `DELETE /files?path=` | Read, list, delete |
+
+Paths that resolve outside the workspace — `..`, absolute paths elsewhere, symlinks pointing
+out — are refused. With an AES key, bodies and responses are sealed (`X-Rixi-Encrypted: 1`); with
+`--require-encryption`, plaintext bodies are refused. Running commands count as busy in
+`/health`, and every authenticated request bumps `activity`, so a box an agent is driving with
+short commands is not mistaken for idle.
+
+From the SDK: `Client.exec()`, `exec_stream()`, `write_file()`, `read_file()`, `list_files()`,
+`delete_file()`. From the CLI: `rixi exec`, `rixi put`, `rixi get`, `rixi ls`.
+
 ## Task lifecycle & attaching later
 
 A task uploaded with the `keep_alive=true` form field stays registered under a generated **task

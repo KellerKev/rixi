@@ -47,3 +47,17 @@ def test_model_ready_matches_tag_variants(monkeypatch):
     assert not agent.model_ready("http://x", "llama3")
     monkeypatch.setattr(agent, "_get_json", lambda url, timeout=5: (_ for _ in ()).throw(OSError()))
     assert not agent.model_ready("http://x", "qwen3:0.6b")     # server not up yet
+
+
+def test_api_activity_between_beats_is_reported(monkeypatch):
+    """An agent's short exec calls finish between beats; the request delta keeps the box busy."""
+    agent._activity["last"] = None
+    seq = {"n": 10}
+    monkeypatch.setattr(agent, "_get_json", lambda url, timeout=5: {"active_tasks": 0,
+                                                                     "activity": seq["n"]})
+    assert agent.server_state("http://x") == (0, 0)            # first beat: baseline only
+    seq["n"] = 14
+    assert agent.server_state("http://x") == (0, 4)
+    assert agent.server_state("http://x") == (0, 0)
+    seq["n"] = 2                                               # server restarted
+    assert agent.server_state("http://x") == (0, 0)

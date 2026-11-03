@@ -12,7 +12,7 @@ are deployed with Pixi (they carry heavier deps); this package is the lightweigh
 """
 from __future__ import annotations
 
-from .client import Client, RixiError, RunResult
+from .client import Client, ExecResult, RixiError, RunResult
 
-__all__ = ["Client", "RixiError", "RunResult", "__version__"]
+__all__ = ["Client", "ExecResult", "RixiError", "RunResult", "__version__"]
 __version__ = "0.2.8"
