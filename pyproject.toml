@@ -36,7 +36,8 @@ Repository = "https://github.com/KellerKev/rixi"
 # Server-side components carry heavy deps; installing them via pip is best-effort — the
 # supported path is Pixi per component. These extras exist so `rixi-server`/`rixi-gateway`
 # launchers can run from a plain venv when desired.
-server = ["fastapi>=0.115,<0.116", "uvicorn>=0.30", "pyjwt>=2.10,<3", "python-multipart>=0.0.9"]
+server = ["fastapi>=0.115,<0.116", "uvicorn>=0.30", "pyjwt>=2.10,<3", "python-multipart>=0.0.9",
+          "websockets>=13"]
 gateway = ["fastapi", "uvicorn", "pyjwt>=2.8", "websockets>=12", "duckdb>=0.10", "tomli>=2; python_version < '3.11'"]
 dev = ["pytest>=8", "ruff>=0.6", "httpx>=0.27"]   # httpx: starlette TestClient (server tests)
 aws = ["boto3>=1.28"]      # `rixi up --provider aws` (experimental)

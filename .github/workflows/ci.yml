@@ -54,6 +54,25 @@ jobs:
       - name: Server security regression tests
         run: pytest server/tests/ -q
 
+  typescript:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install the server (the tests run against a real one)
+        run: pip install -e '.[server]'
+      - name: Build and test
+        working-directory: sdk/typescript
+        env:
+          RIXI_SERVER_PYTHON: python
+        run: npm install --no-audit --no-fund && npm test
+
   gateway:
     name: Gateway tests
     runs-on: ubuntu-latest

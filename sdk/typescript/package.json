@@ -1,0 +1,23 @@
+{
+  "name": "rixi-sdk",
+  "version": "0.11.0",
+  "description": "Rixi from TypeScript/JavaScript: run commands, move files, drive long-running tasks and previews on a Rixi box — yours or a hosted one on EU machines.",
+  "license": "MIT",
+  "author": "Kevin Keller",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "repository": { "type": "git", "url": "https://github.com/KellerKev/rixi", "directory": "sdk/typescript" },
+  "keywords": ["rixi", "sandbox", "remote-execution", "agents", "eu", "pixi"],
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
