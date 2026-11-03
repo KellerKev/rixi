@@ -26,7 +26,7 @@ environment you tested, with nothing to reproduce and no inbound ports to open.
 
 ```bash
 # Not on PyPI yet — install the pinned release straight from git:
-pip install "git+https://github.com/KellerKev/rixi@v0.6.0"
+pip install "git+https://github.com/KellerKev/rixi@v0.7.0"
 ```
 
 ```python
@@ -101,10 +101,26 @@ with Sandbox.create(provider="scaleway", policy={"egress": {"mode": "block"}}) a
     print(sb.exec("python3 main.py").stdout)     # 42 — and the box is gone after the block
 ```
 
+**Long-running work, attach later.** Start a pipeline task or any command in the background,
+leave, and come back from anywhere — several can run side by side:
+
+```bash
+rixi run --detach --task train .          # prints a task id; the run keeps going
+rixi exec --background "npm run dev"      # any command, kept as a task too
+rixi tasks                                # what is running, what finished (exit codes)
+rixi attach <id>                          # replay its output, then follow (Ctrl-C detaches)
+rixi attach <id> --no-history             # only what it prints from now on
+rixi input <id> "yes"                     # a line to its stdin
+rixi restart <id> · rixi redeploy <id> . · rixi kill <id> · rixi logs <id>
+```
+
+The same from Python: `Client.start()`, `spawn()`, `tasks()`, `attach()`, `send_input()`,
+`restart()`, `redeploy()`, `kill()`, `output()` — and on a sandbox, `sb.spawn()` /
+`sb.follow(id)`. Requires rixi 0.7.0+.
+
 `rixi run`, `rixi stream`, and the Python SDK work with these boxes directly (and so does any example
-that uses them — drop `--server` and the profile is used). The full client's interactive lifecycle
-features and serving through the proxy use a server you start yourself or one from
-[the gateway](#scale-it-up-the-gateway) for now.
+that uses them — drop `--server` and the profile is used). Offline bundling and the MCP
+back-channel are in the full client ([`clients/`](clients/)), which works against these boxes too.
 
 ## Hard problems RIXI makes easy
 
@@ -163,7 +179,7 @@ DAG orchestrator; pair it with your scheduler of choice.
 
 ## See it work
 
-Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.6.0"` — not on PyPI yet).
+Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.7.0"` — not on PyPI yet).
 Advanced lifecycle features — offline bundling, attach-history, the interactive redeploy menu —
 use the **full client** in [`clients/`](clients/), shown here as `rixi-client`:
 
@@ -393,7 +409,7 @@ to it:
 cd server && pixi install && pixi run python rixi_server.py --port 9000
 
 # terminal 2 — ship examples/hello to it
-pip install "git+https://github.com/KellerKev/rixi@v0.6.0"   # not on PyPI yet
+pip install "git+https://github.com/KellerKev/rixi@v0.7.0"   # not on PyPI yet
 rixi run --server http://127.0.0.1:9000 --task hello examples/hello
 ```
 

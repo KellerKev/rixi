@@ -92,3 +92,51 @@ def test_everything_is_sealed_with_a_key(sealed):
     from rixi import RixiError
     with pytest.raises(RixiError):                     # a client without the key is refused
         unkeyed.exec("cat s.txt")
+
+
+def _collect(events):
+    out, err, end = "", "", None
+    for kind, value in events:
+        if kind == "stdout":
+            out += value
+        elif kind == "stderr":
+            err += value
+        else:
+            end = value
+    return out, err, end
+
+
+def _lifecycle(c):
+    tid = c.spawn("read who; echo hi $who; sleep 0.3; echo done; echo warn >&2")
+    assert c.tasks()[tid]["status"] == "running"
+    c.send_input(tid, "ada\n")
+    out, err, end = _collect(c.attach(tid))
+    assert out == "hi ada\ndone\n" and err == "warn\n" and end["exit_code"] == 0
+    assert "hi ada" in c.output(tid)
+    out, _, _ = _collect(c.attach(tid, history=False))      # finished: nothing new
+    assert out == ""
+    c.restart(tid)
+    c.send_input(tid, "bob\n")
+    out, _, _ = _collect(c.attach(tid))
+    assert out == "hi bob\ndone\n"
+    c.kill(tid)
+    assert tid not in c.tasks()
+
+
+def test_background_commands_attach_feed_restart_and_kill(plain):
+    _lifecycle(plain[0])
+
+
+def test_the_task_lifecycle_works_sealed_too(sealed):
+    _lifecycle(sealed[0])
+
+
+@pytest.mark.skipif(not __import__("shutil").which("pixi"), reason="needs pixi on PATH")
+def test_a_pixi_task_started_in_the_background_can_be_attached(plain):
+    c, _ = plain
+    tid = c.start(str(HERE.parent / "examples" / "hello"), task="hello")
+    assert c.tasks()[tid]["status"] in ("queued", "extracting", "starting", "running", "completed")
+    out, _, end = _collect(c.attach(tid))
+    assert "Hello from RIXI!" in out and end["exit_code"] == 0
+    assert c.tasks()[tid]["status"] == "completed"           # kept for its output
+    c.kill(tid)

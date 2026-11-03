@@ -155,3 +155,35 @@ class Sandbox:
     def run(self, project_dir: str = ".", *, task: str = "default", **kw) -> RunResult:
         """Ship a Pixi project and run one of its tasks (see `Client.run`)."""
         return self.client.run(project_dir, task=task, **kw)
+
+    # ── long-running work ──────────────────────────────────────────────────
+    def start(self, project_dir: str = ".", *, task: str = "default", **kw) -> str:
+        """Ship a Pixi project and start a task in the background; returns its id."""
+        return self.client.start(project_dir, task=task, **kw)
+
+    def spawn(self, cmd: Union[str, List[str]], **kw) -> str:
+        """Start a command in the background (a dev server, a watcher); returns its id."""
+        return self.client.spawn(cmd, **kw)
+
+    def tasks(self) -> Dict[str, dict]:
+        return self.client.tasks()
+
+    def follow(self, task_id: str, *, history: bool = True) -> Iterator[tuple]:
+        """Follow a task's output (``Client.attach``; on a Sandbox, ``attach`` is the
+        classmethod that drives an existing profile)."""
+        return self.client.attach(task_id, history=history)
+
+    def output(self, task_id: str) -> str:
+        return self.client.output(task_id)
+
+    def send_input(self, task_id: str, data, *, raw: bool = True) -> dict:
+        return self.client.send_input(task_id, data, raw=raw)
+
+    def restart(self, task_id: str) -> dict:
+        return self.client.restart(task_id)
+
+    def redeploy(self, task_id: str, project_dir: str = ".", **kw) -> dict:
+        return self.client.redeploy(task_id, project_dir, **kw)
+
+    def kill(self, task_id: str) -> None:
+        self.client.kill(task_id)

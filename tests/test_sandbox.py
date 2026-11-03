@@ -108,3 +108,29 @@ def test_attach_drives_an_existing_profile_without_owning_it(fake):
         assert sb.exec("ls").ok
     assert cloud.destroyed == [] and not sb.owned
     made.destroy()
+
+
+def test_a_sandbox_drives_long_running_work(fake, monkeypatch):
+    class Box2(Box):
+        def spawn(self, cmd, **kw):
+            self.spawned = cmd
+            return "t-1"
+
+        def attach(self, task_id, history=True):
+            yield "stdout", "serving\n"
+            yield "exit", {"exit_code": 0}
+
+        def tasks(self):
+            return {"t-1": {"status": "running"}}
+
+        def kill(self, task_id):
+            self.killed = task_id
+    box = Box2()
+    monkeypatch.setattr(Profile, "client", lambda self, **_: box)
+    with Sandbox.create(provider="hetzner", creds={"token": "t"}) as sb:
+        tid = sb.spawn("python3 -m http.server 8000")
+        assert tid == "t-1" and box.spawned.startswith("python3")
+        assert [k for k, _ in sb.follow(tid)] == ["stdout", "exit"]
+        assert sb.tasks()["t-1"]["status"] == "running"
+        sb.kill(tid)
+    assert box.killed == "t-1"

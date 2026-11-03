@@ -164,6 +164,117 @@ class Client:
                 result.exit_code = obj["exit_code"]
         return result
 
+    # ── long-running work: tasks you start, leave and come back to ─────────
+    def start(self, project_dir: str = ".", *, task: str = "default",
+              ignore: Optional[set] = None) -> str:
+        """Ship a project and start ``task`` in the background; returns its task id at once.
+
+        The task keeps running after this returns. Follow it with ``attach``, feed it with
+        ``send_input``, and ``restart``/``redeploy``/``kill`` it by id — from any process.
+        """
+        with self._post_package(project_dir, task, True, ignore,
+                                extra={"detach": "true"}) as r:
+            return json.loads(self._unseal(r))["task_id"]
+
+    def spawn(self, cmd: Union[str, List[str]], *, cwd: Optional[str] = None,
+              env: Optional[Dict[str, str]] = None, timeout: Optional[float] = None,
+              stdin: Optional[str] = None) -> str:
+        """Start a command in the workspace in the background; returns its task id.
+
+        Like ``exec``, but the command outlives the call: a dev server, a watcher, a long job.
+        Its output is kept, so ``attach`` can replay and follow it later.
+        """
+        body = {"cmd": cmd, "background": True}
+        for k, v in (("cwd", cwd), ("env", env), ("timeout", timeout), ("stdin", stdin)):
+            if v is not None:
+                body[k] = v
+        data, headers = self._seal_json(body)
+        r = requests.post(f"{self.server_url}/exec", data=data, headers=headers,
+                          verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"spawn failed: {r.status_code} {_detail(r)}")
+        return json.loads(self._unseal(r))["task_id"]
+
+    def tasks(self) -> Dict[str, dict]:
+        """Every task on the box — running, or finished and kept — by id."""
+        return self._get_json("/tasks", "list tasks")
+
+    def task(self, task_id: str) -> dict:
+        """One task: status, exit code, recent output."""
+        return self._get_json(f"/task/{task_id}", f"task {task_id}")
+
+    def output(self, task_id: str) -> str:
+        """Everything a task has printed so far (kept output, no following)."""
+        lines = self._get_json(f"/task/{task_id}/output", f"output of {task_id}")
+        return "".join(e["content"] + "\n" for e in lines.get("output_history", []))
+
+    def attach(self, task_id: str, *, history: bool = True) -> Iterator[tuple]:
+        """Follow a task's output until it ends: yields ``("stdout", text)`` /
+        ``("stderr", text)``, then ``("exit", {...})``. ``history=False`` skips what it printed
+        before you attached. Stop iterating to detach; the task keeps running."""
+        with requests.get(f"{self.server_url}/task/{task_id}/stream",
+                          params={"history": str(history).lower()}, headers=self._headers(),
+                          stream=True, verify=self.verify_ssl, timeout=None) as r:
+            if r.status_code != 200:
+                raise RixiError(f"attach failed: {r.status_code} {_detail(r)}")
+            for payload in iter_frames(self.aes_key, r.iter_content(chunk_size=4096)):
+                for obj in _objects(payload):
+                    if "output" in obj:
+                        yield "stdout", obj["output"]
+                    elif "stderr" in obj:
+                        yield "stderr", obj["stderr"]
+                    elif "exit_code" in obj:
+                        yield "exit", obj
+
+    def send_input(self, task_id: str, data: Union[str, dict], *, raw: bool = True) -> dict:
+        """Write to a running task's stdin. A string goes as-is (``raw``) — add the newline a
+        line-reading program expects; a dict goes as one JSON line (the task protocol)."""
+        params = {"raw": "1"} if raw and isinstance(data, str) else {}
+        body = data.encode() if isinstance(data, str) else json.dumps(data).encode()
+        headers = self._headers()
+        if self.aes_key:
+            body = encrypt(self.aes_key, body)
+            headers["Content-Type"] = "application/octet-stream"
+        else:
+            headers["Content-Type"] = "text/plain" if params else "application/json"
+        r = requests.post(f"{self.server_url}/task/{task_id}/input", params=params, data=body,
+                          headers=headers, verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"input failed: {r.status_code} {_detail(r)}")
+        return r.json()
+
+    def restart(self, task_id: str) -> dict:
+        """Run a task again from the start (same code, or the same command)."""
+        return self._post_json(f"/task/{task_id}/restart", "restart")
+
+    def redeploy(self, task_id: str, project_dir: str = ".", *,
+                 ignore: Optional[set] = None) -> dict:
+        """Replace a running task's code with this project and start it again, same id."""
+        with self._post_package(project_dir, "", True, ignore,
+                                path=f"/task/{task_id}/redeploy") as r:
+            return r.json()
+
+    def kill(self, task_id: str) -> None:
+        """Stop a task and forget it (its output goes with it)."""
+        r = requests.delete(f"{self.server_url}/task/{task_id}", headers=self._headers(),
+                            verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"kill failed: {r.status_code} {_detail(r)}")
+
+    def _get_json(self, path: str, what: str):
+        r = requests.get(f"{self.server_url}{path}", headers=self._headers(),
+                         verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"{what} failed: {r.status_code} {_detail(r)}")
+        return r.json()
+
+    def _post_json(self, path: str, what: str):
+        r = requests.post(f"{self.server_url}{path}", headers=self._headers(),
+                          verify=self.verify_ssl, timeout=self.timeout)
+        if r.status_code != 200:
+            raise RixiError(f"{what} failed: {r.status_code} {_detail(r)}")
+        return r.json()
+
     # ── sandboxed environments: commands and files ─────────────────────────
     def exec(self, cmd: Union[str, List[str]], *, cwd: Optional[str] = None,
              env: Optional[Dict[str, str]] = None, timeout: Optional[float] = None,
@@ -310,7 +421,8 @@ class Client:
 
     @contextlib.contextmanager
     def _post_package(self, project_dir: str, task: str, keep_alive: bool,
-                      ignore: Optional[set]) -> Iterator[requests.Response]:
+                      ignore: Optional[set], *, path: str = "/upload",
+                      extra: Optional[Dict[str, str]] = None) -> Iterator[requests.Response]:
         """Package, upload, and yield the streaming response; temp files are always removed.
 
         With an AES key the package is sealed (one AES-GCM frame per 1 MiB chunk) and marked
@@ -329,8 +441,9 @@ class Client:
                 headers["X-Rixi-Encrypted"] = "1"
             with open(pkg, "rb") as fh:
                 files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
-                data = {"task_name": task, "keep_alive": str(keep_alive).lower()}
-                with requests.post(f"{self.server_url}/upload", files=files, data=data,
+                data = {"task_name": task, "keep_alive": str(keep_alive).lower(),
+                        **(extra or {})}
+                with requests.post(f"{self.server_url}{path}", files=files, data=data,
                                    headers=headers, stream=True,
                                    verify=self.verify_ssl, timeout=None) as r:
                     if r.status_code != 200:

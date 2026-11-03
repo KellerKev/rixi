@@ -70,14 +70,16 @@ An agent drives a box with two primitives, both confined to one workspace root
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /exec` `{cmd, cwd?, env?, timeout?, stdin?}` | Run a command (a string goes through `bash -lc`, a list runs without a shell); streams `{"stdout"}`/`{"stderr"}` frames, then `{"exit_code", "status", "duration_s"}`. Killed at `timeout` (default 600 s). |
+| `POST /exec` `{…, background: true}` | Start it in the background and answer `{"task_id"}` at once; it is a task from then on (attach, stdin, restart, kill). `timeout` is optional here. |
 | `PUT /files?path=` | Write a file (parents created, written atomically) |
 | `GET /files?path=` · `GET /files/list?path=` · `DELETE /files?path=` | Read, list, delete |
 
 Paths that resolve outside the workspace — `..`, absolute paths elsewhere, symlinks pointing
 out — are refused. With an AES key, bodies and responses are sealed (`X-Rixi-Encrypted: 1`); with
 `--require-encryption`, plaintext bodies are refused. Running commands count as busy in
-`/health`, and every authenticated request bumps `activity`, so a box an agent is driving with
-short commands is not mistaken for idle.
+`/health` (only tasks whose process is still running count — a finished task kept for its
+output does not keep a box busy), and every authenticated request bumps `activity`, so a box an
+agent is driving with short commands is not mistaken for idle.
 
 From the SDK: `Client.exec()`, `exec_stream()`, `write_file()`, `read_file()`, `list_files()`,
 `delete_file()`. From the CLI: `rixi exec`, `rixi put`, `rixi get`, `rixi ls`.
@@ -89,11 +91,12 @@ id** after the upload response returns, so clients (and the proxy/agent) can rec
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /upload` | Upload a packaged project (`file`, `task_name`, `keep_alive`); spawns the task and streams extraction + execution |
+| `POST /upload` | Upload a packaged project (`file`, `task_name`, `keep_alive`); spawns the task and streams extraction + execution. With `detach=true` it answers `{"task_id"}` at once and the task runs on, kept |
+| `GET /tasks` | Every task by id: status (refreshed), exit code, `kind` (`task` or `exec`), name |
 | `GET /task/{id}` | Task status JSON: `status`, `exit_code`, `recent_output`, `deployment_type`, `package_stats` |
-| `GET /task/{id}/stream` | Live output — replays the backlog (bounded `output_lines` deque) then follows |
+| `GET /task/{id}/stream` | Live output — replays the backlog (bounded `output_lines` deque) then follows; `?history=false` follows only new output |
 | `GET /task/{id}/output` | Full captured output history (non-streaming) |
-| `POST /task/{id}/input` | Write JSON/text to the task's stdin (how the proxy/agent feed a task) |
+| `POST /task/{id}/input` | Write JSON/text to the task's stdin (how the proxy/agent feed a task); `?raw=1` writes the body as-is, for programs that read plain lines |
 | `POST /task/{id}/restart` · `POST /task/{id}/redeploy` · `DELETE /task/{id}` | Restart in place · push new code · terminate |
 | `ANY /task/{id}/proxy/{path}` | Forward an HTTP request to the task (for tasks that speak RIXI's request envelope, e.g. `examples/http-backends`) |
 | `GET /health` · `GET /tasks` · `GET /deployment/stats` | Server health · list tasks · offline/online stats |

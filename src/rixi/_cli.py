@@ -15,6 +15,7 @@ http://127.0.0.1:9000. Server-side components have their own entry points (rixi-
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -91,6 +92,9 @@ def main(argv=None) -> int:
         sp.add_argument("project_dir", nargs="?", default=".", help="project directory (default: .)")
         sp.add_argument("--task", default="default", help="pixi task to run (default: default)")
         sp.add_argument("--keep-alive", action="store_true", help="keep the task alive after it finishes")
+        if name == "run":
+            sp.add_argument("--detach", "-d", action="store_true",
+                            help="start it in the background and print its task id")
         connection_flags(sp)
 
     ex = sub.add_parser("exec", help="run a command in the box's workspace (exit code passes through)",
@@ -100,7 +104,33 @@ def main(argv=None) -> int:
     ex.add_argument("--cwd", help="working directory inside the workspace")
     ex.add_argument("--timeout", type=float, help="seconds before the command is killed (default 600)")
     ex.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="extra variable (repeatable)")
+    ex.add_argument("--background", "-d", action="store_true",
+                    help="start it in the background and print its task id (attach later)")
     connection_flags(ex)
+
+    # long-running work: follow, feed, restart and stop tasks by id
+    connection_flags(sub.add_parser("tasks", help="list the tasks on the box"))
+    at = sub.add_parser("attach", help="follow a task's output until it ends (Ctrl-C detaches)")
+    at.add_argument("task_id")
+    at.add_argument("--no-history", action="store_true", help="only output from now on")
+    connection_flags(at)
+    lg = sub.add_parser("logs", help="print what a task has output so far")
+    lg.add_argument("task_id")
+    connection_flags(lg)
+    inp = sub.add_parser("input", help="send a line to a task's stdin")
+    inp.add_argument("task_id")
+    inp.add_argument("text", nargs="?", help="the line (default: read stdin)")
+    inp.add_argument("--json", action="store_true", help="send TEXT as one JSON object")
+    connection_flags(inp)
+    for name, help_ in (("restart", "run a task again from the start"),
+                        ("kill", "stop a task and forget it")):
+        sp = sub.add_parser(name, help=help_)
+        sp.add_argument("task_id")
+        connection_flags(sp)
+    rd = sub.add_parser("redeploy", help="replace a running task's code and start it again")
+    rd.add_argument("task_id")
+    rd.add_argument("project_dir", nargs="?", default=".")
+    connection_flags(rd)
 
     put = sub.add_parser("put", help="copy a local file into the box's workspace")
     put.add_argument("local")
@@ -289,6 +319,9 @@ def _dispatch(args) -> int:
                     raise RixiError(f"--env expects KEY=VALUE, got {item!r}")
                 env[k] = v
             cmd = args.command[0] if len(args.command) == 1 else args.command
+            if args.background:
+                print(client.spawn(cmd, cwd=args.cwd, env=env or None, timeout=args.timeout))
+                return 0
             code = 1
             for kind, value in client.exec_stream(cmd, cwd=args.cwd, env=env or None,
                                                   timeout=args.timeout):
@@ -323,6 +356,56 @@ def _dispatch(args) -> int:
             for e in client.list_files(args.path):
                 mark = "/" if e["type"] == "dir" else ""
                 print(f"{e['size']:>12}  {e['name']}{mark}")
+            return 0
+        if args.cmd == "tasks":
+            rows = client.tasks()
+            if not rows:
+                print("no tasks")
+            for tid, t in sorted(rows.items(), key=lambda kv: kv[1].get("started_at", 0)):
+                code = "" if t.get("exit_code") is None else f" (exit {t['exit_code']})"
+                print(f"{tid}  {t.get('status', '?'):<9}{code:<10} {t.get('kind', 'task'):<5} "
+                      f"{t.get('task_name', '')}")
+            return 0
+        if args.cmd == "attach":
+            code = 0
+            try:
+                for kind, value in client.attach(args.task_id, history=not args.no_history):
+                    if kind == "exit":
+                        code = value.get("exit_code") or 0
+                    else:
+                        (sys.stdout if kind == "stdout" else sys.stderr).write(value)
+                        (sys.stdout if kind == "stdout" else sys.stderr).flush()
+            except KeyboardInterrupt:
+                sys.stderr.write(f"\nrixi: detached; the task keeps running "
+                                 f"(rixi attach {args.task_id})\n")
+                return 0
+            return code if isinstance(code, int) else 1
+        if args.cmd == "logs":
+            sys.stdout.write(client.output(args.task_id))
+            return 0
+        if args.cmd == "input":
+            text = args.text if args.text is not None else sys.stdin.read()
+            if args.json:
+                client.send_input(args.task_id, json.loads(text), raw=False)
+            else:
+                client.send_input(args.task_id, text if text.endswith("\n") else text + "\n")
+            return 0
+        if args.cmd == "restart":
+            client.restart(args.task_id)
+            print(f"restarted {args.task_id}")
+            return 0
+        if args.cmd == "kill":
+            client.kill(args.task_id)
+            print(f"killed {args.task_id}")
+            return 0
+        if args.cmd == "redeploy":
+            client.redeploy(args.task_id, args.project_dir)
+            print(f"redeployed {args.task_id}")
+            return 0
+        if args.cmd == "run" and args.detach:
+            tid = client.start(args.project_dir, task=args.task)
+            print(tid)
+            sys.stderr.write(f"started in the background — rixi attach {tid}\n")
             return 0
         if args.cmd == "run":
             result = client.run(args.project_dir, task=args.task, keep_alive=args.keep_alive)

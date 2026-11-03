@@ -1550,16 +1550,26 @@ def _plaintext_body_refused(content_type: str) -> Optional[JSONResponse]:
     return None
 
 
+background_runs: set = set()     # detached uploads still running (holds references)
+
+
+def background_runs_gc() -> None:
+    for fut in [f for f in background_runs if f.done()]:
+        background_runs.discard(fut)
+
+
 @app.post("/upload")
 async def upload(
     auth: bool = Depends(verify_authentication),
     file: UploadFile = File(...),
     task_name: str = Form("foobar"),
     keep_alive: str = Form("false"),
+    detach: str = Form("false"),
     x_rixi_encrypted: Optional[str] = Header(None),
 ):
     _validate_task_name(task_name)
     keep = keep_alive.lower() == "true"
+    detached = detach.lower() == "true"
     tid = str(uuid.uuid4())      # always: the stream reads the task's own output buffer
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".lz4")
 
@@ -1580,6 +1590,23 @@ async def upload(
             "file_size_bytes": total_bytes
         })
 
+        if detached:
+            # Start it and answer at once: the task runs on its own, kept for attaching later.
+            # (Closing a streamed upload early would cancel the extraction it is still doing.)
+            # Registered before answering, so an attach that arrives first finds the task.
+            with running_tasks_lock:
+                running_tasks[tid] = {"status": "queued", "task_name": task_name,
+                                      "temp_dir": "", "process": None, "started_at": time.time(),
+                                      "output_lines": deque(maxlen=OUTPUT_LINES_MAX)}
+
+            async def drain(gen=extract_and_run(temp.name, task_name, tid, True)):
+                async for _ in gen:
+                    pass
+            background_runs.add(asyncio.ensure_future(drain()))
+            background_runs_gc()
+            return _sealed_response(json.dumps({"task_id": tid, "status": "starting",
+                                                "task_name": task_name}).encode(),
+                                    "application/json")
         return StreamingResponse(
             extract_and_run(temp.name, task_name, tid, keep),
             media_type="application/octet-stream" if aes_key else "application/json",
@@ -1603,11 +1630,8 @@ async def task_status(tid: str, auth: bool = Depends(verify_authentication)):
         logger.warning("Task status requested for unknown task", extra={"task_id": tid})
         return JSONResponse({"error": "Task not found"}, status_code=404)
     
-    proc = info.get("process")
-    if proc and proc.poll() is not None and info["status"] == "running":
-        info["status"] = "completed" if proc.returncode == 0 else "failed"
-        info["exit_code"] = proc.returncode
-    
+    _refresh_status(info)
+
     # Enhanced response with deployment info
     resp = {k: v for k, v in info.items() if k not in ["process", "reader_ready", "package_metadata", "task_logger"]}
     
@@ -1670,6 +1694,22 @@ async def send_input_to_task(
         refused = _plaintext_body_refused(content_type)
         if refused is not None:
             return refused
+
+        if request.query_params.get("raw") in ("1", "true"):
+            # Exactly these bytes, no JSON envelope: for programs that read plain lines.
+            if aes_key and "application/octet-stream" in content_type:
+                try:
+                    body = decrypt(body)
+                except Exception as exc:
+                    return JSONResponse({"error": f"Decryption failed: {exc}"}, status_code=400)
+            if not proc.stdin:
+                return JSONResponse({"error": "Process stdin is not available"}, status_code=500)
+            try:
+                proc.stdin.write(body.decode("utf-8", "replace"))
+                proc.stdin.flush()
+            except BrokenPipeError:
+                return JSONResponse({"error": "Process stdin closed"}, status_code=409)
+            return JSONResponse({"status": "input_sent", "bytes": len(body)})
 
         # Process based on content type and encryption
         if aes_key and "application/octet-stream" in content_type:
@@ -1970,6 +2010,21 @@ async def task_http_proxy(
 # ─────────────────────────── Enhanced compatibility endpoints ──────────────
 
 # ENHANCED: Health check with offline deployment capability
+def _running_task_count() -> int:
+    """Tasks whose process is still running. A finished task kept for its output is not work:
+    counting it would keep an idle box alive (and billing) until someone deleted the task."""
+    with running_tasks_lock:
+        procs = [i.get("process") for i in running_tasks.values()]
+    return sum(1 for p in procs if p is not None and p.poll() is None)
+
+
+def _refresh_status(info: dict) -> None:
+    proc = info.get("process")
+    if proc and proc.poll() is not None and info.get("status") == "running":
+        info["status"] = "completed" if proc.returncode == 0 else "failed"
+        info["exit_code"] = proc.returncode
+
+
 @app.get("/health")
 async def health_check():
     offline_support_enabled = True  # Always enabled in this implementation
@@ -1979,7 +2034,7 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "uptime_seconds": time.time() - server_start_time,
         "service": "pixi-runner-server",
-        "active_tasks": len(running_tasks) + active_execs,   # counts only; details need a token
+        "active_tasks": _running_task_count() + active_execs,   # counts only; details need a token
         "activity": activity_seq,     # authenticated requests so far; the agent reports the delta
         "features": [
             "http_proxy", 
@@ -2122,7 +2177,10 @@ async def get_task_output_history(tid: str, auth: bool = Depends(verify_authenti
     })
 
 @app.get("/task/{tid}/stream")
-async def stream_task_output(tid: str, auth: bool = Depends(verify_authentication)):
+async def stream_task_output(tid: str, history: bool = True,
+                             auth: bool = Depends(verify_authentication)):
+    """Attach to a task: replay what it has printed so far (history=false: skip that and follow
+    only new output), then follow it until it ends."""
     if tid not in running_tasks:
         return JSONResponse({"error": "Task not found"}, status_code=404)
 
@@ -2143,6 +2201,9 @@ async def stream_task_output(tid: str, auth: bool = Depends(verify_authenticatio
         })
         print(f"📺 Stream connecting to task {tid} ({deployment_type.upper()}) - sending {len(lines)} backlog lines")
         
+        if not history:
+            idx = len(lines)
+            lines = []
         for lt, lc in lines:
             frame_data = json.dumps({lt: lc.rstrip() + "\n", "task_id": tid, "deployment_type": deployment_type}) + "\n"
             yield send_frame(frame_data.encode())
@@ -2203,6 +2264,10 @@ async def restart_task(
         return JSONResponse({"error": "Task not found"}, status_code=404)
 
     info = running_tasks[tid]
+    if info.get("kind") == "exec":
+        _stop_process(info.get("process"))
+        _start_exec_process(tid, info)
+        return JSONResponse({"status": "restarted", "task_id": tid, "kind": "exec"})
     temp_dir = info["temp_dir"]
     task_name = info["task_name"]
     _validate_task_name(task_name)
@@ -2258,6 +2323,9 @@ async def redeploy_task(
         return JSONResponse({"error": "Task not found"}, status_code=404)
 
     info = running_tasks[tid]
+    if info.get("kind") == "exec":
+        return JSONResponse({"error": "a background command has no code to redeploy; restart it"},
+                            status_code=400)
     task_name = info["task_name"]
     _validate_task_name(task_name)
     old_deployment_type = "offline" if info.get("offline_package") else "online"
@@ -2449,13 +2517,16 @@ async def handshake_step2(req: Dict[str, str],
 async def list_tasks(auth: bool = Depends(verify_authentication)):
     """List all running tasks with deployment type info."""
     tasks = {}
-    for tid, info in running_tasks.items():
+    for tid, info in list(running_tasks.items()):
         deployment_type = "offline" if info.get("offline_package") else "online"
         pixi_lock_hash = info.get("pixi_lock_hash")
         
+        _refresh_status(info)
         task_data = {
             "status": info.get("status", "unknown"),
             "task_name": info.get("task_name", ""),
+            "kind": info.get("kind", "task"),
+            "exit_code": info.get("exit_code"),
             "started_at": info.get("started_at", 0),
             "supports_http_proxy": True,
             "supports_mcp": True,
@@ -2599,10 +2670,62 @@ async def exec_command(request: Request, auth: bool = Depends(verify_authenticat
     stdin = data.get("stdin")
     if stdin is not None and not isinstance(stdin, str):
         raise HTTPException(status_code=400, detail="stdin must be a string")
+    if data.get("background"):
+        # A command that outlives this request: registered as a task, so it can be attached to
+        # (with history), fed on stdin, restarted and killed like any other task.
+        tid = str(uuid.uuid4())
+        info = {"kind": "exec", "temp_dir": "", "task_name": _exec_label(cmd),
+                "exec": {"argv": argv, "cwd": str(cwd), "env": extra_env,
+                         "timeout": float(data["timeout"]) if data.get("timeout") else None},
+                "offline_package": False}
+        with running_tasks_lock:
+            running_tasks[tid] = info
+        _start_exec_process(tid, info)
+        if stdin:
+            info["process"].stdin.write(stdin)
+            info["process"].stdin.flush()
+        return _sealed_response(json.dumps({"task_id": tid, "status": "running",
+                                            "kind": "exec"}).encode(), "application/json")
     env = {**os.environ, **extra_env}
     return StreamingResponse(_exec_stream(argv, cwd, env, timeout, stdin),
                              media_type="application/octet-stream" if aes_key
                              else "application/json")
+
+
+def _exec_label(cmd) -> str:
+    text = cmd if isinstance(cmd, str) else " ".join(cmd)
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _stop_process(proc) -> None:
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _start_exec_process(tid: str, info: dict) -> None:
+    """(Re)start a background command; its stdout and stderr land in the task's output."""
+    spec = info["exec"]
+    proc = subprocess.Popen(
+        spec["argv"], cwd=spec["cwd"], env={**os.environ, **spec["env"]},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE,
+        text=True, bufsize=1, start_new_session=True)
+    with running_tasks_lock:
+        info.update({"process": proc, "status": "running", "started_at": time.time(),
+                     "exit_code": None, "output_lines": deque(maxlen=OUTPUT_LINES_MAX),
+                     "reader_ready": threading.Event()})
+    reader = _make_reader(tid, lambda: running_tasks.get(tid))
+    threading.Thread(target=reader, args=(proc.stdout, "output"), daemon=True).start()
+    threading.Thread(target=reader, args=(proc.stderr, "stderr"), daemon=True).start()
+    if spec.get("timeout"):
+        def watchdog(p=proc, limit=spec["timeout"]):
+            try:
+                p.wait(timeout=limit)
+            except subprocess.TimeoutExpired:
+                _stop_process(p)
+        threading.Thread(target=watchdog, daemon=True).start()
 
 
 async def _exec_stream(argv, cwd, env, timeout, stdin):
