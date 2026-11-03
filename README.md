@@ -26,7 +26,7 @@ environment you tested, with nothing to reproduce and no inbound ports to open.
 
 ```bash
 # Not on PyPI yet — install the pinned release straight from git:
-pip install "git+https://github.com/KellerKev/rixi@v0.5.0"
+pip install "git+https://github.com/KellerKev/rixi@v0.6.0"
 ```
 
 ```python
@@ -76,6 +76,13 @@ machines, paid from a prepaid wallet: create an API key at
 `rixi up --provider eutonomous --size cpu-s` (also `cpu-l`, `gpu-l4`, `gpu-l40s`; `--ttl` hours).
 The key only launches, tokens and shuts down boxes; the box itself is reached directly over TLS
 with a token for that box alone. Everything below works the same on it. Requires rixi 0.4.0+.
+
+**Models from inside the box — your call.** `--model-access governed` routes the box's model
+calls through eutonomous and the malgra policy engine (policy, PII rules, signed audit) with a
+token that only works for that box; your eutonomous key never enters it. `--model-access direct
+--model-url https://…/v1 --model-key …` puts nothing in between: the box calls your own endpoint
+with your own key. Either way `OPENAI_BASE_URL` / `OPENAI_API_KEY` are set for every command.
+Requires rixi 0.6.0+.
 
 **Seal it.** `--egress block` (or `--egress allowlist --egress-allow 203.0.113.0/24,198.51.100.7:443`)
 closes the box down once it is ready, in its own cloud firewall — outside the box, where nothing
@@ -156,7 +163,7 @@ DAG orchestrator; pair it with your scheduler of choice.
 
 ## See it work
 
-Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.5.0"` — not on PyPI yet).
+Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.6.0"` — not on PyPI yet).
 Advanced lifecycle features — offline bundling, attach-history, the interactive redeploy menu —
 use the **full client** in [`clients/`](clients/), shown here as `rixi-client`:
 
@@ -386,7 +393,7 @@ to it:
 cd server && pixi install && pixi run python rixi_server.py --port 9000
 
 # terminal 2 — ship examples/hello to it
-pip install "git+https://github.com/KellerKev/rixi@v0.5.0"   # not on PyPI yet
+pip install "git+https://github.com/KellerKev/rixi@v0.6.0"   # not on PyPI yet
 rixi run --server http://127.0.0.1:9000 --task hello examples/hello
 ```
 

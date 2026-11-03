@@ -119,16 +119,21 @@ for _ in $(seq 1 60); do
 done
 
 # 6. services ----------------------------------------------------------------
-# Governed model calls: every command, task and login on the box sees an OpenAI- and
-# Anthropic-compatible endpoint and a token that only works for this box. The real key stays
-# with the gateway that swaps it in.
+# Model calls: every command, task and login on the box sees an OpenAI- (and, when given,
+# Anthropic-) compatible endpoint and its key. Governed: a token only good for this box, swapped
+# for the real key by a gateway. Direct: the customer's own endpoint and key.
 : > /etc/rixi/workload.env
+if [ -n "${RIXI_LLM_BASE_URL:-}" ] && [ -z "${RIXI_LLM_OPENAI_URL:-}" ]; then   # v0.5.0 form
+  RIXI_LLM_OPENAI_URL="$RIXI_LLM_BASE_URL/v1"; RIXI_LLM_ANTHROPIC_URL="$RIXI_LLM_BASE_URL"
+fi
 if [ -n "${RIXI_LLM_TOKEN:-}" ]; then
   {
-    echo "OPENAI_BASE_URL=$RIXI_LLM_BASE_URL/v1"
+    echo "OPENAI_BASE_URL=$RIXI_LLM_OPENAI_URL"
     echo "OPENAI_API_KEY=$RIXI_LLM_TOKEN"
-    echo "ANTHROPIC_BASE_URL=$RIXI_LLM_BASE_URL"
-    echo "ANTHROPIC_API_KEY=$RIXI_LLM_TOKEN"
+    if [ -n "${RIXI_LLM_ANTHROPIC_URL:-}" ]; then
+      echo "ANTHROPIC_BASE_URL=$RIXI_LLM_ANTHROPIC_URL"
+      echo "ANTHROPIC_API_KEY=$RIXI_LLM_TOKEN"
+    fi
   } > /etc/rixi/workload.env
   echo 'set -a; . /etc/rixi/workload.env; set +a' > /etc/profile.d/rixi-llm.sh
 fi

@@ -83,6 +83,7 @@ def _template(api: Api, size: str, instance_type: Optional[str]) -> dict:
 def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileStore,
        instance_type: Optional[str] = None, region: Optional[str] = None,
        policy: Optional[netpolicy.NetworkPolicy] = None, ttl_hours: Optional[float] = None,
+       model_access=None,
        make_default: bool = True, wait_timeout: float = 900.0, echo: Echo = print,
        _api: Optional[Api] = None, _sleep=time.sleep) -> Profile:
     api = _api or Api(creds.get("api_key"), creds.get("api_url"))
@@ -94,10 +95,16 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
         body["ttl"] = int(ttl_hours * 3600)
     if policy is not None and not policy.is_default:
         body["policy"] = policy.to_dict()
+    if model_access is not None:
+        # governed: through eutonomous + malgra with a box-only token; direct: straight to your
+        # own endpoint with your own key; none. Omitted: governed if your account linked a key.
+        body["model_access"] = model_access
 
     price = f" (€{t['eur_per_hour']}/h)" if t.get("eur_per_hour") else ""
     echo(f"▶ launching a {t['name']} box on eutonomous{price}")
     box = api.launch(body)
+    if box.get("model_access") and box["model_access"] != "none":
+        echo(f"  model access: {box['model_access']} (OPENAI_BASE_URL is set on the box)")
     profile = Profile(name=name, provider="eutonomous", server_url=box["url"], ip="",
                       region=box["zone"], instance_type=box["instance_type"], box_id=box["id"],
                       audience=f"box-{box['id']}", rixi_ref="", created_at=time.time(),

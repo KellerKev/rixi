@@ -122,3 +122,21 @@ def test_a_hosted_sandbox_is_shut_down_after_the_block(monkeypatch):
         assert sb.profile.provider == "eutonomous"
     assert api.released == ["bx1"]
     sandbox_mod._owned.clear()
+
+
+def test_model_access_is_the_customers_choice_and_passes_through():
+    api = FakeApi()
+    direct = {"mode": "direct", "openai_base_url": "https://models.example.org/v1",
+              "api_key": "sk-own"}
+    _up(api, model_access=direct)
+    assert api.launched[0]["model_access"] == direct
+    up_mod.down("hosted1", {"api_key": "rxk_test"}, _provider=api, echo=lambda m: None)
+    api2 = FakeApi()
+    _up(api2, name="hosted2")                          # omitted: the service decides
+    assert "model_access" not in api2.launched[0]
+
+
+def test_model_access_on_your_own_cloud_points_to_exec_env():
+    with pytest.raises(up_mod.UpError, match="exec --env"):
+        up_mod.up(provider="hetzner", name="own", creds={"token": "t"}, model_access="governed",
+                  _check=False, echo=lambda m: None)

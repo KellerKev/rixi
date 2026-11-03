@@ -123,6 +123,14 @@ def main(argv=None) -> int:
     up.add_argument("--size", default="sample-cpu",
                     help="sample-cpu or sample-gpu; on eutonomous also cpu-s, cpu-l, gpu-l4, "
                          "gpu-l40s")
+    up.add_argument("--model-access", choices=["governed", "direct", "none"],
+                    help="eutonomous: how the box's workloads reach models — governed (through "
+                         "eutonomous + malgra, a box-only token), direct (your own endpoint and "
+                         "key, nothing in between) or none. Default: governed if your account "
+                         "linked an eutonomous key, else none")
+    up.add_argument("--model-url", help="direct: OpenAI-compatible base URL (https://…/v1)")
+    up.add_argument("--model-anthropic-url", help="direct: Anthropic-compatible base URL")
+    up.add_argument("--model-key", help="direct: the endpoint's API key (or RIXI_MODEL_KEY)")
     up.add_argument("--ttl", type=float,
                     help="eutonomous: hours until the box shuts itself down (service default)")
     up.add_argument("--name", help="profile/box name (default: <provider>-<size>)")
@@ -210,10 +218,16 @@ def _cloud(args) -> int:
             if args.egress != "open" or args.egress_allow:
                 policy = {"egress": {"mode": args.egress, "allow": [
                     e.strip() for e in args.egress_allow.split(",") if e.strip()]}}
+            model_access = args.model_access
+            if model_access == "direct":
+                model_access = {"mode": "direct", "openai_base_url": args.model_url or "",
+                                "anthropic_base_url": args.model_anthropic_url or "",
+                                "api_key": args.model_key or os.environ.get("RIXI_MODEL_KEY", "")}
             profile = up_mod.up(
                 provider=args.provider, size=args.size, name=args.name, creds=creds,
                 instance_type=args.instance_type, region=args.region,
                 allow_from=args.allow_from, policy=policy, ttl_hours=args.ttl,
+                model_access=model_access,
                 ssh_key=None if args.ssh_key == "none" else args.ssh_key,
                 rixi_ref=args.rixi_ref, save_creds=args.save_credentials,
                 make_default=not args.no_default, wait_timeout=args.timeout * 60,

@@ -29,14 +29,33 @@ def valid_model(name: str) -> bool:
     return bool(_MODEL.match(name))
 
 
-_LLM_URL = re.compile(r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)*$")
-_LLM_TOKEN = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
+_LLM_URL = re.compile(r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)*/?$")
+# A box-only token from the hosted gateway, or the customer's own provider key (direct mode).
+_LLM_TOKEN = re.compile(r"^[A-Za-z0-9._+/=-]{8,256}$")
+
+
+def normalize_llm(llm: dict) -> Optional[dict]:
+    """Where the box's workloads send model calls, and with which key; None if unusable.
+
+    `openai_base_url` is used as given (it usually ends in /v1); `anthropic_base_url` is
+    optional. The older {base_url} form means a gateway serving both under one prefix."""
+    if llm.get("base_url") and not llm.get("openai_base_url"):
+        base = str(llm["base_url"]).rstrip("/")
+        llm = {"openai_base_url": base + "/v1", "anthropic_base_url": base,
+               "token": llm.get("token")}
+    openai_url = str(llm.get("openai_base_url") or "")
+    anthropic_url = str(llm.get("anthropic_base_url") or "")
+    token = str(llm.get("token") or "")
+    if not _LLM_URL.fullmatch(openai_url) or not _LLM_TOKEN.fullmatch(token):
+        return None
+    if anthropic_url and not _LLM_URL.fullmatch(anthropic_url):
+        return None
+    return {"openai_base_url": openai_url.rstrip("/"),
+            "anthropic_base_url": anthropic_url.rstrip("/"), "token": token}
 
 
 def valid_llm(llm: dict) -> bool:
-    """A model-gateway address the box's workloads call, and the box-only token they use."""
-    return bool(_LLM_URL.fullmatch(str(llm.get("base_url") or ""))
-                and _LLM_TOKEN.fullmatch(str(llm.get("token") or "")))
+    return normalize_llm(llm) is not None
 
 
 def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_secret: str,
@@ -64,11 +83,15 @@ def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_se
         if cfg.ollama_version:
             env["RIXI_OLLAMA_VERSION"] = cfg.ollama_version
     if llm:
-        # Model calls leave through a gateway that holds the real key; the box gets a token
-        # that is worthless anywhere else and once the box is gone.
-        if not valid_llm(llm):
-            raise ValueError("not a usable llm gateway")
-        env["RIXI_LLM_BASE_URL"] = llm["base_url"]
+        # Model calls: either through a gateway that holds the real key (the box gets a token
+        # worthless anywhere else and once the box is gone), or straight to the customer's own
+        # endpoint with their own key — their choice. Neither is stored by the gateway.
+        llm = normalize_llm(llm)
+        if llm is None:
+            raise ValueError("not a usable model endpoint")
+        env["RIXI_LLM_OPENAI_URL"] = llm["openai_base_url"]
+        if llm["anthropic_base_url"]:
+            env["RIXI_LLM_ANTHROPIC_URL"] = llm["anthropic_base_url"]
         env["RIXI_LLM_TOKEN"] = llm["token"]
     for k, v in env.items():
         if not _SAFE.match(v):

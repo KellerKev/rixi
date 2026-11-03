@@ -79,7 +79,7 @@ def up(*, provider: str, size: str = "sample-cpu", name: Optional[str] = None,
        creds: Dict[str, Optional[str]], instance_type: Optional[str] = None,
        region: Optional[str] = None, allow_from: str = "0.0.0.0/0",
        ssh_key: Optional[str] = "auto", rixi_ref: Optional[str] = None,
-       policy: Optional[dict] = None, ttl_hours: Optional[float] = None,
+       policy: Optional[dict] = None, ttl_hours: Optional[float] = None, model_access=None,
        save_creds: bool = False, make_default: bool = True,
        wait_timeout: float = 900.0, keep_on_failure: bool = False,
        store: Optional[ProfileStore] = None, echo: Echo = print,
@@ -107,11 +107,15 @@ def up(*, provider: str, size: str = "sample-cpu", name: Optional[str] = None,
         try:
             return hosted.up(name=name, size=size, creds=creds, store=store,
                              instance_type=instance_type, region=region, policy=net,
-                             ttl_hours=ttl_hours, make_default=make_default,
+                             ttl_hours=ttl_hours, model_access=model_access,
+                             make_default=make_default,
                              wait_timeout=wait_timeout, echo=echo, _api=_provider,
                              _sleep=_sleep)
         except hosted.HostedError as exc:
             raise UpError(str(exc)) from exc
+    if model_access not in (None, "none"):
+        raise UpError("model access is set up by the hosted service; on your own box, pass "
+                      "OPENAI_BASE_URL / OPENAI_API_KEY with `rixi exec --env` instead")
     spec_r = presets.resolve(provider, size, instance_type, region)
     ref = rixi_ref or default_ref()
     if _check:

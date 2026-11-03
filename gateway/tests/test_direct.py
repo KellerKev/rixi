@@ -713,7 +713,8 @@ def test_a_box_gets_a_model_gateway_and_token_but_the_store_keeps_neither():
     box = svc.claim(A, "cpu", llm={"base_url": "https://rixi.example.test/llm", "token": tok})
     _settle(svc)
     ud = next(iter(svc.providers["dummy"].servers.values()))["user_data"]
-    assert "RIXI_LLM_BASE_URL=https://rixi.example.test/llm" in ud
+    assert "RIXI_LLM_OPENAI_URL=https://rixi.example.test/llm/v1" in ud
+    assert "RIXI_LLM_ANTHROPIC_URL=https://rixi.example.test/llm" in ud
     assert f"RIXI_LLM_TOKEN={tok}" in ud
     assert tok not in json.dumps(svc.store.get(box.id).public())
 
@@ -721,6 +722,8 @@ def test_a_box_gets_a_model_gateway_and_token_but_the_store_keeps_neither():
 @pytest.mark.parametrize("llm", [
     {"base_url": "http://plain.example/llm", "token": "x" * 30},       # TLS only
     {"base_url": "https://x.example/llm", "token": "short"},
+    {"openai_base_url": "https://x.example/v1", "token": "x" * 30, "anthropic_base_url": "ftp://y"},
+    {"openai_base_url": "https://x.example/v1", "token": "sk proj with spaces"},
     {"base_url": "https://x.example/llm\nRIXI_JWKS_URL=http://evil", "token": "x" * 30},
     {"base_url": "https://x.example/llm", "token": "x" * 30 + "\n"},
     {"token": "x" * 30},
@@ -728,3 +731,15 @@ def test_a_box_gets_a_model_gateway_and_token_but_the_store_keeps_neither():
 def test_llm_settings_are_validated(llm):
     with pytest.raises(Denied, match="llm"):
         _svc().claim(A, "cpu", llm=llm)
+
+
+def test_a_box_can_call_the_customers_own_endpoint_directly():
+    svc = _svc()
+    key = "sk-proj-Abc123_def.456+/="
+    box = svc.claim(A, "cpu", llm={"openai_base_url": "https://models.customer.example/v1",
+                                    "token": key})
+    _settle(svc)
+    ud = next(iter(svc.providers["dummy"].servers.values()))["user_data"]
+    assert "RIXI_LLM_OPENAI_URL=https://models.customer.example/v1" in ud
+    assert "RIXI_LLM_ANTHROPIC_URL" not in ud and f"RIXI_LLM_TOKEN={key}" in ud
+    assert key not in json.dumps(svc.store.get(box.id).public())

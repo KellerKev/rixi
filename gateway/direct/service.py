@@ -162,7 +162,8 @@ class DirectService:
             serve = {"kind": kind, "model": str(serve["model"]),
                      "key": str(serve.get("key") or "") or secrets.token_urlsafe(32)}
         if llm is not None and not cloudinit.valid_llm(llm):
-            raise Denied("llm must be {base_url: https://…, token: 20-128 url-safe chars}", 400)
+            raise Denied("llm must be {openai_base_url: https://…, anthropic_base_url?: "
+                         "https://…, token: 8-256 key characters}", 400)
         rate = self.rate(t)
 
         live = self.store.list(tenant=tenant, live_only=True)
