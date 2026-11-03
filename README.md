@@ -77,6 +77,15 @@ may connect. Ship environments as offline bundles when egress is blocked. Requir
 
 Agents can drive a box command by command: `rixi exec "pytest -q"`, `rixi put`, `rixi get`,
 `rixi ls` (or `Client.exec()` / `write_file()` / `read_file()` in the SDK), confined to `/workspace`.
+For a throwaway box per agent run, `rixi.Sandbox` wraps all of it:
+
+```python
+from rixi import Sandbox
+
+with Sandbox.create(provider="scaleway", policy={"egress": {"mode": "block"}}) as sb:
+    sb.write_file("main.py", "print(6 * 7)")
+    print(sb.exec("python3 main.py").stdout)     # 42 — and the box is gone after the block
+```
 
 `rixi run`, `rixi stream`, and the Python SDK work with these boxes directly (and so does any example
 that uses them — drop `--server` and the profile is used). The full client's interactive lifecycle
