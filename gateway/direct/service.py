@@ -14,6 +14,8 @@ State machine:  provisioning → booting → ready → releasing → gone
 from __future__ import annotations
 
 import hashlib
+import json
+import socket
 import hmac
 import logging
 import re
@@ -23,6 +25,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
+from urllib.parse import urlparse
+
+from rixi import policy as netpolicy
 
 from .. import offerings
 from . import cloudinit
@@ -127,7 +132,8 @@ class DirectService:
 
     def claim(self, caller: Caller, template: str, zone: Optional[str] = None,
               ttl: Optional[float] = None, idle_timeout: Optional[float] = -1,
-              ssh_key: Optional[str] = None, serve: Optional[dict] = None) -> Box:
+              ssh_key: Optional[str] = None, serve: Optional[dict] = None,
+              policy: Optional[dict] = None) -> Box:
         tenant = caller.tenant
         if not tenant or not _TENANT.match(tenant):
             raise Denied("token carries no usable tenant claim", 403)
@@ -173,6 +179,14 @@ class DirectService:
                            reason=reason)
                 raise Denied(reason or "not authorized", 402)
 
+        try:
+            net = netpolicy.parse(policy)
+        except netpolicy.PolicyError as exc:
+            raise Denied(f"policy: {exc}", 400)
+        if not net.is_default and not getattr(self.providers[t.provider], "supports_firewall",
+                                              False):
+            raise Denied(f"provider {t.provider!r} cannot enforce a network policy", 400)
+
         box_id = secrets.token_hex(5)
         secret = secrets.token_urlsafe(32)
         now = self.clock()
@@ -182,7 +196,8 @@ class DirectService:
                   state="provisioning", created_at=now, expires_at=now + ttl,
                   idle_timeout=idle_timeout, hb_hash=_hash(secret),
                   serve_kind=serve["kind"] if serve else None,
-                  serve_model=serve["model"] if serve else None)
+                  serve_model=serve["model"] if serve else None,
+                  policy=None if net.is_default else json.dumps(net.to_dict()))
         user_data = cloudinit.render(self.cfg, box_id=box_id, tenant=tenant,
                                      hostname=box.hostname, box_secret=secret, ssh_key=ssh_key,
                                      serve=serve)
@@ -212,7 +227,10 @@ class DirectService:
             created = provider.create(BoxSpec(box_id=box.id, tenant=box.tenant,
                                               instance_type=box.instance_type, zone=box.zone,
                                               image=t.image, user_data=user_data,
-                                              root_volume_gb=t.root_volume_gb), on_ip)
+                                              root_volume_gb=t.root_volume_gb,
+                                              dedicated_firewall=bool(box.policy)), on_ip)
+            if created.firewall_id:
+                self.store.update(box.id, firewall_id=created.firewall_id)
             if self.store.transition(box.id, ("provisioning",), state="booting",
                                      provider_id=created.provider_id, ip=created.ip):
                 self.audit("box.provisioned", box=box.id, tenant=box.tenant, ip=created.ip)
@@ -312,7 +330,8 @@ class DirectService:
 
     # -- heartbeat --------------------------------------------------------
     def heartbeat(self, box_id: str, secret: str, active_tasks: int, tls_ready: bool,
-                  requests: int = 0, model_ready: bool = False) -> dict:
+                  requests: int = 0, model_ready: bool = False,
+                  resolvers: Optional[List[str]] = None) -> dict:
         box = self.store.get(box_id)
         if box is None or not secret or not hmac.compare_digest(_hash(secret), box.hb_hash):
             raise Denied("unknown box or bad credential", 401)
@@ -328,15 +347,62 @@ class DirectService:
             changes["last_request"] = now
         if box.serve_kind and model_ready and not box.model_ready:
             changes["model_ready"] = 1
+        if resolvers and not box.policy_applied:
+            clean = [r for r in resolvers if isinstance(r, str)][:4]
+            changes["resolvers"] = json.dumps(clean)
         self.store.update(box_id, **changes)
         # A served box is only usable once its model has finished downloading.
         serving_ready = (not box.serve_kind) or model_ready or bool(box.model_ready)
-        if box.state == "booting" and tls_ready and serving_ready:
+        if box.state == "booting" and tls_ready and serving_ready and box.policy \
+                and not box.policy_applied:
+            # The box is otherwise ready, but nothing may run on it before its policy is live:
+            # apply it now, and call the box ready on a later beat.
+            self._schedule_policy(self.store.get(box_id))
+        elif box.state == "booting" and tls_ready and serving_ready:
             if self.store.transition(box_id, ("booting",), state="ready", ready_at=now,
                                      last_busy=now):
                 self.audit("box.ready", box=box_id, tenant=box.tenant,
                            boot_s=round(now - box.created_at, 1))
         return {"state": self.store.get(box_id).state, "revoked_jti": self.store.revoked(box_id)}
+
+    # -- network policy ---------------------------------------------------
+    def control_plane_ips(self) -> List[str]:
+        """Addresses the box must keep reaching: where it sends heartbeats and fetches keys."""
+        if self.cfg.control_plane:
+            return list(self.cfg.control_plane)
+        ips = []
+        for url in (self.cfg.heartbeat_url, self.cfg.box_jwks_url):
+            host = urlparse(url).hostname
+            try:
+                ips += [ai[4][0] for ai in socket.getaddrinfo(host, 443, socket.AF_INET)]
+            except (socket.gaierror, TypeError):
+                log.warning("cannot resolve control plane host %r", host)
+        return list(dict.fromkeys(ips))
+
+    def _schedule_policy(self, box: Box) -> None:
+        if self._begin(box.id):
+            self._pool.submit(self._apply_policy, box)
+
+    def _apply_policy(self, box: Box) -> None:
+        try:
+            net = netpolicy.parse(json.loads(box.policy))
+            if net.egress_mode != "open" and not box.resolvers:
+                # Blocking egress before we know where the box resolves names would cut its DNS.
+                raise RuntimeError("the box has not reported its DNS resolvers yet")
+            compiled = netpolicy.compile_rules(
+                net, own_ip=box.ip, control_plane=self.control_plane_ips(),
+                resolvers=json.loads(box.resolvers) if box.resolvers else [])
+            self.providers[box.provider].apply_firewall(box.id, box.zone, compiled)
+            self.store.update(box.id, policy_applied=1)
+            self.audit("box.policy_applied", box=box.id, tenant=box.tenant,
+                       egress=net.egress_mode, rules=len(compiled.rules))
+        except Exception as exc:
+            # Stays booting: tried again on the next beat, released at the boot timeout.
+            log.exception("applying the policy of %s failed", box.id)
+            self.store.update(box.id, error=f"policy: {exc}"[:500])
+            self.audit("box.policy_failed", box=box.id, tenant=box.tenant, error=str(exc)[:200])
+        finally:
+            self._end(box.id)
 
     # -- reaper -----------------------------------------------------------
     def reap_once(self) -> None:

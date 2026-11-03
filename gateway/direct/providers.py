@@ -44,20 +44,22 @@ class BoxSpec:
     image: str
     user_data: str
     root_volume_gb: Optional[int] = None
+    dedicated_firewall: bool = False     # a policy will be applied to this box's own firewall
 
 
 @dataclass
 class Created:
     provider_id: str
     ip: str
+    firewall_id: Optional[str] = None
 
 
 @dataclass
 class Managed:
-    """Something the provider holds for a box — a server, or a leftover IP with no server."""
+    """Something the provider holds for a box — a server, or a leftover IP or firewall."""
     box_id: Optional[str]
     zone: str
-    kind: str          # "server" | "ip"
+    kind: str          # "server" | "ip" | "firewall"
     id: str
 
 
@@ -65,12 +67,14 @@ class DummyProvider:
     """In-memory provider for tests and local runs. Mirrors the tag semantics of a real cloud."""
 
     name = "dummy"
+    supports_firewall = True
 
     def __init__(self, fail_create: bool = False):
         self.fail_create = fail_create
         self.servers: Dict[str, dict] = {}
         self._n = 0
         self._lock = threading.Lock()      # boxes are created from a worker pool
+        self.firewalls: Dict[str, object] = {}     # box id -> the compiled policy applied
 
     def create(self, spec: BoxSpec, on_ip: Callable[[str], None]) -> Created:
         with self._lock:
@@ -83,12 +87,17 @@ class DummyProvider:
         sid = f"srv-{n}"
         self.servers[sid] = {"zone": spec.zone, "tags": box_tags(spec.box_id, spec.tenant),
                              "user_data": spec.user_data, "type": spec.instance_type}
-        return Created(provider_id=sid, ip=ip)
+        return Created(provider_id=sid, ip=ip,
+                       firewall_id=f"fw-{spec.box_id}" if spec.dedicated_firewall else None)
+
+    def apply_firewall(self, box_id: str, zone: str, compiled) -> None:
+        self.firewalls[box_id] = compiled
 
     def destroy(self, box_id: str, zone: str) -> None:
         for sid in [s for s, v in self.servers.items()
                     if box_id_from_tags(v["tags"]) == box_id and v["zone"] == zone]:
             del self.servers[sid]
+        self.firewalls.pop(box_id, None)
 
     def list_managed(self, zones) -> List[Managed]:
         return [Managed(box_id_from_tags(v["tags"]), v["zone"], "server", sid)
@@ -104,6 +113,7 @@ class ScalewayProvider:
     """
 
     name = "scaleway"
+    supports_firewall = True
     API = "https://api.scaleway.com"
     SG_NAME = "rixi-direct"
 
@@ -169,7 +179,10 @@ class ScalewayProvider:
         z = self._inst(spec.zone)
         tags = box_tags(spec.box_id, spec.tenant)
         image = self.resolve_image(spec.image, spec.zone, spec.instance_type)
-        sg = self.security_group(spec.zone)
+        # A policed box gets a group of its own (bootstrap-permissive until the policy is
+        # applied at ready); every other box shares the zone-wide one.
+        sg = self.box_security_group(spec) if spec.dedicated_firewall else \
+            self.security_group(spec.zone)
         ip = self._call("POST", f"{z}/ips", json={
             "project": self.project_id, "type": "routed_ipv4", "tags": tags})["ip"]
         on_ip(ip["address"])
@@ -183,7 +196,57 @@ class ScalewayProvider:
         self._call("PATCH", f"{z}/servers/{server['id']}/user_data/cloud-init",
                    data=spec.user_data.encode(), headers={"Content-Type": "text/plain"})
         self._call("POST", f"{z}/servers/{server['id']}/action", json={"action": "poweron"})
-        return Created(provider_id=server["id"], ip=ip["address"])
+        return Created(provider_id=server["id"], ip=ip["address"],
+                       firewall_id=sg if spec.dedicated_firewall else None)
+
+    def box_security_group(self, spec: BoxSpec) -> str:
+        z = self._inst(spec.zone)
+        sg = self._call("POST", f"{z}/security_groups", json={
+            "name": f"rixi-box-{spec.box_id}", "project": self.project_id, "stateful": True,
+            "inbound_default_policy": "drop", "outbound_default_policy": "accept",
+            "description": "rixi: this box's own firewall; its policy is applied when it is ready",
+            "tags": box_tags(spec.box_id, spec.tenant)})["security_group"]["id"]
+        rules = [{"protocol": "TCP", "direction": "inbound", "action": "accept",
+                  "ip_range": "0.0.0.0/0", "dest_port_from": p} for p in (80, 443, 22)]
+        rules += [{"protocol": "TCP", "direction": "outbound", "action": "drop",
+                   "ip_range": "0.0.0.0/0", "dest_port_from": p} for p in (25, 465, 587)]
+        self._set_rules(spec.zone, sg, rules)
+        return sg
+
+    def _box_groups(self, zone: str, box_id: str) -> List[dict]:
+        d = self._call("GET", f"{self._inst(zone)}/security_groups",
+                       params={"tags": f"rixi-box={box_id}", "project": self.project_id})
+        return [g for g in d.get("security_groups", [])
+                if f"rixi-box={box_id}" in (g.get("tags") or [])]
+
+    def _set_rules(self, zone: str, sg: str, rules: List[dict]) -> None:
+        """Replace every rule in one call, so a box is never left half-applied."""
+        for i, r in enumerate(rules, start=1):
+            r.setdefault("position", i)
+            r.setdefault("editable", True)
+            if r.get("protocol") == "ANY":
+                r.pop("dest_port_from", None)
+                r.pop("dest_port_to", None)
+        self._call("PUT", f"{self._inst(zone)}/security_groups/{sg}/rules", json={"rules": rules})
+
+    def apply_firewall(self, box_id: str, zone: str, compiled) -> None:
+        groups = self._box_groups(zone, box_id)
+        if not groups:
+            raise ProviderError(f"box {box_id} has no firewall of its own")
+        sg = groups[0]["id"]
+        rules = []
+        for r in compiled.rules:
+            rule = {"protocol": r.protocol, "direction": r.direction, "action": r.action,
+                    "ip_range": r.cidr}
+            if r.port_from is not None:
+                rule["dest_port_from"] = r.port_from
+                if r.port_to is not None and r.port_to != r.port_from:
+                    rule["dest_port_to"] = r.port_to
+            rules.append(rule)
+        self._set_rules(zone, sg, rules)
+        self._call("PATCH", f"{self._inst(zone)}/security_groups/{sg}", json={
+            "inbound_default_policy": compiled.inbound_default,
+            "outbound_default_policy": compiled.outbound_default})
 
     def _servers(self, zone: str, tag: str) -> List[dict]:
         out, page = [], 1
@@ -219,6 +282,9 @@ class ScalewayProvider:
                            ok=(204, 404))
         for ip in self._ips(zone, tag):
             self._call("DELETE", f"{z}/ips/{ip['id']}", ok=(204, 404))
+        # the box's own firewall can only go once no server uses it
+        for g in self._box_groups(zone, box_id):
+            self._call("DELETE", f"{z}/security_groups/{g['id']}", ok=(204, 404))
 
     def _wait_gone(self, zone: str, server_id: str) -> None:
         deadline = time.monotonic() + self.poll_timeout
@@ -241,6 +307,13 @@ class ScalewayProvider:
             for ip in self._ips(zone, MANAGED_TAG):
                 if ip["id"] not in attached:
                     out.append(Managed(box_id_from_tags(ip.get("tags")), zone, "ip", ip["id"]))
+            in_use = {(srv.get("security_group") or {}).get("id") for srv in servers}
+            d = self._call("GET", f"{self._inst(zone)}/security_groups",
+                           params={"tags": MANAGED_TAG, "project": self.project_id})
+            for g in d.get("security_groups", []):
+                box_id = box_id_from_tags(g.get("tags"))
+                if box_id and g["id"] not in in_use:
+                    out.append(Managed(box_id, zone, "firewall", g["id"]))
         return out
 
 

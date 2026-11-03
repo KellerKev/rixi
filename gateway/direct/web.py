@@ -141,10 +141,13 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         serve = body.get("serve")
         if serve is not None and not isinstance(serve, dict):
             raise json_error(400, "serve must be an object: {kind, model}")
+        policy = body.get("policy")
+        if policy is not None and not isinstance(policy, dict):
+            raise json_error(400, "policy must be an object: {egress, ingress}")
         box = await _call(svc.claim, ctx.caller, _str(body, "template", required=True),
                           zone=_str(body, "zone"), ttl=_num(body, "ttl"),
                           idle_timeout=_num(body, "idle_timeout", default=-1, allow_null=True),
-                          ssh_key=_str(body, "ssh_key"), serve=serve)
+                          ssh_key=_str(body, "ssh_key"), serve=serve, policy=policy)
         out = box.public(svc.clock())
         key = getattr(box, "endpoint_key", None)
         if key:
@@ -205,10 +208,14 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
                 raise json_error(400, f"{name} must be an integer")
             return v
 
+        resolvers = body.get("resolvers")
+        if resolvers is not None and not (isinstance(resolvers, list)
+                                          and all(isinstance(r, str) for r in resolvers)):
+            raise json_error(400, "resolvers must be a list of addresses")
         return await _call(svc.heartbeat, _str(body, "box_id", required=True), _bearer() or "",
                            count("active_tasks"), bool(body.get("tls_ready")),
                            requests=count("requests"),
-                           model_ready=bool(body.get("model_ready")))
+                           model_ready=bool(body.get("model_ready")), resolvers=resolvers)
 
     app.mount()
     return app

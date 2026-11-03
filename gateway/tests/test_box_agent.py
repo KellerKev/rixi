@@ -61,3 +61,13 @@ def test_api_activity_between_beats_is_reported(monkeypatch):
     assert agent.server_state("http://x") == (0, 0)
     seq["n"] = 2                                               # server restarted
     assert agent.server_state("http://x") == (0, 0)
+
+
+def test_resolvers_skip_the_local_stub_and_fall_back(tmp_path):
+    stub = tmp_path / "resolv.conf"
+    stub.write_text("nameserver 127.0.0.53\noptions edns0\n")
+    upstream = tmp_path / "upstream.conf"
+    upstream.write_text("# managed\nnameserver 51.159.47.28\nnameserver 51.159.47.26\n")
+    assert agent.resolvers((str(tmp_path / "missing"), str(upstream), str(stub))) == \
+        ["51.159.47.28", "51.159.47.26"]
+    assert agent.resolvers((str(stub),)) == []          # only a stub: nothing to keep open

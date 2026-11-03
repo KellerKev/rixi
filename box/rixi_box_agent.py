@@ -118,6 +118,24 @@ def write_revoked(path: str, jtis) -> None:
     os.replace(tmp, path)       # atomic: the server never reads a half-written list
 
 
+def resolvers(paths=("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf")) -> list:
+    """The upstream DNS servers, so a policy that blocks egress can keep DNS open to them.
+
+    systemd-resolved's own file lists the real upstreams; /etc/resolv.conf often only names its
+    127.0.0.53 stub, which is skipped (loopback never crosses the cloud firewall)."""
+    for path in paths:
+        try:
+            with open(path) as f:
+                found = [line.split()[1] for line in f
+                         if line.startswith("nameserver") and len(line.split()) > 1]
+        except OSError:
+            continue
+        found = [a for a in found if not a.startswith("127.") and a != "::1"]
+        if found:
+            return found[:4]
+    return []
+
+
 def beat(env: dict) -> dict:
     tasks, activity = server_state(env.get("RIXI_SERVER_URL", "http://127.0.0.1:9000"))
     body = {
@@ -126,6 +144,7 @@ def beat(env: dict) -> dict:
         "requests": activity,
         "tls_ready": tls_ready(env["RIXI_HOSTNAME"]),
         "version": VERSION,
+        "resolvers": resolvers(),
     }
     if env.get("RIXI_SERVE_KIND"):
         api = env.get("RIXI_MODEL_API", "http://127.0.0.1:11434")

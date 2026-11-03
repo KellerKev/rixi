@@ -23,6 +23,8 @@ caddy = ">=2.10"     # tests adapt the box Caddyfile with the real binary
 psycopg = ">=3.2"
 
 [pypi-dependencies]
+# the SDK in this repo: direct mode compiles network policies with rixi.policy
+rixi = { path = "..", editable = true }
 # control plane: JWT RBAC, management API, OpenTelemetry + DuckDB audit
 pyjwt = ">=2.8"
 requests = "*"                                  # JWKS fetch (matches the core server)

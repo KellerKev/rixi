@@ -121,6 +121,9 @@ def test_destroy_terminates_waits_and_removes_volumes_and_ip():
         ("DELETE", "/block/v1alpha1/zones/fr-par-2/volumes/vol-1"): Resp(204),
         ("GET", f"{Z}/ips"): Resp(200, {"ips": [{"id": "ip-1"}]}),
         ("DELETE", f"{Z}/ips/ip-1"): Resp(204),
+        ("GET", f"{Z}/security_groups"): Resp(200, {"security_groups": [
+            {"id": "sg-box", "tags": ["rixi-managed", "rixi-box=abc"]}]}),
+        ("DELETE", f"{Z}/security_groups/sg-box"): Resp(204),
     }
     p, s = _provider(routes)
     p.destroy("abc", "fr-par-2")
@@ -128,6 +131,8 @@ def test_destroy_terminates_waits_and_removes_volumes_and_ip():
     assert ("POST", f"{Z}/servers/srv-1/action") in calls
     assert ("DELETE", "/block/v1alpha1/zones/fr-par-2/volumes/vol-1") in calls
     assert ("DELETE", f"{Z}/ips/ip-1") in calls
+    assert calls.index(("DELETE", f"{Z}/security_groups/sg-box")) > \
+        calls.index(("POST", f"{Z}/servers/srv-1/action"))   # the group goes after the server
     list_params = next(kw["params"] for m, path, kw in s.calls
                        if m == "GET" and path == f"{Z}/servers")
     assert list_params["tags"] == "rixi-box=abc"       # only this box, by tag
@@ -141,10 +146,93 @@ def test_list_managed_reports_orphan_ips():
         ("GET", f"{Z}/ips"): Resp(200, {"ips": [
             {"id": "ip-1", "tags": ["rixi-managed", "rixi-box=aaa"]},
             {"id": "ip-2", "tags": ["rixi-managed", "rixi-box=bbb"]}]}),
+        ("GET", f"{Z}/security_groups"): Resp(200, {"security_groups": []}),
     }
     p, _ = _provider(routes)
     found = {(m.kind, m.box_id) for m in p.list_managed(["fr-par-2"])}
     assert found == {("server", "aaa"), ("ip", "bbb")}
+
+
+def test_list_managed_reports_firewalls_no_server_uses():
+    routes = {
+        ("GET", f"{Z}/servers"): Resp(200, {"servers": [{
+            "id": "srv-1", "tags": ["rixi-managed", "rixi-box=aaa"],
+            "security_group": {"id": "sg-aaa"}}]}),
+        ("GET", f"{Z}/ips"): Resp(200, {"ips": []}),
+        ("GET", f"{Z}/security_groups"): Resp(200, {"security_groups": [
+            {"id": "sg-shared", "tags": ["rixi-managed"]},          # the zone-wide group
+            {"id": "sg-aaa", "tags": ["rixi-managed", "rixi-box=aaa"]},
+            {"id": "sg-ccc", "tags": ["rixi-managed", "rixi-box=ccc"]}]}),
+    }
+    p, _ = _provider(routes)
+    found = {(m.kind, m.box_id, m.id) for m in p.list_managed(["fr-par-2"])}
+    assert found == {("server", "aaa", "srv-1"), ("firewall", "ccc", "sg-ccc")}
+
+
+def _created_with_firewall():
+    routes = {
+        ("GET", "/marketplace/v2/local-images"): Resp(200, {"local_images": [
+            {"id": "img-1", "compatible_commercial_types": ["DEV1-S"]}]}),
+        ("PUT", f"{Z}/security_groups/sg-box/rules"): Resp(200, {"rules": []}),
+        ("POST", f"{Z}/security_groups"): Resp(201, {"security_group": {"id": "sg-box"}}),
+        ("POST", f"{Z}/ips"): Resp(201, {"ip": {"id": "ip-1", "address": "51.0.0.7"}}),
+        ("POST", f"{Z}/servers/"): Resp(202, {}),
+        ("POST", f"{Z}/servers"): Resp(201, {"server": {"id": "srv-1"}}),
+        ("PATCH", f"{Z}/servers/srv-1/user_data/cloud-init"): Resp(204),
+    }
+    p, s = _provider(routes)
+    created = p.create(BoxSpec("abc", "t-1", "DEV1-S", "fr-par-2", "ubuntu_noble", "#cc\n{}",
+                               dedicated_firewall=True), on_ip=lambda ip: None)
+    return created, s
+
+
+def test_a_policed_box_gets_its_own_bootstrap_permissive_group():
+    created, s = _created_with_firewall()
+    assert created.firewall_id == "sg-box"
+    sg = next(kw["json"] for m, path, kw in s.calls
+              if m == "POST" and path == f"{Z}/security_groups")
+    assert sg["name"] == "rixi-box-abc" and "rixi-box=abc" in sg["tags"]
+    assert sg["outbound_default_policy"] == "accept"           # bootstrap needs the internet
+    server = next(kw["json"] for m, path, kw in s.calls if m == "POST" and path == f"{Z}/servers")
+    assert server["security_group"] == "sg-box"
+    rules = next(kw["json"]["rules"] for m, path, kw in s.calls if m == "PUT")
+    assert {(r["direction"], r["dest_port_from"]) for r in rules} == {
+        ("inbound", 80), ("inbound", 443), ("inbound", 22),
+        ("outbound", 25), ("outbound", 465), ("outbound", 587)}
+
+
+def test_apply_firewall_replaces_rules_then_sets_defaults():
+    from rixi.policy import compile_rules, parse
+    routes = {
+        ("GET", f"{Z}/security_groups"): Resp(200, {"security_groups": [
+            {"id": "sg-box", "tags": ["rixi-managed", "rixi-box=abc"]}]}),
+        ("PUT", f"{Z}/security_groups/sg-box/rules"): Resp(200, {"rules": []}),
+        ("PATCH", f"{Z}/security_groups/sg-box"): Resp(200, {}),
+    }
+    p, s = _provider(routes)
+    compiled = compile_rules(parse({"egress": {"mode": "allowlist",
+                                               "allow": ["203.0.113.0/24", "198.51.100.7:8000-9000"]}}),
+                             own_ip="51.0.0.7", control_plane=["65.21.252.62"],
+                             resolvers=["51.159.47.28"])
+    p.apply_firewall("abc", "fr-par-2", compiled)
+    calls = [(m, path) for m, path, _ in s.calls]
+    assert calls.index(("PUT", f"{Z}/security_groups/sg-box/rules")) < \
+        calls.index(("PATCH", f"{Z}/security_groups/sg-box"))   # rules before the default drop
+    rules = next(kw["json"]["rules"] for m, path, kw in s.calls if m == "PUT")
+    assert [r["position"] for r in rules] == list(range(1, len(rules) + 1))
+    anyrule = next(r for r in rules if r["ip_range"] == "203.0.113.0/24")
+    assert anyrule["protocol"] == "ANY" and "dest_port_from" not in anyrule
+    ranged = next(r for r in rules if r["ip_range"] == "198.51.100.7/32")
+    assert (ranged["dest_port_from"], ranged["dest_port_to"]) == (8000, 9000)
+    defaults = next(kw["json"] for m, path, kw in s.calls if m == "PATCH")
+    assert defaults == {"inbound_default_policy": "drop", "outbound_default_policy": "drop"}
+
+
+def test_apply_firewall_without_a_group_is_an_error():
+    p, _ = _provider({("GET", f"{Z}/security_groups"): Resp(200, {"security_groups": []})})
+    from rixi.policy import NetworkPolicy, compile_rules
+    with pytest.raises(ProviderError, match="no firewall"):
+        p.apply_firewall("abc", "fr-par-2", compile_rules(NetworkPolicy(), own_ip=None))
 
 
 def test_dns_names_are_relative_to_zone_and_stay_inside_it():

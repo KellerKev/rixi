@@ -594,6 +594,90 @@ def test_api_returns_the_endpoint_url_and_key_once(gw=None):
                    headers=h("alice", "t-a")).status_code == 400
 
 
+# ── network policy ──────────────────────────────────────────────────────
+
+BLOCK = {"egress": {"mode": "block"}, "ingress": {"allow": ["192.0.2.0/24"]}}
+
+
+def test_a_policy_is_validated_at_claim_and_gets_a_firewall_of_its_own():
+    svc = _svc(control_plane=["65.21.252.62"])
+    with pytest.raises(Denied, match="not an IP"):
+        svc.claim(A, "cpu", policy={"egress": {"mode": "allowlist", "allow": ["example.com"]}})
+    plain = svc.claim(A, "cpu")
+    box = svc.claim(A, "cpu", policy=BLOCK)
+    _settle(svc)
+    assert svc.store.get(plain.id).firewall_id is None          # shares the zone-wide group
+    cur = svc.store.get(box.id)
+    assert cur.firewall_id == f"fw-{box.id}" and not cur.policy_applied
+    assert cur.public()["policy"]["egress"]["mode"] == "block"
+    assert "resolvers" not in cur.public()
+
+
+def test_a_policed_box_is_ready_only_after_its_policy_is_live():
+    svc = _svc(control_plane=["65.21.252.62"])
+    box = svc.claim(A, "cpu", policy=BLOCK)
+    _settle(svc)
+    secret = _secret_of(svc, box.id)
+    fw = svc.providers["dummy"].firewalls
+    # no resolvers known yet: blocking egress now would cut DNS, so it waits
+    assert svc.heartbeat(box.id, secret, 0, True)["state"] == "booting"
+    _settle(svc)
+    assert box.id not in fw and "resolvers" in svc.store.get(box.id).error
+    assert svc.heartbeat(box.id, secret, 0, True,
+                         resolvers=["51.159.47.28", "127.0.0.53"])["state"] == "booting"
+    _settle(svc)
+    compiled = fw[box.id]
+    assert compiled.outbound_default == "drop"
+    allowed = {(r.protocol, r.cidr, r.port_from) for r in compiled.rules
+               if r.direction == "outbound" and r.action == "accept"}
+    assert ("UDP", "51.159.47.28/32", 53) in allowed
+    assert ("TCP", "65.21.252.62/32", 443) in allowed
+    assert any(e == "box.policy_applied" for e, _ in svc.events)
+    assert svc.heartbeat(box.id, secret, 0, True)["state"] == "ready"
+
+
+def test_an_open_policy_needs_no_resolvers():
+    svc = _svc(control_plane=["65.21.252.62"])
+    box = svc.claim(A, "cpu", policy={"ingress": {"allow": ["192.0.2.0/24"]}})
+    _settle(svc)
+    secret = _secret_of(svc, box.id)
+    svc.heartbeat(box.id, secret, 0, True)
+    _settle(svc)
+    assert svc.heartbeat(box.id, secret, 0, True)["state"] == "ready"
+
+
+def test_a_provider_without_firewalls_refuses_a_policy():
+    prov = DummyProvider()
+    prov.supports_firewall = False
+    svc = _svc(provider=prov)
+    with pytest.raises(Denied, match="cannot enforce"):
+        svc.claim(A, "cpu", policy=BLOCK)
+    svc.claim(A, "cpu", policy={})                              # the default is fine
+
+
+def test_api_takes_a_policy_and_heartbeats_report_resolvers():
+    tc, svc, h = _api()
+    r = tc.post("/api/boxes", json={"template": "cpu", "policy": BLOCK},
+                headers=h("alice", "t-a"))
+    assert r.status_code == 202 and r.json()["policy"]["egress"]["mode"] == "block"
+    assert tc.post("/api/boxes", json={"template": "cpu", "policy": "block"},
+                   headers=h("alice", "t-a")).status_code == 400
+    assert tc.post("/api/boxes", json={"template": "cpu",
+                                       "policy": {"egress": {"mode": "nope"}}},
+                   headers=h("alice", "t-a")).status_code == 400
+    _settle(svc)
+    box_id = r.json()["id"]
+    secret = _secret_of(svc, box_id)
+    hb = {"Authorization": f"Bearer {secret}"}
+    assert tc.post("/gw/heartbeat", json={"box_id": box_id, "active_tasks": 0,
+                                          "resolvers": "1.1.1.1"},
+                   headers=hb).status_code == 400
+    assert tc.post("/gw/heartbeat", json={"box_id": box_id, "active_tasks": 0,
+                                          "resolvers": ["51.159.47.28"]},
+                   headers=hb).status_code == 200
+    assert json.loads(svc.store.get(box_id).resolvers) == ["51.159.47.28"]
+
+
 def test_an_upgrade_adds_columns_the_live_table_is_missing():
     """A release that adds a field must not query a column the database has never had."""
     import sqlite3

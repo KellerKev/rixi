@@ -8,6 +8,7 @@ one; every write commits immediately.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -53,6 +54,11 @@ class Box:
     model_ready: int = 0                    # the model has finished downloading
     requests_total: int = 0
     last_request: Optional[float] = None
+    # Network policy: enforced by the box's own cloud firewall once the box is ready.
+    policy: Optional[str] = None            # JSON; None = the open default
+    policy_applied: int = 0
+    firewall_id: Optional[str] = None
+    resolvers: Optional[str] = None         # JSON list the box reported (kept open for DNS)
 
     @property
     def live(self) -> bool:
@@ -66,13 +72,16 @@ class Box:
         d = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "hb_hash"}
         d["url"] = f"https://{self.hostname}"
         d["live"] = self.live
+        d["policy"] = json.loads(self.policy) if self.policy else None
+        d.pop("resolvers", None)
         return d
 
 
 _FIELDS = [f.name for f in fields(Box)]
 _DOUBLE = {"eur_per_hour", "created_at", "expires_at", "idle_timeout", "ready_at", "ended_at",
            "last_heartbeat", "last_busy", "last_request"}
-_INT = {"active_tasks", "model_ready", "requests_total"}
+_INT = {"active_tasks", "model_ready", "requests_total", "policy_applied"}
+_TEXT = {"policy", "resolvers"}
 
 
 def _col(name: str) -> str:
@@ -84,6 +93,8 @@ def _field(name: str) -> Field:
         return Field(name, "double")
     if name in _INT:
         return Field(name, "integer", default=0)
+    if name in _TEXT:
+        return Field(name, "text")
     if name == "id":
         return Field("box_id", "string", length=32, unique=True, notnull=True)
     return Field(name, "string", length=512 if name == "error" else 255)
@@ -139,7 +150,8 @@ class Store:
             if col in have:
                 continue
             kind = ("DOUBLE PRECISION" if name in _DOUBLE else
-                    "INTEGER DEFAULT 0" if name in _INT else "VARCHAR(255)")
+                    "INTEGER DEFAULT 0" if name in _INT else
+                    "TEXT" if name in _TEXT else "VARCHAR(255)")
             try:
                 self.db.executesql(f"ALTER TABLE rixi_box ADD COLUMN {col} {kind}")
                 self.db.commit()
