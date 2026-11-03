@@ -80,6 +80,9 @@ TOOLS: List[dict] = [
          "volumes": {"type": "array", "items": {"type": "string"},
                      "description": "eutonomous: volume ids to attach, mounted at "
                                     "/workspace/data/<name>"},
+         "require": {"type": "object", "description": "eutonomous, instead of size: the "
+                     "cheapest box with at least {vcpu, ram_gb, gpu_ram_gb} and/or a gpu model "
+                     "(\"L4\", \"L40S\", \"any\")"},
          "on_idle": {"type": "string", "enum": ["release", "stop"],
                      "description": "eutonomous: when idle, shut down (default) or stop and "
                                     "keep the disk"}}}},
@@ -204,6 +207,8 @@ class Tools:
                 kw["volumes"] = [str(v) for v in a["volumes"]]
             if a.get("on_idle"):
                 kw["on_idle"] = _str(a, "on_idle")
+            if isinstance(a.get("require"), dict) and a["require"]:
+                kw["require"] = a["require"]
         up = self._up or up_mod.up
         kw["creds"] = up_mod.resolve_credentials(provider, {})
         try:

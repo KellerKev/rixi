@@ -16,4 +16,4 @@ from .client import Client, ExecResult, RixiError, RunResult
 from .sandbox import Sandbox
 
 __all__ = ["Client", "ExecResult", "RixiError", "RunResult", "Sandbox", "__version__"]
-__version__ = "0.10.0"
+__version__ = "0.11.0"

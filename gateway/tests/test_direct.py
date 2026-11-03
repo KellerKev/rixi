@@ -941,3 +941,55 @@ def test_api_volumes_and_stop_start(gw=None):
     assert tc.post(f"/api/boxes/{box_id}/stop", headers=h("bob", "t-b")).status_code == 404
     usage = tc.get("/api/usage", headers=h("alice", "t-a")).json()
     assert usage["volumes"][0]["volume"] == vid and "stopped_minutes" in usage["usage"][0]
+
+
+# ── choosing a box by what it has ───────────────────────────────────────
+
+def _spec_svc():
+    conf = _conf()
+    conf["template"] = {
+        "small": {"provider": "dummy", "type": "S", "zones": ["fr-par-2"], "eur_per_hour": 0.02,
+                  "vcpu": 3, "ram_gb": 4},
+        "big": {"provider": "dummy", "type": "B", "zones": ["fr-par-2"], "eur_per_hour": 0.22,
+                "vcpu": 8, "ram_gb": 32},
+        "l4": {"provider": "dummy", "type": "L4", "zones": ["fr-par-2"], "eur_per_hour": 0.80,
+               "vcpu": 8, "ram_gb": 48, "gpu": "L4", "gpu_ram_gb": 24},
+        "l40s": {"provider": "dummy", "type": "L40S", "zones": ["fr-par-2", "pl-waw-2"],
+                 "eur_per_hour": 1.47, "vcpu": 8, "ram_gb": 96, "gpu": "L40S", "gpu_ram_gb": 48},
+    }
+    conf["direct"]["limits"]["max_eur_per_hour"] = 10.0
+    svc = _svc()
+    svc.cfg = parse(conf)
+    return svc
+
+
+@pytest.mark.parametrize("require,expect", [
+    ({"ram_gb": 8}, "big"),
+    ({"vcpu": 2}, "small"),
+    ({"gpu": "any"}, "l4"),
+    ({"gpu_ram_gb": 40}, "l40s"),
+    ({"gpu": "l40s"}, "l40s"),
+    ({"ram_gb": 40, "zone": "pl-waw-2"}, "l40s"),
+])
+def test_the_cheapest_box_that_has_what_you_need(require, expect):
+    assert _spec_svc().match(require).name == expect
+
+
+def test_matching_respects_the_allowed_list_and_says_when_nothing_fits():
+    svc = _spec_svc()
+    assert svc.match({"ram_gb": 8}, among=["small", "l4"]).name == "l4"
+    with pytest.raises(Denied, match="no box type"):
+        svc.match({"gpu": "any"}, among=["small", "big"])
+    with pytest.raises(Denied, match="unknown keys"):
+        svc.match({"cores": 4})
+    with pytest.raises(Denied, match="must be a number"):
+        svc.match({"ram_gb": "lots"})
+
+
+def test_a_claim_can_say_what_it_needs_instead_of_a_template():
+    svc = _spec_svc()
+    box = svc.claim(A, None, require={"gpu_ram_gb": 20})
+    assert box.template == "l4"
+    with pytest.raises(Denied, match="name a template"):
+        svc.claim(A, None)
+    assert {t["name"]: t.get("gpu_ram_gb") for t in svc.templates()}["l40s"] == 48

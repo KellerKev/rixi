@@ -26,7 +26,7 @@ environment you tested, with nothing to reproduce and no inbound ports to open.
 
 ```bash
 # Not on PyPI yet — install the pinned release straight from git:
-pip install "git+https://github.com/KellerKev/rixi@v0.10.0"
+pip install "git+https://github.com/KellerKev/rixi@v0.11.0"
 ```
 
 ```python
@@ -117,6 +117,10 @@ rixi restart <id> · rixi redeploy <id> . · rixi kill <id> · rixi logs <id>
 The same from Python: `Client.start()`, `spawn()`, `tasks()`, `attach()`, `send_input()`,
 `restart()`, `redeploy()`, `kill()`, `output()` — and on a sandbox, `sb.spawn()` /
 `sb.follow(id)`. Requires rixi 0.7.0+.
+
+**Say what you need.** Instead of a size, `rixi up --provider eutonomous --gpu-ram 40` (or `--ram`,
+`--vcpu`, `--gpu L4|L40S|any`) gets the cheapest box that has it among the types your account
+may use; the gateway's `require` does the same for self-hosters. Requires rixi 0.11.0+.
 
 **Keep your work: volumes and stop/start (hosted).** `rixi volumes create data --size 50` makes
 a disk that outlives boxes; `rixi up --provider eutonomous --volume <id>` mounts it at
@@ -210,7 +214,7 @@ DAG orchestrator; pair it with your scheduler of choice.
 
 ## See it work
 
-Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.10.0"` — not on PyPI yet).
+Real command sequences. Simple runs use the lightweight **`rixi`** CLI (`pip install "git+https://github.com/KellerKev/rixi@v0.11.0"` — not on PyPI yet).
 Advanced lifecycle features — offline bundling, attach-history, the interactive redeploy menu —
 use the **full client** in [`clients/`](clients/), shown here as `rixi-client`:
 
@@ -440,7 +444,7 @@ to it:
 cd server && pixi install && pixi run python rixi_server.py --port 9000
 
 # terminal 2 — ship examples/hello to it
-pip install "git+https://github.com/KellerKev/rixi@v0.10.0"   # not on PyPI yet
+pip install "git+https://github.com/KellerKev/rixi@v0.11.0"   # not on PyPI yet
 rixi run --server http://127.0.0.1:9000 --task hello examples/hello
 ```
 

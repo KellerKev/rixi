@@ -64,6 +64,11 @@ class Template:
     image: str
     root_volume_gb: Optional[int] = None
     eur_per_hour: Optional[float] = None   # overrides offerings.toml when set
+    # What the machine has (overrides offerings.toml), for "the cheapest box with at least …"
+    vcpu: Optional[int] = None
+    ram_gb: Optional[float] = None
+    gpu: Optional[str] = None
+    gpu_ram_gb: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -175,7 +180,10 @@ def parse(data: dict) -> DirectConfig:
             name=name, provider=str(body["provider"]), instance_type=str(body["type"]),
             zones=zones, image=str(body.get("image", "ubuntu_noble")),
             root_volume_gb=int(body["root_volume_gb"]) if body.get("root_volume_gb") else None,
-            eur_per_hour=_opt_float(body.get("eur_per_hour")))
+            eur_per_hour=_opt_float(body.get("eur_per_hour")),
+            vcpu=int(body["vcpu"]) if body.get("vcpu") else None,
+            ram_gb=_opt_float(body.get("ram_gb")), gpu=body.get("gpu") or None,
+            gpu_ram_gb=_opt_float(body.get("gpu_ram_gb")))
     if not templates:
         raise ConfigError("no [template.<name>] tables")
 

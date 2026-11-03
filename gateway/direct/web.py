@@ -152,11 +152,18 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         volumes = body.get("volumes") or []
         if not isinstance(volumes, list) or not all(isinstance(v, str) for v in volumes):
             raise json_error(400, "volumes must be a list of volume ids")
-        box = await _call(svc.claim, ctx.caller, _str(body, "template", required=True),
+        require, among = body.get("require"), body.get("among")
+        if require is not None and not isinstance(require, dict):
+            raise json_error(400, "require must be an object, e.g. {\"gpu_ram_gb\": 40}")
+        if among is not None and not (isinstance(among, list)
+                                      and all(isinstance(n, str) for n in among)):
+            raise json_error(400, "among must be a list of template names")
+        box = await _call(svc.claim, ctx.caller, _str(body, "template"),
                           zone=_str(body, "zone"), ttl=_num(body, "ttl"),
                           idle_timeout=_num(body, "idle_timeout", default=-1, allow_null=True),
                           ssh_key=_str(body, "ssh_key"), serve=serve, policy=policy, llm=llm,
-                          volumes=volumes, on_idle=_str(body, "on_idle") or "release")
+                          volumes=volumes, on_idle=_str(body, "on_idle") or "release",
+                          require=require, among=among)
         out = box.public(svc.clock())
         key = getattr(box, "endpoint_key", None)
         if key:

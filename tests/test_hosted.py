@@ -194,3 +194,18 @@ def test_cli_volumes(monkeypatch, capsys):
     assert "v1  data  50 GB" in capsys.readouterr().out
     assert _cli.main(["volumes"]) == 0 and "data" in capsys.readouterr().out
     assert _cli.main(["volumes", "rm", "v1"]) == 0 and api.vols == {}
+
+
+def test_a_box_by_need_lets_the_service_choose():
+    api = FakeApi()
+    _up(api, require={"gpu_ram_gb": 40})
+    assert api.launched[0] == {"require": {"gpu_ram_gb": 40}}       # no template named
+
+
+def test_cli_need_flags(monkeypatch):
+    from rixi import _cli
+    seen = {}
+    monkeypatch.setattr(up_mod, "up", lambda **kw: seen.update(kw) or (_ for _ in ()).throw(
+        up_mod.UpError("stop here")))
+    _cli.main(["up", "--provider", "eutonomous", "--gpu", "any", "--gpu-ram", "40"])
+    assert seen["require"] == {"gpu": "any", "gpu_ram_gb": 40.0}

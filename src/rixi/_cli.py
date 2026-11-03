@@ -183,6 +183,12 @@ def main(argv=None) -> int:
                          "/workspace/data/<name>; repeatable")
     up.add_argument("--on-idle", choices=["release", "stop"],
                     help="eutonomous: when idle, shut down (default) or stop and keep the disk")
+    need = up.add_argument_group("eutonomous: say what you need instead of --size "
+                                 "(the cheapest box that has it)")
+    need.add_argument("--vcpu", type=int, help="at least this many vCPUs")
+    need.add_argument("--ram", type=float, metavar="GB", help="at least this much RAM")
+    need.add_argument("--gpu", metavar="MODEL", help="a GPU: L4, L40S, … or any")
+    need.add_argument("--gpu-ram", type=float, metavar="GB", help="at least this much GPU memory")
     up.add_argument("--ttl", type=float,
                     help="eutonomous: hours until the box shuts itself down (service default)")
     up.add_argument("--name", help="profile/box name (default: <provider>-<size>)")
@@ -296,6 +302,9 @@ def _cloud(args) -> int:
                 instance_type=args.instance_type, region=args.region,
                 allow_from=args.allow_from, policy=policy, ttl_hours=args.ttl,
                 model_access=model_access, volumes=args.volume or None,
+                require={k: v for k, v in (("vcpu", args.vcpu), ("ram_gb", args.ram),
+                                           ("gpu", args.gpu), ("gpu_ram_gb", args.gpu_ram))
+                         if v is not None} or None,
                 on_idle=args.on_idle,
                 ssh_key=None if args.ssh_key == "none" else args.ssh_key,
                 rixi_ref=args.rixi_ref, save_creds=args.save_credentials,

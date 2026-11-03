@@ -124,11 +124,17 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
        instance_type: Optional[str] = None, region: Optional[str] = None,
        policy: Optional[netpolicy.NetworkPolicy] = None, ttl_hours: Optional[float] = None,
        model_access=None, volumes: Optional[list] = None, on_idle: Optional[str] = None,
+       require: Optional[dict] = None,
        make_default: bool = True, wait_timeout: float = 900.0, echo: Echo = print,
        _api: Optional[Api] = None, _sleep=time.sleep) -> Profile:
     api = _api or Api(creds.get("api_key"), creds.get("api_url"))
-    t = _template(api, size, instance_type)
-    body: dict = {"template": t["name"]}
+    if require:
+        # The service picks the cheapest box that has it, among the ones this account may use.
+        t = {"name": "by need", "eur_per_hour": None}
+        body: dict = {"require": dict(require)}
+    else:
+        t = _template(api, size, instance_type)
+        body = {"template": t["name"]}
     if region:
         body["zone"] = region
     if ttl_hours:
@@ -147,6 +153,9 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
     price = f" (€{t['eur_per_hour']}/h)" if t.get("eur_per_hour") else ""
     echo(f"▶ launching a {t['name']} box on eutonomous{price}")
     box = api.launch(body)
+    if require:
+        echo(f"  → {box.get('template')} ({box['instance_type']}, "
+             f"€{box.get('eur_per_hour')}/h) meets {require}")
     if box.get("model_access") and box["model_access"] != "none":
         echo(f"  model access: {box['model_access']} (OPENAI_BASE_URL is set on the box)")
     profile = Profile(name=name, provider="eutonomous", server_url=box["url"], ip="",

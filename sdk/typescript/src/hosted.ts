@@ -24,6 +24,8 @@ export interface LaunchOptions {
   volumes?: string[];
   /** when idle: "release" (default) or "stop" and keep the disk */
   onIdle?: "release" | "stop";
+  /** instead of size: the cheapest box with at least this */
+  require?: { vcpu?: number; ram_gb?: number; gpu?: string; gpu_ram_gb?: number; zone?: string };
 }
 
 export interface Box {
@@ -90,7 +92,8 @@ export class Eutonomous {
   deleteVolume(id: string) { return this.call<Volume>("DELETE", `/api/volumes/${id}`); }
 
   async launch(opts: LaunchOptions = {}): Promise<Box> {
-    const body: Record<string, unknown> = { template: opts.size ?? "cpu-s" };
+    const body: Record<string, unknown> = opts.require && !opts.size
+      ? { require: opts.require } : { template: opts.size ?? "cpu-s" };
     if (opts.zone) body.zone = opts.zone;
     if (opts.ttlHours) body.ttl = Math.round(opts.ttlHours * 3600);
     if (opts.policy) body.policy = opts.policy;

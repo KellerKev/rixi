@@ -115,6 +115,15 @@ class DirectService:
             return box_id in self._inflight
 
     # -- claim ------------------------------------------------------------
+    def specs(self, t: Template) -> dict:
+        """What a template's machine has: its own settings, else the offerings catalog."""
+        off = offerings.lookup(t.provider, t.instance_type) or {}
+        out = {k: off[k] for k in ("vcpu", "ram_gb", "gpu", "gpu_count", "gpu_ram_gb") if k in off}
+        for k in ("vcpu", "ram_gb", "gpu", "gpu_ram_gb"):
+            if getattr(t, k) is not None:
+                out[k] = getattr(t, k)
+        return out
+
     def templates(self) -> List[dict]:
         out = []
         for t in self.cfg.templates.values():
@@ -122,12 +131,51 @@ class DirectService:
                 rate = self.rate(t)
             except Denied:
                 rate = None
-            off = offerings.lookup(t.provider, t.instance_type) or {}
             out.append({"name": t.name, "provider": t.provider, "instance_type": t.instance_type,
-                        "zones": list(t.zones), "eur_per_hour": rate,
-                        **{k: off[k] for k in ("vcpu", "ram_gb", "gpu", "gpu_count", "gpu_ram_gb")
-                           if k in off}})
+                        "zones": list(t.zones), "eur_per_hour": rate, **self.specs(t)})
         return out
+
+    REQUIRE_KEYS = ("vcpu", "ram_gb", "gpu", "gpu_ram_gb", "zone")
+
+    def match(self, require: dict, among: Optional[List[str]] = None) -> Template:
+        """The cheapest template with at least what `require` asks for: vcpu, ram_gb,
+        gpu_ram_gb (minimums), gpu (a model such as "L4", or "any"), zone. `among` limits the
+        choice to those template names (e.g. the ones a tenant may use)."""
+        if not isinstance(require, dict) or not require:
+            raise Denied("require must name at least one of " + ", ".join(self.REQUIRE_KEYS), 400)
+        unknown = set(require) - set(self.REQUIRE_KEYS)
+        if unknown:
+            raise Denied(f"require: unknown keys {sorted(unknown)}", 400)
+        best = None
+        for t in self.cfg.templates.values():
+            if among is not None and t.name not in among:
+                continue
+            spec = self.specs(t)
+            ok = True
+            for k in ("vcpu", "ram_gb", "gpu_ram_gb"):
+                if require.get(k) is not None:
+                    try:
+                        ok &= float(spec.get(k) or 0) >= float(require[k])
+                    except (TypeError, ValueError):
+                        raise Denied(f"require.{k} must be a number", 400)
+            want_gpu = require.get("gpu")
+            if want_gpu:
+                have = str(spec.get("gpu") or "")
+                ok &= bool(have) and (str(want_gpu).lower() == "any" or
+                                      have.lower() == str(want_gpu).lower())
+            if require.get("zone"):
+                ok &= require["zone"] in t.zones
+            if not ok:
+                continue
+            try:
+                rate = self.rate(t)
+            except Denied:
+                continue
+            if best is None or rate < best[0]:
+                best = (rate, t)
+        if best is None:
+            raise Denied(f"no box type meets {require}", 404)
+        return best[1]
 
     SERVE_KINDS = ("ollama",)
 
@@ -135,13 +183,20 @@ class DirectService:
               ttl: Optional[float] = None, idle_timeout: Optional[float] = -1,
               ssh_key: Optional[str] = None, serve: Optional[dict] = None,
               policy: Optional[dict] = None, llm: Optional[dict] = None,
-              volumes: Optional[List[str]] = None, on_idle: str = "release") -> Box:
+              volumes: Optional[List[str]] = None, on_idle: str = "release",
+              require: Optional[dict] = None, among: Optional[List[str]] = None) -> Box:
         tenant = caller.tenant
         if not tenant or not _TENANT.match(tenant):
             raise Denied("token carries no usable tenant claim", 403)
-        t = self.cfg.templates.get(template)
-        if t is None:
-            raise Denied(f"unknown template {template!r}", 404)
+        if not template:
+            if require is None:
+                raise Denied("name a template, or say what you need (require)", 400)
+            t = self.match(require, among)
+            zone = zone or require.get("zone")
+        else:
+            t = self.cfg.templates.get(template)
+            if t is None:
+                raise Denied(f"unknown template {template!r}", 404)
         if on_idle not in ("release", "stop"):
             raise Denied("on_idle must be release or stop", 400)
         vols = self._claimable_volumes(caller, volumes or [])
