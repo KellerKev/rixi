@@ -68,6 +68,7 @@ class HetznerProvider:
     """
 
     name = "hetzner"
+    supports_policy = True
     API = "https://api.hetzner.cloud/v1"
     IMAGE = "ubuntu-24.04"
 
@@ -147,6 +148,29 @@ class HetznerProvider:
                 raise ProviderError("hetzner: SSH key exists but could not be found")
             page += 1
 
+    def apply_firewall(self, name: str, region: Optional[str], compiled) -> None:
+        """Replace the box firewall's rules. Hetzner rules only allow: no outbound rule at all
+        means everything may leave, and once one exists, everything not listed is dropped."""
+        fws = self._labeled("firewalls", name)
+        if not fws:
+            raise ProviderError(f"hetzner: box {name!r} has no firewall")
+        rules = []
+        for r in compiled.rules:
+            if r.action != "accept" or (r.direction == "outbound"
+                                        and compiled.outbound_default == "accept"):
+                continue
+            protos = ("tcp", "udp", "icmp") if r.protocol == "ANY" else (r.protocol.lower(),)
+            for proto in protos:
+                rule = {"direction": "in" if r.direction == "inbound" else "out",
+                        "protocol": proto, "description": "rixi policy",
+                        ("source_ips" if r.direction == "inbound" else "destination_ips"):
+                            [r.cidr]}
+                if proto != "icmp":
+                    lo, hi = r.port_from or 1, r.port_to or r.port_from or 65535
+                    rule["port"] = str(lo) if lo == hi else f"{lo}-{hi}"
+                rules.append(rule)
+        self._call("POST", f"/firewalls/{fws[0]['id']}/actions/set_rules", json={"rules": rules})
+
     def destroy(self, name: str, region: Optional[str] = None) -> None:
         for srv in self._labeled("servers", name):
             self._call("DELETE", f"/servers/{srv['id']}", ok=(200, 202, 204, 404))
@@ -193,6 +217,7 @@ class ScalewayProvider:
     """
 
     name = "scaleway"
+    supports_policy = True
     API = "https://api.scaleway.com"
     ZONES = ("fr-par-1", "fr-par-2", "fr-par-3", "nl-ams-1", "nl-ams-2", "pl-waw-1")
     CPU_IMAGE = "ubuntu_noble"
@@ -261,6 +286,29 @@ class ScalewayProvider:
                 "protocol": "TCP", "direction": direction, "action": action,
                 "ip_range": cidr, "dest_port_from": port})
         return sg
+
+    def apply_firewall(self, name: str, region: Optional[str], compiled) -> None:
+        """Replace every rule of the box's security group, then set its default policies."""
+        z = self._inst(region)
+        groups = [g for g in self._call("GET", f"{z}/security_groups", params={
+            "name": f"rixi-{name}", "project": self.project_id}).get("security_groups", [])
+            if g.get("name") == f"rixi-{name}"]
+        if not groups:
+            raise ProviderError(f"scaleway: box {name!r} has no security group in {region}")
+        rules = []
+        for i, r in enumerate(compiled.rules, start=1):
+            rule = {"protocol": r.protocol, "direction": r.direction, "action": r.action,
+                    "ip_range": r.cidr, "position": i, "editable": True}
+            if r.protocol != "ANY" and r.port_from is not None:
+                rule["dest_port_from"] = r.port_from
+                if r.port_to is not None and r.port_to != r.port_from:
+                    rule["dest_port_to"] = r.port_to
+            rules.append(rule)
+        sg = groups[0]["id"]
+        self._call("PUT", f"{z}/security_groups/{sg}/rules", json={"rules": rules})
+        self._call("PATCH", f"{z}/security_groups/{sg}", json={
+            "inbound_default_policy": compiled.inbound_default,
+            "outbound_default_policy": compiled.outbound_default})
 
     def create(self, spec: BoxSpec, region: str) -> BoxInfo:
         zone, z, tags = region, self._inst(region), self._tags(spec.name)
@@ -354,6 +402,7 @@ class AwsProvider:
     """
 
     name = "aws"
+    supports_policy = True
     _CPU_AMI = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
     _GPU_AMI = ("/aws/service/deeplearning/ami/x86_64/"
                 "base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id")
@@ -421,6 +470,42 @@ class AwsProvider:
                                spec.instance_type)
             time.sleep(self.poll_interval)
         raise ProviderError(f"aws: instance {iid} got no public IP in time")
+
+    def apply_firewall(self, name: str, region: Optional[str], compiled) -> None:
+        """Replace the box group's rules. Security groups only allow: outbound mail is already
+        blocked by AWS, and dropping everything else means removing the default allow-all."""
+        ec2 = self._ec2(region)
+        groups = ec2.describe_security_groups(Filters=[
+            {"Name": "tag:rixi-box", "Values": [name]},
+            {"Name": "tag:managed-by", "Values": [MANAGED_BY]}])["SecurityGroups"]
+        if not groups:
+            raise ProviderError(f"aws: box {name!r} has no security group in {region}")
+        sg = groups[0]
+
+        def perms(direction):
+            out = []
+            for r in compiled.rules:
+                if r.direction != direction or r.action != "accept":
+                    continue
+                if r.protocol == "ANY":
+                    out.append({"IpProtocol": "-1", "IpRanges": [{"CidrIp": r.cidr}]})
+                else:
+                    out.append({"IpProtocol": r.protocol.lower(), "FromPort": r.port_from,
+                                "ToPort": r.port_to or r.port_from,
+                                "IpRanges": [{"CidrIp": r.cidr}]})
+            return out
+
+        if sg.get("IpPermissions"):
+            ec2.revoke_security_group_ingress(GroupId=sg["GroupId"],
+                                              IpPermissions=sg["IpPermissions"])
+        ec2.authorize_security_group_ingress(GroupId=sg["GroupId"], IpPermissions=perms("inbound"))
+        if compiled.outbound_default == "drop":
+            if sg.get("IpPermissionsEgress"):
+                ec2.revoke_security_group_egress(GroupId=sg["GroupId"],
+                                                 IpPermissions=sg["IpPermissionsEgress"])
+            egress = perms("outbound")
+            if egress:
+                ec2.authorize_security_group_egress(GroupId=sg["GroupId"], IpPermissions=egress)
 
     def destroy(self, name: str, region: Optional[str] = None) -> None:
         if not region:

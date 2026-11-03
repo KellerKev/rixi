@@ -70,6 +70,14 @@ AES-256-GCM-sealed under a key negotiated over RSA right after boot. Credentials
 the provider's usual env vars (`HCLOUD_TOKEN`, `SCW_SECRET_KEY` + `SCW_DEFAULT_PROJECT_ID`, …); see
 `rixi up --help`. Requires rixi 0.2.8+.
 
+**Seal it.** `--egress block` (or `--egress allowlist --egress-allow 203.0.113.0/24,198.51.100.7:443`)
+closes the box down once it is ready, in its own cloud firewall — outside the box, where nothing
+running on it as root can undo it. DNS to the box's resolvers stays open; `--allow-from` limits who
+may connect. Ship environments as offline bundles when egress is blocked. Requires rixi 0.3.0+.
+
+Agents can drive a box command by command: `rixi exec "pytest -q"`, `rixi put`, `rixi get`,
+`rixi ls` (or `Client.exec()` / `write_file()` / `read_file()` in the SDK), confined to `/workspace`.
+
 `rixi run`, `rixi stream`, and the Python SDK work with these boxes directly (and so does any example
 that uses them — drop `--server` and the profile is used). The full client's interactive lifecycle
 features and serving through the proxy use a server you start yourself or one from

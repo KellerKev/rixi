@@ -404,3 +404,126 @@ def test_aws_create_tags_and_security_group():
     tags = {t["Key"]: t["Value"] for t in run["TagSpecifications"][0]["Tags"]}
     assert tags["managed-by"] == "rixi" and tags["rixi-box"] == "box1"
     assert run["ImageId"] == "ami-123" and run["SecurityGroupIds"] == ["sg-1"]
+
+
+# ── network policy ───────────────────────────────────────────────────────────
+
+class PolicyCloud(FakeCloud):
+    supports_policy = True
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.applied = []
+
+    def apply_firewall(self, name, region, compiled):
+        self.applied.append((name, region, compiled))
+
+
+class PolicyClient(FakeClient):
+    def __init__(self, resolv="nameserver 127.0.0.53\n", upstream="nameserver 10.1.0.2\n"):
+        super().__init__()
+        self.files = {"/etc/resolv.conf": resolv, "/run/systemd/resolve/resolv.conf": upstream}
+
+    def exec(self, cmd, timeout=None):
+        from rixi import ExecResult
+        text = self.files.get(cmd[-1])
+        return ExecResult(exit_code=0 if text else 1, status="completed", stdout=text or "",
+                          stderr="", duration_s=0.0)
+
+
+def test_up_seals_the_box_before_handing_it_over(monkeypatch):
+    cloud = PolicyCloud()
+    profile, msgs = _up(monkeypatch, cloud, PolicyClient(), allow_from="192.0.2.0/24",
+                        policy={"egress": {"mode": "allowlist", "allow": ["203.0.113.0/24:443"]}})
+    (name, region, compiled), = cloud.applied
+    assert name == "box1" and compiled.outbound_default == "drop"
+    out = {(r.action, r.protocol, r.cidr, r.port_from) for r in compiled.rules
+           if r.direction == "outbound"}
+    assert ("accept", "UDP", "10.1.0.2/32", 53) in out              # DNS from the upstream file
+    assert ("accept", "TCP", "203.0.113.0/24", 443) in out
+    inbound = {(r.cidr, r.port_from) for r in compiled.rules if r.direction == "inbound"}
+    assert inbound == {("192.0.2.0/24", 9000), ("192.0.2.0/24", 22)}   # no port 80
+    saved = ProfileStore().get("box1")
+    assert saved.status == "ready" and saved.policy["egress"]["mode"] == "allowlist"
+
+
+def test_up_refuses_a_bad_policy_before_creating_anything(monkeypatch):
+    cloud = PolicyCloud()
+    with pytest.raises(up_mod.UpError, match="policy"):
+        _up(monkeypatch, cloud, PolicyClient(), policy={"egress": {"mode": "sometimes"}})
+    plain = FakeCloud()
+    with pytest.raises(up_mod.UpError, match="cannot enforce"):
+        _up(monkeypatch, plain, PolicyClient(), policy={"egress": {"mode": "block"}})
+    assert cloud.created == [] and plain.created == []
+
+
+def test_up_destroys_the_box_when_resolvers_cannot_be_found(monkeypatch):
+    cloud = PolicyCloud()
+    with pytest.raises(up_mod.UpError, match="resolvers"):
+        _up(monkeypatch, cloud, PolicyClient(upstream=""), policy={"egress": {"mode": "block"}})
+    assert cloud.destroyed and cloud.applied == []
+
+
+def _compiled(mode="block", allow=()):
+    from rixi.policy import compile_rules, parse
+    doc = {"egress": {"mode": mode}}
+    if allow:
+        doc["egress"]["allow"] = list(allow)
+    return compile_rules(parse(doc), own_ip=None, resolvers=["10.1.0.2"],
+                         api_ports=(9000, 22), cert_port=None)
+
+
+def test_hetzner_policy_lists_only_allowed_traffic():
+    s = FakeSession({
+        ("GET", "/firewalls"): FakeResp(200, {"firewalls": [{"id": 7}], "meta": {}}),
+        ("POST", "/firewalls/7/actions/set_rules"): FakeResp(201, {"actions": []}),
+    })
+    HetznerProvider("tok", session=s).apply_firewall(
+        "box1", "nbg1", _compiled("allowlist", ["203.0.113.0/24", "198.51.100.7:8000-9000"]))
+    rules = next(kw["json"]["rules"] for m, url, kw in s.calls if url.endswith("set_rules"))
+    outs = {(r["protocol"], r["destination_ips"][0], r.get("port")) for r in rules
+            if r["direction"] == "out"}
+    assert ("udp", "10.1.0.2/32", "53") in outs
+    assert {("tcp", "203.0.113.0/24", "1-65535"), ("udp", "203.0.113.0/24", "1-65535"),
+            ("icmp", "203.0.113.0/24", None)} <= outs
+    assert ("tcp", "198.51.100.7/32", "8000-9000") in outs
+    assert not any(r["direction"] == "out" and r.get("port") == "25" for r in rules)  # no drops
+
+
+def test_hetzner_open_egress_adds_no_outbound_rules():
+    s = FakeSession({
+        ("GET", "/firewalls"): FakeResp(200, {"firewalls": [{"id": 7}], "meta": {}}),
+        ("POST", "/firewalls/7/actions/set_rules"): FakeResp(201, {"actions": []}),
+    })
+    HetznerProvider("tok", session=s).apply_firewall("box1", "nbg1", _compiled("open"))
+    rules = next(kw["json"]["rules"] for m, url, kw in s.calls if url.endswith("set_rules"))
+    assert rules and all(r["direction"] == "in" for r in rules)   # no "out" rule = all allowed
+
+
+def test_scaleway_policy_replaces_rules_then_defaults():
+    z = "/instance/v1/zones/fr-par-2"
+    s = FakeSession({
+        ("GET", f"{z}/security_groups"): FakeResp(200, {"security_groups": [
+            {"id": "sg-1", "name": "rixi-box1"}]}),
+        ("PUT", f"{z}/security_groups/sg-1/rules"): FakeResp(200, {"rules": []}),
+        ("PATCH", f"{z}/security_groups/sg-1"): FakeResp(200, {}),
+    })
+    ScalewayProvider("k", "proj", session=s).apply_firewall("box1", "fr-par-2", _compiled())
+    methods = [m for m, url, kw in s.calls]
+    assert methods.index("PUT") < methods.index("PATCH")
+    patch = next(kw["json"] for m, url, kw in s.calls if m == "PATCH")
+    assert patch["outbound_default_policy"] == "drop"
+
+
+def test_aws_policy_swaps_the_default_egress_for_the_allowed_list():
+    boto = _FakeBoto()
+    boto.ec2.describe_security_groups = lambda **kw: {"SecurityGroups": [{
+        "GroupId": "sg-1", "IpPermissions": [{"IpProtocol": "tcp"}],
+        "IpPermissionsEgress": [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]}]}
+    AwsProvider(session=boto).apply_firewall("box1", "eu-central-1",
+                                             _compiled("allowlist", ["203.0.113.0/24"]))
+    names = [n for n, _ in boto.ec2.calls]
+    assert names == ["revoke_security_group_ingress", "authorize_security_group_ingress",
+                     "revoke_security_group_egress", "authorize_security_group_egress"]
+    egress = boto.ec2.calls[-1][1]["IpPermissions"]
+    assert {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "203.0.113.0/24"}]} in egress

@@ -17,7 +17,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -63,6 +63,7 @@ class Profile:
     created_at: float
     status: str = "provisioning"          # provisioning → ready
     eur_per_hour: Optional[float] = None
+    policy: Optional[dict] = None             # the network policy in force, if any
 
     # ── key material ───────────────────────────────────────────────────────
     @property
@@ -130,7 +131,8 @@ class ProfileStore:
         rec = self._load()["profiles"].get(name)
         if rec is None:
             raise ProfileError(f"no profile named {name!r} (see `rixi profiles`)")
-        return Profile(**rec)
+        known = {f.name for f in fields(Profile)}
+        return Profile(**{k: v for k, v in rec.items() if k in known})   # tolerate newer files
 
     def exists(self, name: str) -> bool:
         return name in self._load()["profiles"]

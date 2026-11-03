@@ -151,17 +151,30 @@ def _hosts(addresses: Iterable[str]) -> List[str]:
     return list(dict.fromkeys(out))
 
 
+def resolvers_from(resolv_conf: str) -> List[str]:
+    """Upstream DNS servers named in a resolv.conf (a loopback stub is not one)."""
+    found = []
+    for line in resolv_conf.splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[0] == "nameserver":
+            found.append(parts[1])
+    return [h[:-3] for h in _hosts(found)][:4]
+
+
 def compile_rules(policy: NetworkPolicy, *, own_ip: Optional[str],
                   control_plane: Iterable[str] = (), resolvers: Iterable[str] = (),
-                  api_ports: Tuple[int, ...] = (443, 22)) -> Compiled:
+                  api_ports: Tuple[int, ...] = (443, 22),
+                  cert_port: Optional[int] = 80) -> Compiled:
     """Turn a policy into firewall rules for one box.
 
     `control_plane` and `resolvers` are addresses the box must keep reaching; `own_ip` is the
     box's public address (its TLS self-check goes out and comes back through the firewall).
+    `cert_port` stays open to anyone for certificate challenges (None: the box has no certificate).
     """
     rules: List[Rule] = []
     # inbound: certificate challenges always; the API and SSH from the allowlist (or anyone)
-    rules.append(Rule("inbound", "accept", "TCP", "0.0.0.0/0", 80, 80))
+    if cert_port:
+        rules.append(Rule("inbound", "accept", "TCP", "0.0.0.0/0", cert_port, cert_port))
     sources = list(policy.ingress_allow) or ["0.0.0.0/0"]
     if policy.ingress_allow and own_ip:
         sources += _hosts([own_ip])

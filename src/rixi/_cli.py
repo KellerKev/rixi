@@ -124,6 +124,12 @@ def main(argv=None) -> int:
     up.add_argument("--allow-from", default="0.0.0.0/0",
                     help="CIDRs allowed to reach the box (comma-separated), or 'auto' for this "
                          "machine's public IP (default: 0.0.0.0/0)")
+    up.add_argument("--egress", choices=["open", "allowlist", "block"], default="open",
+                    help="what the box may reach once it is ready, enforced by its cloud firewall "
+                         "(default: open). DNS always stays reachable")
+    up.add_argument("--egress-allow", default="",
+                    help="with --egress allowlist: destinations, comma-separated "
+                         "(IP or CIDR, optional :port or :from-to)")
     up.add_argument("--ssh-key", default="auto",
                     help="SSH public key to authorize for debugging (default: ~/.ssh/id_*.pub; "
                          "'none' to skip)")
@@ -189,10 +195,14 @@ def _cloud(args) -> int:
             return 0
         if args.cmd == "up":
             creds = up_mod.resolve_credentials(args.provider, _cred_values(args))
+            policy = None
+            if args.egress != "open" or args.egress_allow:
+                policy = {"egress": {"mode": args.egress, "allow": [
+                    e.strip() for e in args.egress_allow.split(",") if e.strip()]}}
             profile = up_mod.up(
                 provider=args.provider, size=args.size, name=args.name, creds=creds,
                 instance_type=args.instance_type, region=args.region,
-                allow_from=args.allow_from,
+                allow_from=args.allow_from, policy=policy,
                 ssh_key=None if args.ssh_key == "none" else args.ssh_key,
                 rixi_ref=args.rixi_ref, save_creds=args.save_credentials,
                 make_default=not args.no_default, wait_timeout=args.timeout * 60,

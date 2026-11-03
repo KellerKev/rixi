@@ -2,7 +2,7 @@
 
 up:   keygen (ES256 + one-use handshake secret) → create the box (region fallback on stock-outs)
       → save the profile (so `rixi down` works even if this process dies) → wait for /health
-      → RSA→AES key handshake → profile ready.
+      → RSA→AES key handshake → network policy (if any) on the box's own firewall → ready.
 down: destroy every resource labeled for the box, then forget the profile.
 
 Any failure after the box exists destroys it again, so a failed `up` never leaves anything billing.
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from .. import __version__
+from .. import policy as netpolicy
 from . import cloudinit, presets
 from .profiles import (Profile, ProfileError, ProfileStore, _write_private, generate_keypair,
                        load_credentials, save_credentials, validate_name)
@@ -77,6 +78,7 @@ def up(*, provider: str, size: str = "sample-cpu", name: Optional[str] = None,
        creds: Dict[str, Optional[str]], instance_type: Optional[str] = None,
        region: Optional[str] = None, allow_from: str = "0.0.0.0/0",
        ssh_key: Optional[str] = "auto", rixi_ref: Optional[str] = None,
+       policy: Optional[dict] = None,
        save_creds: bool = False, make_default: bool = True,
        wait_timeout: float = 900.0, keep_on_failure: bool = False,
        store: Optional[ProfileStore] = None, echo: Echo = print,
@@ -92,10 +94,20 @@ def up(*, provider: str, size: str = "sample-cpu", name: Optional[str] = None,
         _check_ref(ref)
     cidrs = [f"{_public_ip()}/32"] if allow_from == "auto" else \
         [c.strip() for c in allow_from.split(",") if c.strip()]
+    try:
+        net = netpolicy.parse(policy)
+    except netpolicy.PolicyError as exc:
+        raise UpError(f"policy: {exc}") from exc
+    if net.ingress_allow:
+        cidrs = list(net.ingress_allow)          # the policy's ingress list wins
+    elif not net.is_default and any(":" in c for c in cidrs):
+        raise UpError("a network policy is IPv4 only: --allow-from must list IPv4 ranges")
     ssh_pub = _default_ssh_key() if ssh_key == "auto" else (
         Path(ssh_key).expanduser().read_text().strip() if ssh_key else None)
 
     cloud = _provider or make_provider(provider, creds)
+    if not net.is_default and not getattr(cloud, "supports_policy", False):
+        raise UpError(f"{provider} cannot enforce a network policy")
     if save_creds:
         save_credentials(provider, creds)
 
@@ -125,6 +137,8 @@ def up(*, provider: str, size: str = "sample-cpu", name: Optional[str] = None,
         client = profile.client()
         _wait_healthy(client, wait_timeout, echo, _sleep)
         profile.save_aes_key(client.handshake(key_secret))
+        if not net.is_default:
+            _apply_policy(cloud, profile, net, cidrs, echo)
         profile.status = "ready"
         store.put(profile, make_default=make_default)
     except BaseException as exc:
@@ -165,6 +179,31 @@ def _cleanup(cloud, name: str, region: str, echo: Echo) -> None:
         cloud.destroy(name, region)
     except Exception as exc:  # never mask the error that got us here
         echo(f"✖ could not clean up partial resources in {region}: {exc}")
+
+
+def _apply_policy(cloud, profile: Profile, net, cidrs: List[str], echo: Echo) -> None:
+    """Close the box down to its policy. Bootstrap needed the internet; nothing of yours has run
+    on the box yet, so it is sealed before the profile is handed over."""
+    client = profile.client()
+    resolvers: List[str] = []
+    if net.egress_mode != "open":
+        for path in ("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"):
+            res = client.exec(["cat", path], timeout=30)
+            resolvers = netpolicy.resolvers_from(res.stdout) if res.ok else []
+            if resolvers:
+                break
+        if not resolvers:
+            raise UpError("could not find the box's DNS resolvers to keep them reachable")
+    ingress = tuple(c for c in cidrs if c != "0.0.0.0/0")
+    compiled = netpolicy.compile_rules(
+        netpolicy.NetworkPolicy(net.egress_mode, net.egress_allow, ingress),
+        own_ip=None, resolvers=resolvers, api_ports=(RIXI_PORT, 22), cert_port=None)
+    echo(f"▶ applying the network policy (egress {net.egress_mode}"
+         f"{', ' + str(len(net.egress_allow)) + ' allowed' if net.egress_allow else ''})…")
+    cloud.apply_firewall(profile.name, profile.region, compiled)
+    client.health()                 # the box is still reachable through its new firewall
+    profile.policy = netpolicy.NetworkPolicy(net.egress_mode, net.egress_allow,
+                                             ingress).to_dict()
 
 
 def _wait_healthy(client, timeout: float, echo: Echo, sleep) -> None:

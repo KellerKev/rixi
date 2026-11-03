@@ -2,6 +2,7 @@
 import pytest
 
 from rixi.policy import NetworkPolicy, PolicyError, compile_rules, parse
+from rixi.policy import resolvers_from as parse_resolvers
 
 
 def test_empty_is_the_open_default():
@@ -82,3 +83,16 @@ def test_no_ingress_allowlist_means_anyone_may_connect():
     c = compile_rules(NetworkPolicy(), own_ip="51.0.0.7")
     inbound = {(r.cidr, r.port_from) for r in c.rules if r.direction == "inbound"}
     assert ("0.0.0.0/0", 443) in inbound and ("0.0.0.0/0", 22) in inbound
+
+
+def test_resolvers_are_read_from_resolv_conf():
+    text = "# generated\nnameserver 127.0.0.53\nnameserver 51.159.47.28\noptions edns0\n" \
+           "nameserver 2001:db8::1\nnameserver 51.159.47.26\n"
+    assert parse_resolvers(text) == ["51.159.47.28", "51.159.47.26"]
+
+
+def test_a_box_without_a_certificate_opens_no_port_80():
+    c = compile_rules(parse({"egress": {"mode": "block"}}), own_ip=None, resolvers=["10.0.0.1"],
+                      api_ports=(9000, 22), cert_port=None)
+    inbound = {(r.cidr, r.port_from) for r in c.rules if r.direction == "inbound"}
+    assert inbound == {("0.0.0.0/0", 9000), ("0.0.0.0/0", 22)}
