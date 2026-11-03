@@ -118,6 +118,19 @@ The same from Python: `Client.start()`, `spawn()`, `tasks()`, `attach()`, `send_
 `restart()`, `redeploy()`, `kill()`, `output()` — and on a sandbox, `sb.spawn()` /
 `sb.follow(id)`. Requires rixi 0.7.0+.
 
+**Boxes as tools for your agent (MCP).** `rixi mcp` serves boxes over the Model Context
+Protocol: an agent can create a box, run commands and background processes on it, move files,
+ship a Pixi project, and destroy the box. It runs on your machine and talks to the boxes directly,
+so command output and files never pass through a hosted service. In Claude Code, Cursor or any MCP
+client:
+
+```json
+{"mcpServers": {"rixi": {"command": "rixi", "args": ["mcp"], "env": {"RIXI_API_KEY": "rxk_…"}}}}
+```
+
+Hosted boxes made this way shut down after `ttl_hours` (default 2); set `RIXI_MCP_PROVIDER` to
+use your own cloud account instead. Requires rixi 0.8.0+.
+
 `rixi run`, `rixi stream`, and the Python SDK work with these boxes directly (and so does any example
 that uses them — drop `--server` and the profile is used). Offline bundling and the MCP
 back-channel are in the full client ([`clients/`](clients/)), which works against these boxes too.

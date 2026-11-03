@@ -108,6 +108,11 @@ def main(argv=None) -> int:
                     help="start it in the background and print its task id (attach later)")
     connection_flags(ex)
 
+    sub.add_parser("mcp", help="serve rixi boxes as tools to an agent (MCP over stdio)",
+                   description="Add to an MCP client: {\"command\": \"rixi\", \"args\": [\"mcp\"]}. "
+                               "Boxes default to the hosted eutonomous provider (RIXI_API_KEY); "
+                               "set RIXI_MCP_PROVIDER for your own cloud account.")
+
     # long-running work: follow, feed, restart and stop tasks by id
     connection_flags(sub.add_parser("tasks", help="list the tasks on the box"))
     at = sub.add_parser("attach", help="follow a task's output until it ends (Ctrl-C detaches)")
@@ -203,6 +208,9 @@ def main(argv=None) -> int:
     args.no_verify_ssl = args.no_verify_ssl or getattr(args, "sub_no_verify_ssl", False)
     if args.cmd in ("up", "down", "profiles", "use"):
         return _cloud(args)
+    if args.cmd == "mcp":
+        from .mcp_server import main as mcp_main
+        return mcp_main()
     return _dispatch(args)
 
 
