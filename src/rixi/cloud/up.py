@@ -45,6 +45,7 @@ def resolve_credentials(provider: str, flags: Dict[str, Optional[str]]) -> Dict[
                      "project_id": "SCW_DEFAULT_PROJECT_ID"},
         "aws": {"access_key_id": "AWS_ACCESS_KEY_ID",
                 "secret_access_key": "AWS_SECRET_ACCESS_KEY"},
+        "eutonomous": {"api_key": "RIXI_API_KEY", "api_url": "RIXI_API_URL"},
     }[provider]
     saved = load_credentials(provider)
     return {k: flags.get(k) or os.environ.get(var) or saved.get(k) for k, var in env.items()}
@@ -78,7 +79,7 @@ def up(*, provider: str, size: str = "sample-cpu", name: Optional[str] = None,
        creds: Dict[str, Optional[str]], instance_type: Optional[str] = None,
        region: Optional[str] = None, allow_from: str = "0.0.0.0/0",
        ssh_key: Optional[str] = "auto", rixi_ref: Optional[str] = None,
-       policy: Optional[dict] = None,
+       policy: Optional[dict] = None, ttl_hours: Optional[float] = None,
        save_creds: bool = False, make_default: bool = True,
        wait_timeout: float = 900.0, keep_on_failure: bool = False,
        store: Optional[ProfileStore] = None, echo: Echo = print,
@@ -88,16 +89,35 @@ def up(*, provider: str, size: str = "sample-cpu", name: Optional[str] = None,
     if store.exists(name):
         raise UpError(f"profile {name!r} already exists — `rixi down {name}` first, or pick "
                       f"another --name")
+    try:
+        net = netpolicy.parse(policy)
+    except netpolicy.PolicyError as exc:
+        raise UpError(f"policy: {exc}") from exc
+    if provider == "eutonomous":
+        from . import hosted
+        if allow_from not in ("0.0.0.0/0", "", None) and not net.ingress_allow:
+            ingress = [f"{_public_ip()}/32"] if allow_from == "auto" else \
+                [c.strip() for c in allow_from.split(",") if c.strip()]
+            try:
+                net = netpolicy.parse({**net.to_dict(), "ingress": {"allow": ingress}})
+            except netpolicy.PolicyError as exc:
+                raise UpError(f"policy: {exc}") from exc
+        if save_creds:
+            save_credentials(provider, creds)
+        try:
+            return hosted.up(name=name, size=size, creds=creds, store=store,
+                             instance_type=instance_type, region=region, policy=net,
+                             ttl_hours=ttl_hours, make_default=make_default,
+                             wait_timeout=wait_timeout, echo=echo, _api=_provider,
+                             _sleep=_sleep)
+        except hosted.HostedError as exc:
+            raise UpError(str(exc)) from exc
     spec_r = presets.resolve(provider, size, instance_type, region)
     ref = rixi_ref or default_ref()
     if _check:
         _check_ref(ref)
     cidrs = [f"{_public_ip()}/32"] if allow_from == "auto" else \
         [c.strip() for c in allow_from.split(",") if c.strip()]
-    try:
-        net = netpolicy.parse(policy)
-    except netpolicy.PolicyError as exc:
-        raise UpError(f"policy: {exc}") from exc
     if net.ingress_allow:
         cidrs = list(net.ingress_allow)          # the policy's ingress list wins
     elif not net.is_default and any(":" in c for c in cidrs):
@@ -228,6 +248,16 @@ def down(name: str, creds: Dict[str, Optional[str]], *, store: Optional[ProfileS
          echo: Echo = print, _provider=None) -> None:
     store = store or ProfileStore()
     profile = store.get(name)
+    if profile.provider == "eutonomous":
+        from . import hosted
+        echo(f"▶ shutting down eutonomous box {name!r} ({profile.box_id})…")
+        try:
+            hosted.down(profile, creds, _api=_provider)
+        except hosted.HostedError as exc:
+            raise UpError(str(exc)) from exc
+        store.remove(name)
+        echo(f"✔ shut down and removed profile {name!r}")
+        return
     cloud = _provider or make_provider(profile.provider, creds)
     echo(f"▶ destroying {profile.provider} box {name!r} ({profile.ip}, {profile.region})…")
     cloud.destroy(name, profile.region)

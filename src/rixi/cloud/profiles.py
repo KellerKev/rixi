@@ -64,6 +64,7 @@ class Profile:
     status: str = "provisioning"          # provisioning → ready
     eur_per_hour: Optional[float] = None
     policy: Optional[dict] = None             # the network policy in force, if any
+    api_url: Optional[str] = None             # hosted boxes: the service that made it
 
     # ── key material ───────────────────────────────────────────────────────
     @property
@@ -91,6 +92,10 @@ class Profile:
     def client(self, **kw):
         """An SDK Client for this box: per-request tokens + the negotiated AES key."""
         from ..client import Client
+        if self.provider == "eutonomous":
+            # A hosted box: a token for this box from the service, over TLS to the box itself.
+            from . import hosted
+            return Client(self.server_url, token=lambda: hosted.box_token(self), **kw)
         return Client(self.server_url, token=self.mint_token, aes_key=self.aes_key(), **kw)
 
 

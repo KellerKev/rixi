@@ -2,7 +2,7 @@
 
     from rixi import Sandbox
 
-    with Sandbox.create(provider="scaleway", size="sample-cpu",
+    with Sandbox.create(provider="eutonomous", size="cpu-s",       # or your own cloud: scaleway, …
                         policy={"egress": {"mode": "block"}}) as sb:
         sb.write_file("main.py", "print(6 * 7)")
         print(sb.exec("python3 main.py").stdout)      # 42
@@ -64,7 +64,7 @@ class Sandbox:
                policy: Optional[dict] = None, allow_from: str = "0.0.0.0/0",
                region: Optional[str] = None, instance_type: Optional[str] = None,
                creds: Optional[Dict[str, Optional[str]]] = None, ssh_key: Optional[str] = None,
-               wait_timeout: float = 900.0, store=None, echo=None) -> "Sandbox":
+               ttl_hours: Optional[float] = None, wait_timeout: float = 900.0, store=None, echo=None) -> "Sandbox":
         """Provision a box, wait until it is ready (and sealed, with a policy), return it.
 
         Credentials come from `creds`, else the provider's usual env vars, else saved ones.
@@ -75,7 +75,7 @@ class Sandbox:
         profile = up_mod.up(
             provider=provider, size=size, name=name or f"sb-{secrets.token_hex(4)}",
             creds=resolved, instance_type=instance_type, region=region, allow_from=allow_from,
-            ssh_key=ssh_key, policy=policy, make_default=False, wait_timeout=wait_timeout,
+            ssh_key=ssh_key, policy=policy, ttl_hours=ttl_hours, make_default=False, wait_timeout=wait_timeout,
             store=store, echo=echo or log.info)
         return cls(profile, owned=True, creds=resolved, store=store)
 

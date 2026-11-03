@@ -116,8 +116,15 @@ def main(argv=None) -> int:
 
     up = sub.add_parser("up", help="create a cloud box with rixi installed + save a profile",
                         description=_UP_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
-    up.add_argument("--provider", required=True, choices=["hetzner", "scaleway", "aws"])
-    up.add_argument("--size", default="sample-cpu", choices=["sample-cpu", "sample-gpu"])
+    up.add_argument("--provider", required=True,
+                    choices=["eutonomous", "hetzner", "scaleway", "aws"],
+                    help="eutonomous = the hosted service (an API key, EU machines, no cloud "
+                         "account); the others use your own cloud account")
+    up.add_argument("--size", default="sample-cpu",
+                    help="sample-cpu or sample-gpu; on eutonomous also cpu-s, cpu-l, gpu-l4, "
+                         "gpu-l40s")
+    up.add_argument("--ttl", type=float,
+                    help="eutonomous: hours until the box shuts itself down (service default)")
     up.add_argument("--name", help="profile/box name (default: <provider>-<size>)")
     up.add_argument("--type", dest="instance_type", help="instance type override (e.g. cx33)")
     up.add_argument("--region", help="region/zone (default: the provider's, with stock fallback)")
@@ -170,13 +177,17 @@ def _cred_flags(sp) -> None:
     g.add_argument("--scw-project-id", help="Scaleway project id (SCW_DEFAULT_PROJECT_ID)")
     g.add_argument("--aws-access-key-id", help="AWS access key id (AWS_ACCESS_KEY_ID)")
     g.add_argument("--aws-secret-access-key", help="AWS secret key (AWS_SECRET_ACCESS_KEY)")
+    g.add_argument("--api-key", help="eutonomous API key, from the portal (RIXI_API_KEY)")
+    g.add_argument("--api-url", help="eutonomous service URL (RIXI_API_URL; default "
+                                     "https://rixi.eutonomous.eu)")
 
 
 def _cred_values(args) -> dict:
     return {"token": args.hetzner_token, "secret_key": args.scw_secret_key,
             "access_key": args.scw_access_key, "project_id": args.scw_project_id,
             "access_key_id": args.aws_access_key_id,
-            "secret_access_key": args.aws_secret_access_key}
+            "secret_access_key": args.aws_secret_access_key,
+            "api_key": args.api_key, "api_url": args.api_url}
 
 
 def _cloud(args) -> int:
@@ -202,7 +213,7 @@ def _cloud(args) -> int:
             profile = up_mod.up(
                 provider=args.provider, size=args.size, name=args.name, creds=creds,
                 instance_type=args.instance_type, region=args.region,
-                allow_from=args.allow_from, policy=policy,
+                allow_from=args.allow_from, policy=policy, ttl_hours=args.ttl,
                 ssh_key=None if args.ssh_key == "none" else args.ssh_key,
                 rixi_ref=args.rixi_ref, save_creds=args.save_credentials,
                 make_default=not args.no_default, wait_timeout=args.timeout * 60,
