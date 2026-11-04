@@ -73,6 +73,8 @@ def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_se
     }
     if cfg.acme_email:
         env["RIXI_ACME_EMAIL"] = cfg.acme_email
+    if cfg.acme_ca:
+        env["RIXI_ACME_CA"] = cfg.acme_ca
     if serve:
         # The box serves a model behind its own /v1, guarded by a key only this box holds.
         if not valid_model(serve["model"]):

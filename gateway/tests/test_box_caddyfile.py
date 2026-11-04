@@ -17,7 +17,7 @@ KEY = "test-key-AbC123_-xyz"
 GATE = "0a1b2c3d4e5f"
 
 
-def render(tmp_path, serve=True) -> str:
+def render(tmp_path, serve=True, **extra) -> str:
     """Run just the Caddyfile section of the bootstrap."""
     src = BOOTSTRAP.read_text()
     start = src.index("mkdir -p /var/lib/caddy")
@@ -27,6 +27,7 @@ def render(tmp_path, serve=True) -> str:
            "RIXI_PREVIEW_GATE": GATE, "PATH": os.environ["PATH"], "HOME": str(tmp_path)}
     if serve:
         env.update(RIXI_SERVE_KIND="ollama", RIXI_ENDPOINT_KEY=KEY)
+    env.update(extra)
     body = body.replace("mkdir -p /var/lib/caddy", "mkdir -p %s/caddy" % tmp_path)
     subprocess.run(["bash", "-c", body], env=env, check=True, capture_output=True)
     return (tmp_path / "Caddyfile").read_text()
@@ -80,3 +81,23 @@ def test_caddy_accepts_the_preview_config(tmp_path):
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert '"on_demand":true' in out.stdout.replace(" ", "") or "on_demand" in out.stdout
+
+
+def test_lets_encrypt_alone_unless_another_ca_is_asked_for(tmp_path):
+    assert "cert_issuer" not in render(tmp_path, serve=False)
+
+
+def test_zerossl_first_and_lets_encrypt_as_fallback(tmp_path):
+    conf = render(tmp_path, serve=False, RIXI_ACME_CA="zerossl")
+    glob = conf.split("*.b-abc.run.example.com {")[0]
+    assert glob.index("dir https://acme.zerossl.com/v2/DV90") < glob.index("  cert_issuer acme\n")
+    assert "eab" not in conf.lower()                  # nothing secret for the CA on the box
+
+
+@pytest.mark.skipif(not shutil.which("caddy"), reason="needs the caddy binary")
+def test_caddy_accepts_the_zerossl_config(tmp_path):
+    render(tmp_path, serve=False, RIXI_ACME_CA="zerossl")
+    out = subprocess.run(["caddy", "adapt", "--config", str(tmp_path / "Caddyfile")],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "acme.zerossl.com" in out.stdout and "acme-v02.api.letsencrypt.org" not in out.stdout

@@ -119,6 +119,17 @@ def test_config_refuses_unpinned_ref():
     assert parse(_conf(rixi_ref="main", allow_unpinned_ref=True)).rixi_ref == "main"
 
 
+def test_config_takes_a_ca_for_box_certificates():
+    assert parse(_conf()).acme_ca is None
+    assert parse(_conf(acme_ca="letsencrypt")).acme_ca is None
+    assert parse(_conf(acme_ca="zerossl")).acme_ca == "zerossl"
+    with pytest.raises(ConfigError, match="acme_ca"):
+        parse(_conf(acme_ca="zerossl\nRIXI_JWKS_URL=https://evil"))
+    cfg = parse(_conf(acme_ca="zerossl"))
+    assert "RIXI_ACME_CA=zerossl" in cloudinit.render(cfg, box_id="x", tenant="t", hostname="h",
+                                                      box_secret="s")
+
+
 # ── claim + provisioning ────────────────────────────────────────────────
 
 def test_claim_provisions_box_with_dns_and_scoped_user_data():

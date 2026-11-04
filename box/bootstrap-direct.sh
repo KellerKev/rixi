@@ -10,7 +10,9 @@
 #   RIXI_HEARTBEAT_URL  gateway heartbeat endpoint
 #   RIXI_BOX_SECRET     this box's own heartbeat credential (useless for any other box)
 #   RIXI_REF / RIXI_REPO  pinned rixi release to install
-#   RIXI_ACME_EMAIL     optional Let's Encrypt account email
+#   RIXI_ACME_EMAIL     optional ACME account email
+#   RIXI_ACME_CA        optional "zerossl" (Let's Encrypt as fallback) or an ACME directory URL;
+#                       Let's Encrypt alone when unset
 #   RIXI_SERVE_KIND     optional "ollama": serve a model behind /v1 instead of only running uploads
 #   RIXI_SERVE_MODEL    the model to pull and serve (e.g. qwen3:8b)
 #   RIXI_ENDPOINT_KEY   bearer key for /v1; only this box has it
@@ -107,6 +109,24 @@ mkdir -p /var/lib/caddy
   echo "{"
   echo "  admin off"
   [ -z "${RIXI_ACME_EMAIL:-}" ] || echo "  email $RIXI_ACME_EMAIL"
+  # Every box and every opened preview port takes a certificate, more than Let's Encrypt's
+  # weekly allowance for one domain once there are many boxes. Issuers are tried in order;
+  # for ZeroSSL, Caddy fetches the account binding with the email, so no CA secret lives here.
+  case "${RIXI_ACME_CA:-}" in
+    ""|letsencrypt) ;;
+    zerossl)
+      echo "  cert_issuer acme {"
+      echo "    dir https://acme.zerossl.com/v2/DV90"
+      echo "  }"
+      echo "  cert_issuer acme"
+      ;;
+    https://*)
+      echo "  cert_issuer acme {"
+      echo "    dir $RIXI_ACME_CA"
+      echo "  }"
+      echo "  cert_issuer acme"
+      ;;
+  esac
   echo "  on_demand_tls {"
   echo "    ask http://127.0.0.1:9000/preview/ask?gate=$RIXI_PREVIEW_GATE"
   echo "  }"

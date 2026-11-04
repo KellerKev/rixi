@@ -24,6 +24,7 @@ jwt_audience   = "rixi-gateway"                              # API tokens need t
 tenant_claim   = "tenant"                                    # JWT claim naming the owning tenant
 admin_role     = "admin"                                     # role that sees every tenant
 # acme_email   = "ops@example.com"
+# acme_ca      = "zerossl"            # many boxes: ZeroSSL first, Let's Encrypt as fallback
 # Optional: ask a billing service before every claim; it must answer {"allow": true}.
 # authorizer_url   = "http://127.0.0.1:8030/internal/authorize"
 # authorizer_token = "${env:RIXI_AUTHORIZER_TOKEN}"

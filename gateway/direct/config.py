@@ -102,6 +102,7 @@ class DirectConfig:
     roles_claim: str = "roles"
     admin_role: str = "admin"
     acme_email: Optional[str] = None
+    acme_ca: Optional[str] = None        # "zerossl" or an ACME directory URL; Let's Encrypt if unset
     ollama_version: str = "v0.35.1"      # pinned; boxes install exactly this
     dns_publish_timeout: float = 180.0   # wait for all nameservers before booting a box
     control_plane: Tuple[str, ...] = ()  # addresses a policed box must keep reaching (default: resolved)
@@ -131,6 +132,16 @@ class DirectConfig:
 
 def _opt_float(v) -> Optional[float]:
     return float(v) if v is not None else None
+
+
+def _acme_ca(v) -> Optional[str]:
+    """Which CA boxes take certificates from: Let's Encrypt (unset), "zerossl", or a directory."""
+    v = (v or "").strip()
+    if v in ("", "letsencrypt"):
+        return None
+    if v == "zerossl" or re.fullmatch(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)*/?", v):
+        return v
+    raise ConfigError(f"acme_ca must be letsencrypt, zerossl or an https ACME directory, not {v!r}")
 
 
 def parse(data: dict) -> DirectConfig:
@@ -199,6 +210,7 @@ def parse(data: dict) -> DirectConfig:
         jwt_audience=d.get("jwt_audience") or None,
         tenant_claim=d.get("tenant_claim", "tenant"), roles_claim=d.get("roles_claim", "roles"),
         admin_role=d.get("admin_role", "admin"), acme_email=d.get("acme_email") or None,
+        acme_ca=_acme_ca(d.get("acme_ca")),
         dns_publish_timeout=_duration(d.get("dns_publish_timeout", "3m")),
         control_plane=tuple(d.get("control_plane") or ()),
         heartbeat_timeout=_duration(d.get("heartbeat_timeout", "10m")),
