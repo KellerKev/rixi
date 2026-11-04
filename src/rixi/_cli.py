@@ -181,6 +181,13 @@ def main(argv=None) -> int:
     up.add_argument("--volume", action="append", default=[], metavar="ID",
                     help="eutonomous: attach a volume (rixi volumes), mounted at "
                          "/workspace/data/<name>; repeatable")
+    up.add_argument("--storage", action="store_true",
+                    help="eutonomous: S3 access to your buckets from the box (AWS_* variables, "
+                         "a key that dies with the box)")
+    up.add_argument("--storage-bucket", action="append", default=[], metavar="NAME",
+                    help="with --storage: only these buckets; repeatable")
+    up.add_argument("--storage-read-only", action="store_true",
+                    help="with --storage: the box may read but not change them")
     up.add_argument("--on-idle", choices=["release", "stop"],
                     help="eutonomous: when idle, shut down (default) or stop and keep the disk")
     need = up.add_argument_group("eutonomous: say what you need instead of --size "
@@ -229,6 +236,27 @@ def main(argv=None) -> int:
     vo.add_argument("--zone", help="region (default: the service's first)")
     _cred_flags(vo)
 
+    bk = sub.add_parser("buckets", help="S3 buckets on the hosted service",
+                        description="rixi buckets [ls] · rixi buckets create NAME [--region R] "
+                                    "[--expire-days N] · rixi buckets expire NAME DAYS|off · "
+                                    "rixi buckets rm NAME [--force]")
+    bk.add_argument("action", nargs="?", default="ls", choices=["ls", "create", "expire", "rm"])
+    bk.add_argument("target", nargs="?", help="the bucket name")
+    bk.add_argument("days", nargs="?", help="expire: days after upload, or off")
+    bk.add_argument("--region", help="create: region (default: the service's first)")
+    bk.add_argument("--expire-days", type=int, help="create: delete objects this long after upload")
+    bk.add_argument("--force", action="store_true", help="rm: delete everything in it too")
+    _cred_flags(bk)
+    sk = sub.add_parser("s3-keys", help="S3 access keys for your buckets (hosted service)",
+                        description="rixi s3-keys [ls] · rixi s3-keys create NAME [--bucket B]… "
+                                    "[--read-only] · rixi s3-keys rm ACCESS_KEY")
+    sk.add_argument("action", nargs="?", default="ls", choices=["ls", "create", "rm"])
+    sk.add_argument("target", nargs="?", help="create: a name for the key; rm: its access key")
+    sk.add_argument("--bucket", action="append", default=[], metavar="NAME",
+                    help="create: only this bucket; repeatable (default: all of yours)")
+    sk.add_argument("--read-only", action="store_true", help="create: read, never change")
+    _cred_flags(sk)
+
     down = sub.add_parser("down", help="destroy a box created with `rixi up` and forget its profile")
     down.add_argument("name", nargs="?", help="profile name (default: the default profile)")
     _cred_flags(down)
@@ -243,7 +271,8 @@ def main(argv=None) -> int:
     args.aes_key = getattr(args, "sub_aes_key", None) or args.aes_key
     args.profile = getattr(args, "sub_profile", None) or args.profile
     args.no_verify_ssl = args.no_verify_ssl or getattr(args, "sub_no_verify_ssl", False)
-    if args.cmd in ("up", "down", "profiles", "use", "stop", "start", "volumes"):
+    if args.cmd in ("up", "down", "profiles", "use", "stop", "start", "volumes", "buckets",
+                    "s3-keys"):
         return _cloud(args)
     if args.cmd == "mcp":
         from .mcp_server import main as mcp_main
@@ -270,6 +299,68 @@ def _cred_values(args) -> dict:
             "access_key_id": args.aws_access_key_id,
             "secret_access_key": args.aws_secret_access_key,
             "api_key": args.api_key, "api_url": args.api_url}
+
+
+def _storage_cmd(args) -> int:
+    from .cloud import hosted
+    vals = _cred_values(args)
+    os.environ.update({k: v for k, v in (("RIXI_API_KEY", vals.get("api_key")),
+                                          ("RIXI_API_URL", vals.get("api_url"))) if v})
+    try:
+        api = hosted.api_from_env()
+        if args.cmd == "buckets":
+            if args.action in ("create", "expire", "rm") and not args.target:
+                print(f"rixi: buckets {args.action} needs a NAME", file=sys.stderr)
+                return 1
+            if args.action == "create":
+                b = api.create_bucket(args.target, args.region, args.expire_days)
+                print(f"{b['name']}  {b['region']}  {b['state']}")
+                print(f"  endpoint: {api.storage_info()['endpoint_url']} "
+                      f"(keys: rixi s3-keys create NAME)")
+            elif args.action == "expire":
+                if args.days is None:
+                    print("rixi: buckets expire NAME DAYS|off", file=sys.stderr)
+                    return 1
+                days = None if args.days in ("off", "0") else int(args.days)
+                b = api.set_bucket_expiry(args.target, days)
+                print(f"{b['name']}: objects " + (f"expire {days} days after upload" if days
+                                                  else "are kept until deleted"))
+            elif args.action == "rm":
+                b = api.delete_bucket(args.target, force=args.force)
+                print(f"{b['name']}: {b['state']}")
+            else:
+                info = api.storage_info()
+                rows = api.buckets()
+                print(f"endpoint: {info['endpoint_url']}")
+                for b in rows:
+                    exp = f"expire {b['expire_days']}d" if b.get("expire_days") else ""
+                    print(f"{b['name']:<24} {b['region']:<7} {b['size_gb']:>10.3f} GB  "
+                          f"{b['objects']:>8} objects  {exp}")
+                if not rows:
+                    print("no buckets — rixi buckets create NAME")
+            return 0
+        if args.action == "create":
+            if not args.target:
+                print("rixi: s3-keys create needs a NAME", file=sys.stderr)
+                return 1
+            k = api.create_s3_key(args.target, args.bucket or None, write=not args.read_only)
+            print("# shown once — keep it somewhere safe")
+            print(f"export AWS_ENDPOINT_URL_S3={k['endpoint_url']}")
+            print(f"export AWS_ACCESS_KEY_ID={k['access_key']}")
+            print(f"export AWS_SECRET_ACCESS_KEY={k['secret_key']}")
+            print(f"export AWS_REGION={k['region']}")
+        elif args.action == "rm":
+            api.revoke_s3_key(args.target or "")
+            print(f"revoked {args.target}")
+        else:
+            for k in api.s3_keys():
+                scope = ", ".join(k["buckets"]) if k.get("buckets") else "all buckets"
+                who = f"box {k['box_id']}" if k.get("box_id") else k["name"]
+                print(f"{k['access_key']}  {who:<24} {'rw' if k['write'] else 'ro'}  {scope}")
+    except hosted.HostedError as exc:
+        print(f"rixi: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cloud(args) -> int:
@@ -306,6 +397,9 @@ def _cloud(args) -> int:
                                            ("gpu", args.gpu), ("gpu_ram_gb", args.gpu_ram))
                          if v is not None} or None,
                 on_idle=args.on_idle,
+                storage=({"buckets": args.storage_bucket or None,
+                          "write": not args.storage_read_only}
+                         if args.storage or args.storage_bucket else None),
                 ssh_key=None if args.ssh_key == "none" else args.ssh_key,
                 rixi_ref=args.rixi_ref, save_creds=args.save_credentials,
                 make_default=not args.no_default, wait_timeout=args.timeout * 60,
@@ -353,6 +447,8 @@ def _cloud(args) -> int:
                 print(f"rixi: {exc}", file=sys.stderr)
                 return 1
             return 0
+        if args.cmd in ("buckets", "s3-keys"):
+            return _storage_cmd(args)
         if args.cmd == "down":
             name = args.name or store.default_name()
             if not name:

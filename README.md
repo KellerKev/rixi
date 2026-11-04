@@ -129,6 +129,14 @@ its disk, files and name kept (compute stops billing, the disk is billed per GB)
 brings it back; `--on-idle stop` makes an idle box stop instead of going away. From Python:
 `Sandbox.create(volumes=[…], on_idle="stop")`, `sb.stop()`, `sb.resume()`. Requires rixi 0.10.0+.
 
+**S3 buckets (hosted).** `rixi buckets create results` and `rixi s3-keys create laptop` give you
+an S3 endpoint for results, artifacts and datasets, usable with aws-cli, boto3 or s3fs and billed
+per GB stored and downloaded. `rixi up --provider eutonomous --storage` (or
+`--storage-bucket results`, `--storage-read-only`) gives the box its own key — it dies with the
+box — and sets `AWS_ENDPOINT_URL_S3` and friends, so Metaflow's S3 datastore works on the box
+as is. Keys can be limited to some buckets and to reading; nothing can be made public. Self-hosters
+get the same from the gateway's S3 proxy. Requires rixi 0.12.0+.
+
 **A terminal on the box.** `rixi shell` opens an interactive login shell in the workspace (a PTY
 over a WebSocket; window resizes follow, the exit code passes through). On hosted boxes the
 portal's box page has the same terminal in the browser, connected to the box directly. Requires

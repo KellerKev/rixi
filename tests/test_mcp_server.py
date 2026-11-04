@@ -199,3 +199,42 @@ def test_persistence_over_tools():
     assert call(s, "stop_box", box="b1")[0].startswith("stopping") and box.stopped
     assert call(s, "resume_box", box="b1")[0] == "running again" and not box.stopped
     assert call(s, "delete_volume", volume_id="v1")[0] == "deleting" and api.vols == {}
+
+
+def test_storage_over_tools(monkeypatch):
+    class Api:
+        def __init__(self):
+            self.rows = []
+
+        def storage_info(self):
+            return {"endpoint_url": "https://s3.test", "regions": ["fr-par"]}
+
+        def buckets(self):
+            return self.rows
+
+        def create_bucket(self, name, region=None, expire_days=None):
+            self.rows.append({"id": "bk1", "name": name, "region": "fr-par", "size_gb": 0.0,
+                              "objects": 0, "expire_days": expire_days, "state": "ready"})
+            return self.rows[-1]
+
+        def delete_bucket(self, name, force=False):
+            assert not force                      # agents can only remove empty buckets
+            self.rows = [r for r in self.rows if r["name"] != name]
+            return {"name": name, "state": "deleted"}
+    api = Api()
+    s = Server(Tools(store=_store_with(), sandbox_for=lambda name: Box(), api=api))
+    assert "bucket results (fr-par) is ready" in call(s, "create_bucket", name="results",
+                                                      expire_days=30)[0]
+    out = call(s, "list_buckets")[0]
+    assert "endpoint: https://s3.test" in out and "results: fr-par" in out and "30 days" in out
+    assert call(s, "create_bucket", name="x", expire_days="soon")[1] is True
+    assert "deleted" in call(s, "delete_bucket", name="results")[0] and api.rows == []
+
+    seen = {}
+    tools = Tools(store=_store_with(), up=lambda **kw: seen.update(kw) or (_ for _ in ()).throw(
+        RuntimeError("stop")))
+    s = Server(tools)
+    call(s, "create_box", storage=["results"])
+    assert seen["storage"] == {"buckets": ["results"]}
+    call(s, "create_box", storage=["*"])
+    assert seen["storage"] is True

@@ -85,6 +85,53 @@ class Api:
     def delete_volume(self, volume_id: str) -> dict:
         return self._call("DELETE", f"/api/volumes/{volume_id}")
 
+    # -- S3 storage (buckets reached with your own keys at the storage endpoint) ----------
+    def buckets(self) -> list:
+        return self._call("GET", "/api/buckets")["buckets"]
+
+    def storage_info(self) -> dict:
+        """{endpoint_url, regions} — where S3 clients reach your buckets."""
+        d = self._call("GET", "/api/buckets")
+        return {"endpoint_url": d.get("endpoint_url"), "regions": d.get("regions", [])}
+
+    def bucket(self, name_or_id: str) -> dict:
+        for b in self.buckets():
+            if name_or_id in (b["name"], b["id"]):
+                return b
+        raise HostedError(f"no bucket {name_or_id!r}")
+
+    def create_bucket(self, name: str, region: Optional[str] = None,
+                      expire_days: Optional[int] = None) -> dict:
+        body: dict = {"name": name}
+        if region:
+            body["region"] = region
+        if expire_days:
+            body["expire_days"] = int(expire_days)
+        return self._call("POST", "/api/buckets", body)
+
+    def set_bucket_expiry(self, name_or_id: str, expire_days: Optional[int]) -> dict:
+        b = self.bucket(name_or_id)
+        return self._call("PATCH", f"/api/buckets/{b['id']}", {"expire_days": expire_days})
+
+    def delete_bucket(self, name_or_id: str, force: bool = False) -> dict:
+        """Without force the bucket must be empty; with it, everything in it is deleted."""
+        b = self.bucket(name_or_id)
+        return self._call("DELETE", f"/api/buckets/{b['id']}" + ("?force=1" if force else ""))
+
+    def s3_keys(self) -> list:
+        return self._call("GET", "/api/s3-keys")["keys"]
+
+    def create_s3_key(self, name: str, buckets: Optional[list] = None,
+                      write: bool = True) -> dict:
+        """A key for S3 clients; the answer carries `secret_key`, shown this once."""
+        body: dict = {"name": name, "write": bool(write)}
+        if buckets:
+            body["buckets"] = list(buckets)
+        return self._call("POST", "/api/s3-keys", body)
+
+    def revoke_s3_key(self, access_key: str) -> dict:
+        return self._call("DELETE", f"/api/s3-keys/{access_key}")
+
 
 def api_from_env(api_url: Optional[str] = None) -> Api:
     from .up import resolve_credentials
@@ -124,7 +171,7 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
        instance_type: Optional[str] = None, region: Optional[str] = None,
        policy: Optional[netpolicy.NetworkPolicy] = None, ttl_hours: Optional[float] = None,
        model_access=None, volumes: Optional[list] = None, on_idle: Optional[str] = None,
-       require: Optional[dict] = None,
+       require: Optional[dict] = None, storage=None,
        make_default: bool = True, wait_timeout: float = 900.0, echo: Echo = print,
        _api: Optional[Api] = None, _sleep=time.sleep) -> Profile:
     api = _api or Api(creds.get("api_key"), creds.get("api_url"))
@@ -145,6 +192,10 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
         body["volumes"] = list(volumes)       # mounted at /workspace/data/<name>
     if on_idle:
         body["on_idle"] = on_idle             # "stop": keep the disk instead of shutting down
+    if storage:
+        # S3 on the box (AWS_* variables), with a key that dies with it: True for all your
+        # buckets, or {"buckets": [names], "write": bool}
+        body["storage"] = {} if storage is True else dict(storage)
     if model_access is not None:
         # governed: through eutonomous + malgra with a box-only token; direct: straight to your
         # own endpoint with your own key; none. Omitted: none.
@@ -156,6 +207,8 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
     if require:
         echo(f"  → {box.get('template')} ({box['instance_type']}, "
              f"€{box.get('eur_per_hour')}/h) meets {require}")
+    if storage:
+        echo("  storage: your buckets via AWS_ENDPOINT_URL_S3 and a box-only key")
     if box.get("model_access") and box["model_access"] != "none":
         echo(f"  model access: {box['model_access']} (OPENAI_BASE_URL is set on the box)")
     profile = Profile(name=name, provider="eutonomous", server_url=box["url"], ip="",

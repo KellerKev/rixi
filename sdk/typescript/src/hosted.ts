@@ -26,6 +26,8 @@ export interface LaunchOptions {
   onIdle?: "release" | "stop";
   /** instead of size: the cheapest box with at least this */
   require?: { vcpu?: number; ram_gb?: number; gpu?: string; gpu_ram_gb?: number; zone?: string };
+  /** S3 on the box (AWS_* variables, a key that dies with it): true for all your buckets */
+  storage?: true | { buckets?: string[]; write?: boolean };
 }
 
 export interface Box {
@@ -49,6 +51,32 @@ export interface Volume {
   box_id: string | null;
   mount: string;
   eur_per_gb_month: number;
+}
+
+export interface Bucket {
+  id: string;
+  name: string;
+  region: string;
+  state: string;
+  size_gb: number;
+  objects: number;
+  egress_gb: number;
+  expire_days: number | null;
+  created_at: number;
+  [k: string]: any;
+}
+
+export interface S3Key {
+  access_key: string;
+  name: string;
+  buckets: string[] | null;
+  write: boolean;
+  box_id: string | null;
+  /** only when the key is created */
+  secret_key?: string;
+  endpoint_url?: string;
+  region?: string;
+  [k: string]: any;
 }
 
 export class Eutonomous {
@@ -91,6 +119,39 @@ export class Eutonomous {
   }
   deleteVolume(id: string) { return this.call<Volume>("DELETE", `/api/volumes/${id}`); }
 
+  // S3 storage: buckets reached at `endpoint_url` with keys from createS3Key
+  storageInfo() {
+    return this.call<{ endpoint_url: string; regions: string[] }>("GET", "/api/buckets")
+      .then((d) => ({ endpoint_url: d.endpoint_url, regions: d.regions }));
+  }
+  buckets() { return this.call<{ buckets: Bucket[] }>("GET", "/api/buckets").then((d) => d.buckets); }
+  async bucket(nameOrId: string): Promise<Bucket> {
+    const b = (await this.buckets()).find((x) => x.name === nameOrId || x.id === nameOrId);
+    if (!b) throw new RixiError(`no bucket ${nameOrId}`, 404);
+    return b;
+  }
+  createBucket(name: string, opts: { region?: string; expireDays?: number } = {}) {
+    return this.call<Bucket>("POST", "/api/buckets", {
+      name, ...(opts.region ? { region: opts.region } : {}),
+      ...(opts.expireDays ? { expire_days: opts.expireDays } : {}) });
+  }
+  async setBucketExpiry(nameOrId: string, expireDays: number | null) {
+    const b = await this.bucket(nameOrId);
+    return this.call<Bucket>("PATCH", `/api/buckets/${b.id}`, { expire_days: expireDays });
+  }
+  /** Without force the bucket must be empty; with it, everything in it is deleted. */
+  async deleteBucket(nameOrId: string, opts: { force?: boolean } = {}) {
+    const b = await this.bucket(nameOrId);
+    return this.call<Bucket>("DELETE", `/api/buckets/${b.id}${opts.force ? "?force=1" : ""}`);
+  }
+  s3Keys() { return this.call<{ keys: S3Key[] }>("GET", "/api/s3-keys").then((d) => d.keys); }
+  /** The answer carries secret_key, shown this once. */
+  createS3Key(name: string, opts: { buckets?: string[]; write?: boolean } = {}) {
+    return this.call<S3Key>("POST", "/api/s3-keys", {
+      name, write: opts.write ?? true, ...(opts.buckets?.length ? { buckets: opts.buckets } : {}) });
+  }
+  revokeS3Key(accessKey: string) { return this.call<S3Key>("DELETE", `/api/s3-keys/${accessKey}`); }
+
   async launch(opts: LaunchOptions = {}): Promise<Box> {
     const body: Record<string, unknown> = opts.require && !opts.size
       ? { require: opts.require } : { template: opts.size ?? "cpu-s" };
@@ -100,6 +161,7 @@ export class Eutonomous {
     if (opts.modelAccess) body.model_access = opts.modelAccess;
     if (opts.volumes?.length) body.volumes = opts.volumes;
     if (opts.onIdle) body.on_idle = opts.onIdle;
+    if (opts.storage) body.storage = opts.storage === true ? {} : opts.storage;
     return this.call<Box>("POST", "/api/boxes", body);
   }
 

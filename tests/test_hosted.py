@@ -209,3 +209,94 @@ def test_cli_need_flags(monkeypatch):
         up_mod.UpError("stop here")))
     _cli.main(["up", "--provider", "eutonomous", "--gpu", "any", "--gpu-ram", "40"])
     assert seen["require"] == {"gpu": "any", "gpu_ram_gb": 40.0}
+
+
+def test_storage_rides_along_with_the_launch():
+    api = FakeApi()
+    _up(api, name="s1", storage=True)
+    assert api.launched[0]["storage"] == {}
+    _up(api, name="s2", storage={"buckets": ["results"], "write": False})
+    assert api.launched[1]["storage"] == {"buckets": ["results"], "write": False}
+
+
+def test_own_cloud_boxes_do_not_take_storage_yet():
+    with pytest.raises(up_mod.UpError, match="hosted service"):
+        up_mod.up(provider="hetzner", name="own", creds={"token": "t"}, storage=True,
+                  _check=False, echo=lambda m: None)
+
+
+class StorageSession:
+    """requests.Session stand-in for the portal's bucket and key routes."""
+
+    def __init__(self):
+        self.headers = {}
+        self.calls = []
+        self.rows = [{"id": "bk1", "name": "results", "region": "fr-par", "size_gb": 1.5,
+                      "objects": 3, "expire_days": None, "state": "ready"}]
+
+    def request(self, method, url, json=None, timeout=None):
+        path = url.split("rixi.test", 1)[1]
+        self.calls.append((method, path, json))
+        body, status = {}, 200
+        if path == "/api/buckets" and method == "GET":
+            body = {"buckets": self.rows, "endpoint_url": "https://s3.test", "regions": ["fr-par"]}
+        elif path == "/api/buckets" and method == "POST":
+            body, status = {**json, "id": "bk2", "region": "fr-par", "state": "ready"}, 201
+        elif path.startswith("/api/buckets/bk1"):
+            body = {**self.rows[0], "state": "deleting" if method == "DELETE" else "ready",
+                    **(json or {})}
+        elif path == "/api/s3-keys" and method == "POST":
+            body, status = {"access_key": "RXKEY", "secret_key": "s3cr3t", "region": "fr-par",
+                            "endpoint_url": "https://s3.test", "write": json["write"],
+                            "buckets": json.get("buckets"), "box_id": None, "name": json["name"]}, 201
+        elif path == "/api/s3-keys":
+            body = {"keys": [{"access_key": "RXKEY", "name": "ci", "write": False,
+                              "buckets": ["bk1"], "box_id": None}]}
+        elif path.startswith("/api/s3-keys/"):
+            body = {"access_key": path.rsplit("/", 1)[1], "active": False}
+
+        class R:
+            status_code = status
+            text = ""
+
+            def json(self_inner):
+                return body
+        return R()
+
+
+def test_cli_buckets_and_keys(monkeypatch, capsys):
+    from rixi import _cli
+    sess = StorageSession()
+    api = hosted.Api("rxk_test", "https://rixi.test", session=sess)
+    monkeypatch.setattr(hosted, "api_from_env", lambda url=None: api)
+    assert _cli.main(["buckets"]) == 0
+    out = capsys.readouterr().out
+    assert "endpoint: https://s3.test" in out and "results" in out and "1.500 GB" in out
+    assert _cli.main(["buckets", "create", "logs", "--expire-days", "7"]) == 0
+    assert ("POST", "/api/buckets", {"name": "logs", "expire_days": 7}) in sess.calls
+    assert _cli.main(["buckets", "expire", "results", "off"]) == 0
+    assert sess.calls[-1] == ("PATCH", "/api/buckets/bk1", {"expire_days": None})
+    assert _cli.main(["buckets", "rm", "results", "--force"]) == 0
+    assert sess.calls[-1][:2] == ("DELETE", "/api/buckets/bk1?force=1")
+    assert _cli.main(["buckets", "rm", "nope"]) == 1
+    capsys.readouterr()
+    assert _cli.main(["s3-keys", "create", "ci", "--bucket", "results", "--read-only"]) == 0
+    out = capsys.readouterr().out
+    assert "export AWS_SECRET_ACCESS_KEY=s3cr3t" in out and "AWS_ENDPOINT_URL_S3=https://s3.test" in out
+    assert sess.calls[-1] == ("POST", "/api/s3-keys", {"name": "ci", "write": False,
+                                                       "buckets": ["results"]})
+    assert _cli.main(["s3-keys"]) == 0 and "RXKEY" in capsys.readouterr().out
+    assert _cli.main(["s3-keys", "rm", "RXKEY"]) == 0
+    assert sess.calls[-1][:2] == ("DELETE", "/api/s3-keys/RXKEY")
+
+
+def test_cli_storage_flags(monkeypatch):
+    from rixi import _cli
+    seen = {}
+    monkeypatch.setattr(up_mod, "up", lambda **kw: seen.update(kw) or (_ for _ in ()).throw(
+        up_mod.UpError("stop here")))
+    _cli.main(["up", "--provider", "eutonomous", "--storage-bucket", "results",
+               "--storage-read-only"])
+    assert seen["storage"] == {"buckets": ["results"], "write": False}
+    _cli.main(["up", "--provider", "eutonomous"])
+    assert seen["storage"] is None

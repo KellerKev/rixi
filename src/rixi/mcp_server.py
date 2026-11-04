@@ -85,7 +85,10 @@ TOOLS: List[dict] = [
                      "(\"L4\", \"L40S\", \"any\")"},
          "on_idle": {"type": "string", "enum": ["release", "stop"],
                      "description": "eutonomous: when idle, shut down (default) or stop and "
-                                    "keep the disk"}}}},
+                                    "keep the disk"},
+         "storage": {"type": "array", "items": {"type": "string"},
+                     "description": "eutonomous: S3 bucket names the box may use (AWS_* "
+                                    "variables are set; [\"*\"] for all your buckets)"}}}},
     {"name": "list_boxes", "description": "The boxes you have (all profiles), with status.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "destroy_box", "description": "Destroy a box; billing stops and its files are gone.",
@@ -107,6 +110,20 @@ TOOLS: List[dict] = [
     {"name": "delete_volume", "description": "Hosted: delete a volume and its data.",
      "inputSchema": {"type": "object", "properties": {"volume_id": {"type": "string"}},
                      "required": ["volume_id"]}},
+    {"name": "list_buckets", "description": "Hosted: your S3 buckets, their size, and the "
+                                            "endpoint S3 clients use.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "create_bucket",
+     "description": "Hosted: an S3 bucket for results, artifacts or datasets (billed per GB "
+                    "stored and per GB downloaded). Give a box access with create_box "
+                    "storage=[name].",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "3-63 lowercase letters, digits, dashes"},
+         "expire_days": {"type": "integer", "description": "delete objects this many days "
+                         "after upload (default: keep)"}}, "required": ["name"]}},
+    {"name": "delete_bucket", "description": "Hosted: delete an EMPTY bucket.",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}},
+                     "required": ["name"]}},
     {"name": "exec",
      "description": "Run a shell command in the box's workspace and wait for it. Returns exit "
                     "code, stdout and stderr. For servers and long jobs use spawn instead.",
@@ -209,6 +226,11 @@ class Tools:
                 kw["on_idle"] = _str(a, "on_idle")
             if isinstance(a.get("require"), dict) and a["require"]:
                 kw["require"] = a["require"]
+            names = a.get("storage")
+            if names:
+                if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                    raise ToolError("storage must be a list of bucket names")
+                kw["storage"] = True if names == ["*"] else {"buckets": names}
         up = self._up or up_mod.up
         kw["creds"] = up_mod.resolve_credentials(provider, {})
         try:
@@ -275,6 +297,28 @@ class Tools:
     def delete_volume(self, a: dict) -> str:
         self._hosted_api().delete_volume(_str(a, "volume_id"))
         return "deleting"
+
+    def list_buckets(self, a: dict) -> str:
+        api = self._hosted_api()
+        rows = api.buckets()
+        head = f"endpoint: {api.storage_info()['endpoint_url']}"
+        if not rows:
+            return head + "\nno buckets"
+        return head + "\n" + "\n".join(
+            f"{b['name']}: {b['region']}, {b['size_gb']:.3f} GB in {b['objects']} objects"
+            + (f", objects expire after {b['expire_days']} days" if b.get("expire_days") else "")
+            for b in rows)
+
+    def create_bucket(self, a: dict) -> str:
+        days = a.get("expire_days")
+        if days is not None and (isinstance(days, bool) or not isinstance(days, int)):
+            raise ToolError("expire_days must be a whole number of days")
+        b = self._hosted_api().create_bucket(_str(a, "name"), expire_days=days)
+        return f"bucket {b['name']} ({b['region']}) is ready"
+
+    def delete_bucket(self, a: dict) -> str:
+        b = self._hosted_api().delete_bucket(_str(a, "name"))
+        return f"bucket {b['name']} is {b['state']}"
 
     # ── commands and tasks ────────────────────────────────────────────────
     def exec(self, a: dict) -> str:

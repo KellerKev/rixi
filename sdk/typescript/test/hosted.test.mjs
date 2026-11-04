@@ -22,6 +22,13 @@ function fakeService() {
     if (u.pathname === "/api/boxes/bx1" && method === "DELETE") return json({ ...box, state: "releasing" });
     if (u.pathname === "/api/boxes/bx1/tokens") return json({ token: "box-token", expires_at: Date.now() / 1000 + 3600 });
     if (u.pathname === "/api/volumes" && method === "POST") return json({ id: "v1", ...JSON.parse(init.body) }, 202);
+    if (u.pathname === "/api/buckets" && method === "GET")
+      return json({ buckets: [{ id: "bk1", name: "results", region: "fr-par" }],
+                    endpoint_url: "https://s3.test", regions: ["fr-par"] });
+    if (u.pathname === "/api/buckets" && method === "POST") return json({ id: "bk2", ...JSON.parse(init.body) }, 201);
+    if (u.pathname === "/api/buckets/bk1") return json({ id: "bk1", name: "results", state: "deleting" });
+    if (u.pathname === "/api/s3-keys" && method === "POST")
+      return json({ access_key: "RXK", secret_key: "sec", ...JSON.parse(init.body) }, 201);
     return json({ detail: "nope" }, 404);
   };
   return calls;
@@ -55,4 +62,20 @@ test("volumes", async () => {
   const v = await api.createVolume("data", 50, "fr-par-2");
   assert.equal(v.id, "v1");
   assert.deepEqual(calls.at(-1).body, { name: "data", size_gb: 50, zone: "fr-par-2" });
+});
+
+test("buckets, keys, and storage on a box", async () => {
+  const calls = fakeService();
+  const api = new Eutonomous({ apiKey: "rxk_test", apiUrl: "https://rixi.test" });
+  assert.equal((await api.storageInfo()).endpoint_url, "https://s3.test");
+  await api.createBucket("logs", { expireDays: 7 });
+  assert.deepEqual(calls.at(-1).body, { name: "logs", expire_days: 7 });
+  await api.deleteBucket("results", { force: true });
+  assert.equal(calls.at(-1).method, "DELETE");
+  await assert.rejects(api.deleteBucket("nope"), /no bucket nope/);
+  const k = await api.createS3Key("ci", { buckets: ["results"], write: false });
+  assert.equal(k.secret_key, "sec");
+  assert.deepEqual(calls.at(-1).body, { name: "ci", write: false, buckets: ["results"] });
+  await api.launch({ storage: true });
+  assert.deepEqual(calls.at(-1).body, { template: "cpu-s", storage: {} });
 });
