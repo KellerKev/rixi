@@ -61,5 +61,10 @@ def build_service(cfg: DirectConfig, audit=None) -> DirectService:
                  for name in {t.provider for t in cfg.templates.values()}}
     authorize = http_authorizer(cfg.authorizer_url, cfg.authorizer_token) \
         if cfg.authorizer_url else None
-    return DirectService(cfg, Store(cfg.store), providers, make_dns(cfg.dns, cfg.providers),
-                         authorize=authorize, audit=audit)
+    store = Store(cfg.store)
+    storage = None
+    if cfg.storage is not None:
+        from .storage import StorageService
+        storage = StorageService(cfg, store, authorize=authorize, audit=audit)
+    return DirectService(cfg, store, providers, make_dns(cfg.dns, cfg.providers),
+                         authorize=authorize, audit=audit, storage=storage)

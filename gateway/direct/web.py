@@ -9,6 +9,8 @@
     GET    /api/usage?since=              billable box time and volume GB-hours (admin: all, or ?tenant=)
     POST   /api/boxes/<id>/stop · /start   power a ready box off (disk kept) · back on
     POST   /api/volumes · GET · DELETE /api/volumes/<id>   persistent volumes
+    POST   /api/buckets · GET · GET|PATCH|DELETE /api/buckets/<id>   S3 buckets (?force=1 empties)
+    POST   /api/s3-keys · GET · DELETE /api/s3-keys/<access key>     S3 keys (secret shown once)
     POST   /api/tenants/<tenant>/stop     admin: release every box of a tenant
     POST   /gw/heartbeat                  box → gateway; authenticated by the box's own secret
     GET    /healthz
@@ -109,7 +111,7 @@ async def _call(fn, *a, **kw):
     try:
         return await asyncio.to_thread(fn, *a, **kw)
     except NotFound:
-        raise json_error(404, "no such box")
+        raise json_error(404, "not found")
     except Denied as d:
         raise json_error(d.status, d.reason)
 
@@ -133,8 +135,15 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
     @app.use(ctxd.caller)
     async def templates(ctx):
         # The release the boxes install, so a caller can pin the client to the same one.
-        return {"templates": await _call(svc.templates), "rixi_ref": cfg.rixi_ref,
-                "rixi_repo": cfg.rixi_repo}
+        out = {"templates": await _call(svc.templates), "rixi_ref": cfg.rixi_ref,
+               "rixi_repo": cfg.rixi_repo}
+        if cfg.storage is not None:
+            st = cfg.storage
+            out["storage"] = {"endpoint_url": st.endpoint_url, "regions": list(st.regions),
+                              "eur_per_gb_hour": st.eur_per_gb_hour,
+                              "eur_per_gb_hour_onezone": st.eur_per_gb_hour_onezone,
+                              "eur_per_gb_egress": st.eur_per_gb_egress}
+        return out
 
     @app.route("/api/boxes", method="POST")
     @app.use(ctxd.caller)
@@ -152,6 +161,9 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         volumes = body.get("volumes") or []
         if not isinstance(volumes, list) or not all(isinstance(v, str) for v in volumes):
             raise json_error(400, "volumes must be a list of volume ids")
+        storage = body.get("storage")
+        if storage is not None and not isinstance(storage, dict):
+            raise json_error(400, "storage must be an object: {buckets?, write?}")
         require, among = body.get("require"), body.get("among")
         if require is not None and not isinstance(require, dict):
             raise json_error(400, "require must be an object, e.g. {\"gpu_ram_gb\": 40}")
@@ -163,7 +175,7 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
                           idle_timeout=_num(body, "idle_timeout", default=-1, allow_null=True),
                           ssh_key=_str(body, "ssh_key"), serve=serve, policy=policy, llm=llm,
                           volumes=volumes, on_idle=_str(body, "on_idle") or "release",
-                          require=require, among=among)
+                          require=require, among=among, storage=storage)
         out = box.public(svc.clock())
         key = getattr(box, "endpoint_key", None)
         if key:
@@ -237,7 +249,82 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
             raise json_error(400, "since must be a unix timestamp")
         rows = await _call(svc.usage, ctx.caller, since, q.get("tenant") or None)
         vols = await _call(svc.volume_usage, ctx.caller, since, q.get("tenant") or None)
-        return {"now": svc.clock(), "usage": rows, "volumes": vols}
+        out = {"now": svc.clock(), "usage": rows, "volumes": vols}
+        if svc.storage is not None:
+            out["storage"] = await _call(svc.storage.usage, ctx.caller, since,
+                                         q.get("tenant") or None)
+        return out
+
+    def _storage():
+        if svc.storage is None:
+            raise json_error(404, "this gateway offers no storage")
+        return svc.storage
+
+    @app.route("/api/buckets", method="POST")
+    @app.use(ctxd.caller)
+    async def create_bucket(ctx):
+        body = _body()
+        days = body.get("expire_days")
+        b = await _call(_storage().create_bucket, ctx.caller, _str(body, "name", required=True),
+                        _str(body, "region"), days)
+        ombott_ng.response.status = 201
+        return b.public()
+
+    @app.route("/api/buckets")
+    @app.use(ctxd.caller)
+    async def buckets(ctx):
+        st = _storage()
+        rows = await _call(st.list_buckets, ctx.caller,
+                           ombott_ng.request.query.get("tenant") or None)
+        return {"buckets": [b.public() for b in rows], "endpoint_url": st.st.endpoint_url,
+                "regions": list(st.st.regions)}
+
+    @app.route("/api/buckets/<bucket_id>")
+    @app.use(ctxd.caller)
+    async def bucket(ctx, bucket_id):
+        return (await _call(_storage().get_bucket, ctx.caller, bucket_id)).public()
+
+    @app.route("/api/buckets/<bucket_id>", method="PATCH")
+    @app.use(ctxd.caller)
+    async def patch_bucket(ctx, bucket_id):
+        body = _body()
+        if "expire_days" not in body:
+            raise json_error(400, "only expire_days can be changed")
+        return (await _call(_storage().set_expiry, ctx.caller, bucket_id,
+                            body["expire_days"])).public()
+
+    @app.route("/api/buckets/<bucket_id>", method="DELETE")
+    @app.use(ctxd.caller)
+    async def delete_bucket(ctx, bucket_id):
+        force = ombott_ng.request.query.get("force", "") in ("1", "true", "yes")
+        return (await _call(_storage().delete_bucket, ctx.caller, bucket_id, force)).public()
+
+    @app.route("/api/s3-keys", method="POST")
+    @app.use(ctxd.caller)
+    async def create_s3_key(ctx):
+        body = _body()
+        bks = body.get("buckets")
+        write = body.get("write", True)
+        if not isinstance(write, bool):
+            raise json_error(400, "write must be true or false")
+        st = _storage()
+        k, secret = await _call(st.create_key, ctx.caller, _str(body, "name", required=True),
+                                bks, write)
+        ombott_ng.response.status = 201
+        # The secret is shown here once; the gateway keeps it only encrypted, for checking.
+        return {**k.public(), "secret_key": secret, "endpoint_url": st.st.endpoint_url,
+                "region": st.st.regions[0]}
+
+    @app.route("/api/s3-keys")
+    @app.use(ctxd.caller)
+    async def s3_keys(ctx):
+        rows = await _call(_storage().list_keys, ctx.caller)
+        return {"keys": [k.public() for k in rows]}
+
+    @app.route("/api/s3-keys/<access_key>", method="DELETE")
+    @app.use(ctxd.caller)
+    async def revoke_s3_key(ctx, access_key):
+        return (await _call(_storage().revoke_key, ctx.caller, access_key)).public()
 
     @app.route("/api/tenants/<tenant>/stop", method="POST")
     @app.use(ctxd.admin)

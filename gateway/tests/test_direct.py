@@ -419,6 +419,9 @@ class SyncClient:
     def delete(self, url, **kw):
         return self._req("DELETE", url, **kw)
 
+    def patch(self, url, **kw):
+        return self._req("PATCH", url, **kw)
+
 
 def _api():
     priv, pub = _keys()

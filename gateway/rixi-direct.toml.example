@@ -57,3 +57,13 @@ zones          = ["fr-par-2", "pl-waw-2"]
 image          = "ubuntu_noble_gpu_os_12"
 root_volume_gb = 100
 # eur_per_hour = 0.7875   # overrides offerings.toml (refresh it with `python -m gateway.offerings --refresh`)
+
+# Optional: S3 buckets for tenants behind the proxy (python -m gateway.direct.s3proxy).
+# [direct.storage]
+# endpoint_url = "https://s3.example.com"            # the proxy, behind TLS
+# upstream     = "https://s3.{region}.scw.cloud"     # the real object storage, per region
+# regions      = ["fr-par"]
+# access_key   = "${env:RIXI_S3_ACCESS_KEY}"         # never leaves the gateway and proxy
+# secret_key   = "${env:RIXI_S3_SECRET_KEY}"
+# key_secret   = "${env:RIXI_S3_KEY_SECRET}"         # Fernet key for tenants' secrets at rest
+# scan_interval = "1h"

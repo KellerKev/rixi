@@ -21,6 +21,7 @@ greenlet = ">=3"     # sqlalchemy async layer (sqladal imports aio even for the 
 dnspython = ">=2.6"  # direct mode: wait for a box record on every authoritative nameserver
 caddy = ">=2.10"     # tests adapt the box Caddyfile with the real binary
 psycopg = ">=3.2"
+boto3 = ">=1.38"     # tests drive the S3 proxy with the real AWS SDK
 
 [pypi-dependencies]
 # the SDK in this repo: direct mode compiles network policies with rixi.policy
@@ -28,7 +29,7 @@ rixi = { path = "..", editable = true }
 # control plane: JWT RBAC, management API, OpenTelemetry + DuckDB audit
 pyjwt = ">=2.8"
 requests = "*"                                  # JWKS fetch (matches the core server)
-httpx = "*"                                     # tests drive the direct-mode ASGI app in-process
+httpx = "*"                                     # the S3 proxy upstream; tests drive the ASGI apps
 fastapi = "*"
 uvicorn = "*"
 duckdb = ">=0.10"                               # queryable audit store

@@ -72,8 +72,38 @@ on with its disk, name, firewall and volumes; `on_idle: "stop"` does that instea
 an idle box. A stopped box is released after `limits.max_stopped` (7 days).
 
 Billing stays outside: `GET /api/usage?since=` returns each box's rate (snapshotted at claim), its running
-and stopped minutes (and the stopped disk's rate), and each volume's GB-hours, and an optional authorizer URL must approve every claim. A tenant can be
+and stopped minutes (and the stopped disk's rate), each volume's GB-hours and each bucket's
+GB-hours and downloaded GB, and an optional authorizer URL must approve every claim. A tenant can be
 stopped with `POST /api/tenants/<t>/stop`.
+
+### S3 storage for tenants (`[direct.storage]`)
+
+Buckets for many tenants on **one** object-storage account, without handing anyone that
+account's key. `python -m gateway.direct.s3proxy --config rixi-direct.toml --bind 127.0.0.1:7102`
+runs an S3-compatible proxy (put it behind TLS at `endpoint_url`; with nginx, pass the request URI
+and `Host` unchanged and turn request buffering off):
+
+- Every tenant bucket is a real bucket named `<bucket_prefix><id>`, tagged with its tenant, with an
+  abort-unfinished-uploads rule and optional expiry. Tenants only ever see their own names.
+- Tenants get **their own access keys** (`POST /api/s3-keys {name, buckets?, write?}` — the secret
+  is returned once and kept only encrypted, with `key_secret`). A key can be limited to some
+  buckets and to reading. A claim's `storage: {buckets?, write?}` gives the box a key that only
+  works while that box is live; the box gets `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` (and `METAFLOW_S3_ENDPOINT_URL`), so aws-cli, boto3, s3fs and Metaflow
+  find the buckets without setup.
+- The proxy checks each request's sigv4 (headers or presigned URL, signed chunks chunk by chunk, a
+  signed body hash before the last piece is forwarded), keeps it inside the key's buckets, allows
+  object, multipart, listing and tagging operations only — no bucket policies, ACLs other than
+  private, CORS, website or replication — and re-signs it with the operator's key. Bodies stream
+  through; only listings and errors are rewritten (to the tenant's bucket name).
+- Adding data asks the authorizer (`action: "storage.write"`, cached for a minute) and stops at
+  `limits.max_storage_gb`; reading and deleting never ask, so a tenant who runs out of credit can
+  still take their data out and clean up.
+- Metering: the gateway measures each bucket every `scan_interval` and accumulates GB-hours by
+  storage class (Standard and One Zone IA); the proxy counts downloaded bytes.
+
+`POST /api/buckets {name, region?, expire_days?}` · `GET /api/buckets` · `PATCH /api/buckets/<id>
+{expire_days}` · `DELETE /api/buckets/<id>[?force=1]` (force empties it first).
 
 ## Resource catalog — declare compute in TOML (no OpenTofu required)
 

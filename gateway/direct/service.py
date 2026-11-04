@@ -68,8 +68,9 @@ def _hash(secret: str) -> str:
 class DirectService:
     def __init__(self, cfg: DirectConfig, store: Store, providers: Dict[str, object], dns,
                  authorize: Optional[Callable[[dict], tuple]] = None, audit=None,
-                 clock: Callable[[], float] = time.time, workers: int = 8):
+                 clock: Callable[[], float] = time.time, workers: int = 8, storage=None):
         self.cfg = cfg
+        self.storage = storage              # StorageService, when [direct.storage] is set
         self.store = store
         self.providers = providers
         self.dns = dns
@@ -184,7 +185,8 @@ class DirectService:
               ssh_key: Optional[str] = None, serve: Optional[dict] = None,
               policy: Optional[dict] = None, llm: Optional[dict] = None,
               volumes: Optional[List[str]] = None, on_idle: str = "release",
-              require: Optional[dict] = None, among: Optional[List[str]] = None) -> Box:
+              require: Optional[dict] = None, among: Optional[List[str]] = None,
+              storage: Optional[dict] = None) -> Box:
         tenant = caller.tenant
         if not tenant or not _TENANT.match(tenant):
             raise Denied("token carries no usable tenant claim", 403)
@@ -229,6 +231,15 @@ class DirectService:
         if llm is not None and not cloudinit.valid_llm(llm):
             raise Denied("llm must be {openai_base_url: https://…, anthropic_base_url?: "
                          "https://…, token: 8-256 key characters}", 400)
+        if storage is not None:
+            if self.storage is None:
+                raise Denied("this gateway offers no storage", 400)
+            if not isinstance(storage, dict) or set(storage) - {"buckets", "write"}:
+                raise Denied("storage must be {buckets?: [names], write?: bool}", 400)
+            sb = storage.get("buckets")
+            if sb is not None and not (isinstance(sb, list) and sb and
+                                       all(isinstance(n, str) for n in sb)):
+                raise Denied("storage.buckets must be a list of bucket names", 400)
         rate = self.rate(t)
 
         live = self.store.list(tenant=tenant, live_only=True)
@@ -268,6 +279,20 @@ class DirectService:
                                                  box_id=None)
                 raise Denied(f"volume {v.name} is no longer available", 409)
             taken.append(v.id)
+        s3 = None
+        if storage is not None:
+            # The box's own key: works only while this box is live, revoked when it ends.
+            try:
+                k, secret_key = self.storage.box_key(tenant, caller.sub, box_id,
+                                                     storage.get("buckets"),
+                                                     bool(storage.get("write", True)))
+            except Denied:
+                for got in taken:
+                    self.store.transition_volume(got, ("attached",), state="available",
+                                                 box_id=None)
+                raise
+            s3 = {"endpoint": self.storage.st.endpoint_url, "access_key": k.access_key,
+                  "secret_key": secret_key, "region": self.storage.st.regions[0]}
         disk_gb = t.root_volume_gb or self.cfg.root_disk_gb
         box = Box(id=box_id, tenant=tenant, owner=caller.sub, template=t.name,
                   provider=t.provider, instance_type=t.instance_type, zone=zone,
@@ -282,7 +307,7 @@ class DirectService:
         user_data = cloudinit.render(self.cfg, box_id=box_id, tenant=tenant,
                                      hostname=box.hostname, box_secret=secret, ssh_key=ssh_key,
                                      serve=serve, llm=llm,
-                                     volumes=[(v.provider_id, v.name) for v in vols])
+                                     volumes=[(v.provider_id, v.name) for v in vols], s3=s3)
         self.store.insert(box)
         self.audit("box.claimed", box=box_id, tenant=tenant, sub=caller.sub, template=t.name,
                    zone=zone, eur_per_hour=rate)
@@ -371,6 +396,8 @@ class DirectService:
                 log.warning("dns cleanup for %s failed: %s", box.id, exc)
             for vid in box.volume_ids():          # the volume outlives the box
                 self.store.transition_volume(vid, ("attached",), state="available", box_id=None)
+            if self.storage is not None:
+                self.storage.revoke_box_keys(box.id)
             final = "failed" if box.end_reason == "provision_failed" else "gone"
             if self.store.transition(box.id, ("releasing",), state=final, ended_at=self.clock()):
                 self.audit("box.gone", box=box.id, tenant=box.tenant, reason=box.end_reason,
@@ -770,7 +797,11 @@ class DirectService:
                        (self.reconcile_once, self.cfg.reconcile_interval)):
             threading.Thread(target=loop, args=(fn, iv), daemon=True,
                              name=f"rixi-{fn.__name__}").start()
+        if self.storage is not None:
+            self.storage.start(self._stop)
 
     def stop(self, wait: bool = True) -> None:
         self._stop.set()
         self._pool.shutdown(wait=wait)
+        if self.storage is not None:
+            self.storage.stop()

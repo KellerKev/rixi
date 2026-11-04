@@ -27,6 +27,14 @@
     provider = "scaleway"          # or "none"
     zone = "example.com"
 
+    [direct.storage]               # optional: S3 buckets behind the proxy (gateway.direct.s3proxy)
+    endpoint_url = "https://s3.example.com"           # where clients and boxes reach the proxy
+    upstream     = "https://s3.{region}.scw.cloud"    # the real object storage, per region
+    regions      = ["fr-par"]
+    access_key   = "${env:RIXI_S3_ACCESS_KEY}"        # the operator's key; never leaves the proxy
+    secret_key   = "${env:RIXI_S3_SECRET_KEY}"
+    key_secret   = "${env:RIXI_S3_KEY_SECRET}"        # Fernet key: customer secrets at rest
+
     [template.l4]
     provider = "scaleway"
     type = "L4-1-24G"
@@ -81,6 +89,28 @@ class Limits:
     max_volumes: int = 10                  # persistent volumes per tenant
     max_volume_gb: int = 1000              # size of one volume
     max_stopped: float = 7 * 24 * 3600     # a stopped box is released after this long
+    max_buckets: int = 20                  # S3 buckets per tenant
+    max_storage_gb: float = 1000.0         # what a tenant's buckets may hold in all
+    max_s3_keys: int = 20                  # S3 access keys per tenant (box keys not counted)
+
+
+@dataclass(frozen=True)
+class StorageConfig:
+    """S3 buckets for tenants, on one operator account: the proxy checks each request against
+    the tenant's own key, keeps it inside the tenant's buckets, and signs it again upstream."""
+    endpoint_url: str
+    upstream: str
+    regions: Tuple[str, ...]
+    access_key: str
+    secret_key: str
+    key_secret: str
+    bucket_prefix: str = "rixi-"
+    # Scaleway Object Storage, catalog 2026-11: Standard (multi-AZ), One Zone IA, egress per GB
+    eur_per_gb_hour: float = 0.000022
+    eur_per_gb_hour_onezone: float = 0.000011
+    eur_per_gb_egress: float = 0.01
+    scan_interval: float = 3600.0          # how often each bucket's size is measured
+    abort_multipart_days: int = 7          # unfinished uploads are dropped after this long
 
 
 @dataclass(frozen=True)
@@ -117,6 +147,7 @@ class DirectConfig:
     providers: Dict[str, dict] = field(default_factory=dict)
     dns: dict = field(default_factory=dict)
     templates: Dict[str, Template] = field(default_factory=dict)
+    storage: Optional[StorageConfig] = None
 
     @property
     def bootstrap(self) -> str:
@@ -142,6 +173,42 @@ def _acme_ca(v) -> Optional[str]:
     if v == "zerossl" or re.fullmatch(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)*/?", v):
         return v
     raise ConfigError(f"acme_ca must be letsencrypt, zerossl or an https ACME directory, not {v!r}")
+
+
+def _storage(st: dict, allowed: Optional[Tuple[str, ...]]) -> Optional[StorageConfig]:
+    if not st:
+        return None
+    for key in ("endpoint_url", "upstream", "access_key", "secret_key", "key_secret"):
+        if not st.get(key):
+            raise ConfigError(f"[direct.storage] needs {key}")
+    regions = tuple(st.get("regions") or ())
+    if not regions:
+        raise ConfigError("[direct.storage] needs regions")
+    if allowed is not None:
+        outside = [r for r in regions if not any(z.startswith(r + "-") or z == r for z in allowed)]
+        if outside:
+            raise ConfigError(f"[direct.storage] regions {outside} are outside allowed_regions")
+    if not str(st["endpoint_url"]).startswith("https://") and not st.get("allow_http"):
+        raise ConfigError("[direct.storage] endpoint_url must be https")
+    try:
+        from cryptography.fernet import Fernet
+        Fernet(st["key_secret"])
+    except Exception:
+        raise ConfigError("[direct.storage] key_secret must be a Fernet key "
+                          "(python -c 'from cryptography.fernet import Fernet; "
+                          "print(Fernet.generate_key().decode())')")
+    prefix = str(st.get("bucket_prefix", "rixi-"))
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", prefix):
+        raise ConfigError("[direct.storage] bucket_prefix: lowercase letters, digits, '-'")
+    return StorageConfig(
+        endpoint_url=str(st["endpoint_url"]).rstrip("/"), upstream=str(st["upstream"]),
+        regions=regions, access_key=st["access_key"], secret_key=st["secret_key"],
+        key_secret=st["key_secret"], bucket_prefix=prefix,
+        eur_per_gb_hour=float(st.get("eur_per_gb_hour", 0.000022)),
+        eur_per_gb_hour_onezone=float(st.get("eur_per_gb_hour_onezone", 0.000011)),
+        eur_per_gb_egress=float(st.get("eur_per_gb_egress", 0.01)),
+        scan_interval=_duration(st.get("scan_interval", "1h")),
+        abort_multipart_days=int(st.get("abort_multipart_days", 7)))
 
 
 def parse(data: dict) -> DirectConfig:
@@ -170,6 +237,9 @@ def parse(data: dict) -> DirectConfig:
         max_volumes=int(lim.get("max_volumes", 10)),
         max_volume_gb=int(lim.get("max_volume_gb", 1000)),
         max_stopped=_duration(lim.get("max_stopped", "7d")),
+        max_buckets=int(lim.get("max_buckets", 20)),
+        max_storage_gb=float(lim.get("max_storage_gb", 1000)),
+        max_s3_keys=int(lim.get("max_s3_keys", 20)),
     )
     if limits.default_ttl > limits.max_ttl:
         raise ConfigError("[direct.limits] default_ttl exceeds max_ttl")
@@ -220,7 +290,7 @@ def parse(data: dict) -> DirectConfig:
         volume_eur_per_gb_hour=float(d.get("volume_eur_per_gb_hour", 0.00013)),
         root_disk_gb=int(d.get("root_disk_gb", 20)),
         limits=limits, providers=dict(d.get("providers") or {}), dns=dict(d.get("dns") or {}),
-        templates=templates)
+        templates=templates, storage=_storage(dict(d.get("storage") or {}), allowed))
 
 
 def load(path) -> DirectConfig:

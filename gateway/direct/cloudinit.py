@@ -60,7 +60,8 @@ def valid_llm(llm: dict) -> bool:
 
 def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_secret: str,
            ssh_key: Optional[str] = None, serve: Optional[dict] = None,
-           llm: Optional[dict] = None, volumes: Optional[list] = None) -> str:
+           llm: Optional[dict] = None, volumes: Optional[list] = None,
+           s3: Optional[dict] = None) -> str:
     env = {
         "RIXI_BOX_ID": box_id,
         "RIXI_TENANT": tenant,
@@ -99,6 +100,12 @@ def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_se
         # provider id:name pairs; the box finds each disk by id and mounts it under
         # /workspace/data/<name>, formatting it only the first time.
         env["RIXI_VOLUMES"] = "+".join(f"{pid}:{name}" for pid, name in volumes)
+    if s3:
+        # S3 through the gateway's proxy, with a key that dies with this box.
+        env["RIXI_S3_ENDPOINT"] = s3["endpoint"]
+        env["RIXI_S3_ACCESS_KEY"] = s3["access_key"]
+        env["RIXI_S3_SECRET_KEY"] = s3["secret_key"]
+        env["RIXI_S3_REGION"] = s3["region"]
     for k, v in env.items():
         if not _SAFE.match(v):
             raise ValueError(f"{k} contains characters not allowed in box env")

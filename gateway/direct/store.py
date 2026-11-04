@@ -1,4 +1,5 @@
-"""Durable state for direct mode — boxes, volumes, heartbeat credentials, and revoked tokens.
+"""Durable state for direct mode — boxes, volumes, buckets and S3 keys, heartbeat credentials,
+and revoked tokens.
 
 Everything that must survive a gateway restart lives here: which boxes exist, who owns them, what
 they cost, and when they started and stopped (the usage record billing is built on). Built on
@@ -130,6 +131,108 @@ class Volume:
         return d
 
 
+BUCKET_LIVE = ("ready", "deleting")
+
+
+@dataclass
+class Bucket:
+    """An S3 bucket of a tenant: a real bucket under the operator's account (`real_name`),
+    reached only through the proxy under the tenant's own `name`. Billed per GB-hour of what it
+    holds (measured by the scanner) and per GB downloaded through the proxy."""
+    id: str
+    tenant: str
+    owner: str
+    name: str
+    region: str
+    real_name: str
+    state: str = "ready"
+    created_at: float = 0.0
+    deleted_at: Optional[float] = None
+    expire_days: Optional[int] = None       # objects are deleted this many days after upload
+    # prices snapshotted at creation
+    eur_per_gb_hour: float = 0.0
+    eur_per_gb_hour_onezone: float = 0.0
+    eur_per_gb_egress: float = 0.0
+    # measured by the scanner; GB-hours accumulate between scans
+    bytes_std: float = 0.0
+    bytes_onezone: float = 0.0
+    objects: int = 0
+    scanned_at: Optional[float] = None
+    gbh_std: float = 0.0
+    gbh_onezone: float = 0.0
+    # counted by the proxy
+    egress_bytes: float = 0.0
+    ingress_bytes: float = 0.0
+    ingress_at_scan: float = 0.0            # ingress when last measured: estimates growth since
+    requests: int = 0
+    purge: int = 0                          # being deleted with everything in it
+    error: Optional[str] = None
+
+    @property
+    def live(self) -> bool:
+        return self.state in BUCKET_LIVE
+
+    def estimated_bytes(self) -> float:
+        """What it holds now, as far as we know: the last measurement plus uploads since."""
+        return self.bytes_std + self.bytes_onezone + max(
+            0.0, self.ingress_bytes - self.ingress_at_scan)
+
+    def public(self) -> dict:
+        d = {f.name: getattr(self, f.name) for f in fields(self) if f.name not in (
+            "real_name", "ingress_at_scan")}
+        d["live"] = self.live
+        d["size_gb"] = round((self.bytes_std + self.bytes_onezone) / 1e9, 6)
+        d["egress_gb"] = round(self.egress_bytes / 1e9, 6)
+        return d
+
+
+@dataclass
+class S3Key:
+    """An access key for the proxy. The secret is needed to check signatures, so it is kept,
+    encrypted; `buckets` limits the key to some of the tenant's buckets (None: all of them,
+    including ones made later), `write` allows changes. A box key lives as long as its box."""
+    access_key: str
+    tenant: str
+    owner: str
+    name: str
+    secret_enc: str
+    buckets: Optional[str] = None           # JSON list of bucket ids
+    write: int = 0
+    box_id: Optional[str] = None
+    created_at: float = 0.0
+    revoked_at: Optional[float] = None
+    last_used_at: Optional[float] = None
+
+    def bucket_ids(self) -> Optional[List[str]]:
+        return json.loads(self.buckets) if self.buckets else None
+
+    def public(self) -> dict:
+        return {"access_key": self.access_key, "tenant": self.tenant, "owner": self.owner,
+                "name": self.name, "buckets": self.bucket_ids(), "write": bool(self.write),
+                "box_id": self.box_id, "created_at": self.created_at,
+                "revoked_at": self.revoked_at, "last_used_at": self.last_used_at,
+                "active": self.revoked_at is None}
+
+
+_BFIELDS = [f.name for f in fields(Bucket)]
+_BDOUBLE = {"created_at", "deleted_at", "eur_per_gb_hour", "eur_per_gb_hour_onezone",
+            "eur_per_gb_egress", "bytes_std", "bytes_onezone", "scanned_at", "gbh_std",
+            "gbh_onezone", "egress_bytes", "ingress_bytes", "ingress_at_scan"}
+_BINT = {"expire_days", "objects", "requests", "purge"}
+_KFIELDS = [f.name for f in fields(S3Key)]
+_KDOUBLE = {"created_at", "revoked_at", "last_used_at"}
+
+
+def _plain_field(name: str, doubles: set, ints: set = frozenset(), texts: set = frozenset()):
+    if name in doubles:
+        return Field(name, "double", default=0.0 if not name.endswith("_at") else None)
+    if name in ints:
+        return Field(name, "integer", default=None if name == "expire_days" else 0)
+    if name in texts:
+        return Field(name, "text")
+    return Field(name, "string", length=512 if name == "error" else 255)
+
+
 _VFIELDS = [f.name for f in fields(Volume)]
 _VDOUBLE = {"eur_per_gb_hour", "created_at", "deleted_at"}
 
@@ -179,6 +282,13 @@ class Store:
             Field(n, "double") if n in _VDOUBLE else
             Field(n, "integer") if n == "size_gb" else
             Field(n, "string", length=512 if n == "error" else 255) for n in _VFIELDS])
+        self.db.define_table("rixi_bucket", *[
+            Field("bucket_id", "string", length=32, unique=True, notnull=True) if n == "id" else
+            _plain_field(n, _BDOUBLE, _BINT) for n in _BFIELDS])
+        self.db.define_table("rixi_s3_key", *[
+            Field("access_key", "string", length=32, unique=True, notnull=True)
+            if n == "access_key" else _plain_field(n, _KDOUBLE, {"write"}, {"secret_enc", "buckets"})
+            for n in _KFIELDS])
         self.db.define_table("rixi_revoked_jti",
                              Field("box_id", "string", length=32, notnull=True),
                              Field("jti", "string", length=128, notnull=True),
@@ -316,6 +426,97 @@ class Store:
         rows = self.db(q).select(orderby=t.created_at)
         self.db.commit()
         return [self._volume(r) for r in rows]
+
+    # -- buckets ----------------------------------------------------------
+    def _bucket(self, row) -> Bucket:
+        return Bucket(**{n: row["bucket_id" if n == "id" else n] for n in _BFIELDS})
+
+    def insert_bucket(self, b: Bucket) -> None:
+        self.db.rixi_bucket.insert(**{("bucket_id" if n == "id" else n): getattr(b, n)
+                                      for n in _BFIELDS})
+        self.db.commit()
+
+    def update_bucket(self, bucket_id: str, **changes) -> None:
+        bad = set(changes) - set(_BFIELDS) - {"id"}
+        if bad:
+            raise KeyError(f"unknown bucket fields: {sorted(bad)}")
+        self.db(self.db.rixi_bucket.bucket_id == bucket_id).update(**changes)
+        self.db.commit()
+
+    def transition_bucket(self, bucket_id: str, from_states: tuple, **changes) -> bool:
+        t = self.db.rixi_bucket
+        n = self.db((t.bucket_id == bucket_id) & t.state.belongs(list(from_states))) \
+            .update(**changes)
+        self.db.commit()
+        return n == 1
+
+    def add_bucket_traffic(self, bucket_id: str, egress: float, ingress: float,
+                           requests: int) -> None:
+        """Counters from the proxy, added in the database so concurrent flushes never lose one."""
+        self.db.executesql(
+            "UPDATE rixi_bucket SET egress_bytes = COALESCE(egress_bytes, 0) + :e, "
+            "ingress_bytes = COALESCE(ingress_bytes, 0) + :i, "
+            "requests = COALESCE(requests, 0) + :r WHERE bucket_id = :b",
+            {"e": float(egress), "i": float(ingress), "r": int(requests), "b": bucket_id})
+        self.db.commit()
+
+    def get_bucket(self, bucket_id: str) -> Optional[Bucket]:
+        row = self.db(self.db.rixi_bucket.bucket_id == bucket_id).select().first()
+        self.db.commit()
+        return self._bucket(row) if row else None
+
+    def find_bucket(self, tenant: str, name: str) -> Optional[Bucket]:
+        """A tenant's live bucket by the name the tenant gave it."""
+        t = self.db.rixi_bucket
+        row = self.db((t.tenant == tenant) & (t.name == name) &
+                      t.state.belongs(list(BUCKET_LIVE))).select().first()
+        self.db.commit()
+        return self._bucket(row) if row else None
+
+    def list_buckets(self, tenant: Optional[str] = None, live_only: bool = False,
+                     since: Optional[float] = None) -> List[Bucket]:
+        t = self.db.rixi_bucket
+        q = t.id > 0
+        if tenant is not None:
+            q &= t.tenant == tenant
+        if live_only:
+            q &= t.state.belongs(list(BUCKET_LIVE))
+        if since is not None:
+            q &= (t.deleted_at == None) | (t.deleted_at >= since)  # noqa: E711
+        rows = self.db(q).select(orderby=t.created_at)
+        self.db.commit()
+        return [self._bucket(r) for r in rows]
+
+    # -- S3 keys ----------------------------------------------------------
+    def insert_s3_key(self, k: S3Key) -> None:
+        self.db.rixi_s3_key.insert(**{n: getattr(k, n) for n in _KFIELDS})
+        self.db.commit()
+
+    def get_s3_key(self, access_key: str) -> Optional[S3Key]:
+        row = self.db(self.db.rixi_s3_key.access_key == access_key).select().first()
+        self.db.commit()
+        return S3Key(**{n: row[n] for n in _KFIELDS}) if row else None
+
+    def list_s3_keys(self, tenant: Optional[str] = None, box_id: Optional[str] = None,
+                     active_only: bool = True) -> List[S3Key]:
+        t = self.db.rixi_s3_key
+        q = t.id > 0
+        if tenant is not None:
+            q &= t.tenant == tenant
+        if box_id is not None:
+            q &= t.box_id == box_id
+        if active_only:
+            q &= t.revoked_at == None  # noqa: E711
+        rows = self.db(q).select(orderby=t.created_at)
+        self.db.commit()
+        return [S3Key(**{n: r[n] for n in _KFIELDS}) for r in rows]
+
+    def update_s3_key(self, access_key: str, **changes) -> None:
+        bad = set(changes) - set(_KFIELDS)
+        if bad:
+            raise KeyError(f"unknown key fields: {sorted(bad)}")
+        self.db(self.db.rixi_s3_key.access_key == access_key).update(**changes)
+        self.db.commit()
 
     # -- token revocation -------------------------------------------------
     def revoke(self, box_id: str, jti: str) -> None:

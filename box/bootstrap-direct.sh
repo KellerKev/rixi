@@ -17,6 +17,9 @@
 #   RIXI_SERVE_MODEL    the model to pull and serve (e.g. qwen3:8b)
 #   RIXI_ENDPOINT_KEY   bearer key for /v1; only this box has it
 #   RIXI_OLLAMA_VERSION pinned ollama release (e.g. v0.35.1)
+#   RIXI_S3_ENDPOINT / RIXI_S3_ACCESS_KEY / RIXI_S3_SECRET_KEY / RIXI_S3_REGION
+#                       optional: the tenant's buckets through the gateway's S3 proxy, with a
+#                       key that only works while this box is live
 #
 # Result: Caddy terminates TLS for RIXI_HOSTNAME on this box and forwards to the rixi server on
 # loopback, which only accepts tokens scoped to this box and tenant. Traffic never leaves the
@@ -216,6 +219,19 @@ if [ -n "${RIXI_LLM_TOKEN:-}" ]; then
       echo "ANTHROPIC_API_KEY=$RIXI_LLM_TOKEN"
     fi
   } > /etc/rixi/workload.env
+fi
+# Storage: the standard AWS variables, so aws-cli, boto3, s3fs and Metaflow find the buckets.
+if [ -n "${RIXI_S3_ACCESS_KEY:-}" ]; then
+  {
+    echo "AWS_ENDPOINT_URL_S3=$RIXI_S3_ENDPOINT"
+    echo "AWS_ACCESS_KEY_ID=$RIXI_S3_ACCESS_KEY"
+    echo "AWS_SECRET_ACCESS_KEY=$RIXI_S3_SECRET_KEY"
+    echo "AWS_REGION=$RIXI_S3_REGION"
+    echo "AWS_DEFAULT_REGION=$RIXI_S3_REGION"
+    echo "METAFLOW_S3_ENDPOINT_URL=$RIXI_S3_ENDPOINT"
+  } >> /etc/rixi/workload.env
+fi
+if [ -s /etc/rixi/workload.env ]; then
   echo 'set -a; . /etc/rixi/workload.env; set +a' > /etc/profile.d/rixi-llm.sh
 fi
 chmod 600 /etc/rixi/workload.env

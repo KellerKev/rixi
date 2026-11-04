@@ -101,3 +101,31 @@ def test_caddy_accepts_the_zerossl_config(tmp_path):
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert "acme.zerossl.com" in out.stdout and "acme-v02.api.letsencrypt.org" not in out.stdout
+
+
+def _workload_env(tmp_path, **env) -> str:
+    """Run just the workload-environment section of the bootstrap."""
+    src = BOOTSTRAP.read_text()
+    start = src.index(": > /etc/rixi/workload.env")
+    end = src.index("cat > /etc/systemd/system/rixi-server.service")
+    body = src[start:end].replace("/etc/rixi/workload.env", str(tmp_path / "workload.env")) \
+        .replace("/etc/profile.d/rixi-llm.sh", str(tmp_path / "profile.sh"))
+    subprocess.run(["bash", "-c", body], env={"PATH": os.environ["PATH"], **env}, check=True,
+                   capture_output=True)
+    return (tmp_path / "workload.env").read_text()
+
+
+def test_storage_and_model_access_both_reach_the_workload_environment(tmp_path):
+    out = _workload_env(tmp_path, RIXI_LLM_TOKEN="tok-123456", RIXI_LLM_OPENAI_URL="https://m/v1",
+                        RIXI_S3_ENDPOINT="https://s3.example.com", RIXI_S3_ACCESS_KEY="RXABC",
+                        RIXI_S3_SECRET_KEY="sec", RIXI_S3_REGION="fr-par")
+    assert "OPENAI_API_KEY=tok-123456" in out
+    assert "AWS_ENDPOINT_URL_S3=https://s3.example.com" in out
+    assert "AWS_ACCESS_KEY_ID=RXABC" in out and "AWS_SECRET_ACCESS_KEY=sec" in out
+    assert "METAFLOW_S3_ENDPOINT_URL=https://s3.example.com" in out
+    assert (tmp_path / "profile.sh").exists()
+
+
+def test_a_box_without_extras_has_an_empty_workload_environment(tmp_path):
+    assert _workload_env(tmp_path) == ""
+    assert not (tmp_path / "profile.sh").exists()
