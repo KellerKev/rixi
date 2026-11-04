@@ -426,6 +426,7 @@ def test_downloads_are_counted_and_storage_is_measured_into_gb_hours(env):
         time.sleep(0.05)
     got = env.store.get_bucket(b.id)
     assert got.egress_bytes >= 3 * len(data) and got.ingress_bytes >= len(data)
+    assert env.store.get_s3_key(s3._request_signer._credentials.access_key).last_used_at
     # one measurement two hours after creation: the mean of 0 and 500 kB, for two hours
     env.now[0] = b.created_at + 7200
     env.storage.measure(env.store.get_bucket(b.id))

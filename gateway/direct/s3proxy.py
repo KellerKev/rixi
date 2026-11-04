@@ -172,6 +172,7 @@ class Proxy:
         self._buckets: Dict[Tuple[str, str], Tuple[float, Optional[Bucket]]] = {}
         self._tenant_bytes: Dict[str, Tuple[float, float]] = {}
         self._traffic: Dict[str, List[float]] = {}
+        self._key_seen: Dict[str, float] = {}       # access key → when it last signed a request
         self._flusher: Optional[asyncio.Task] = None
 
     # -- cached lookups ---------------------------------------------------
@@ -236,6 +237,12 @@ class Proxy:
         c[2] += requests
 
     async def flush(self) -> None:
+        used, self._key_seen = self._key_seen, {}
+        for ak, at in used.items():
+            try:
+                await asyncio.to_thread(self.store.update_s3_key, ak, last_used_at=at)
+            except Exception:
+                log.exception("could not record use of key %s", ak)
         traffic, self._traffic = self._traffic, {}
         for bid, (e, i, r) in traffic.items():
             try:
@@ -347,6 +354,7 @@ class Proxy:
         signing_key = sigv4.verify(signed, secret, method, raw_path, headers, now=self.clock(),
                                    v2_resource=raw_path if prefix_raw else
                                    f"/{bucket_name}{raw_path}")
+        self._key_seen[key.access_key] = self.clock()
         caller = Caller(sub=key.owner, tenant=key.tenant)
         q = dict(signed.pairs)
         for p in [p for p in q if p.startswith("X-Amz-") or
