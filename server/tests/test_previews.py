@@ -52,7 +52,7 @@ def test_certificates_only_for_opened_ports_and_only_for_caddy(srv):
     assert ask(srv, f"8000.{DOMAIN}") == 200
     assert ask(srv, f"8001.{DOMAIN}") == 404                  # not opened
     assert ask(srv, f"9000.{DOMAIN}") == 404
-    assert ask(srv, f"8000.b-other.run.example.test") == 404
+    assert ask(srv, "8000.b-other.run.example.test") == 404
     assert ask(srv, f"8000.{DOMAIN}", gate="wrong") == 404
 
 
@@ -67,7 +67,7 @@ def test_a_private_preview_needs_its_share_link_once_then_the_cookie(srv):
     assert "Domain" not in cookie                                # this host only
     assert auth(srv, host, "/app", cookie=token).status_code == 200
     assert auth(srv, host, "/app", cookie="forged").status_code == 401
-    assert auth(srv, host, f"/?rixi_preview=forged").status_code == 401
+    assert auth(srv, host, "/?rixi_preview=forged").status_code == 401
 
 
 def test_public_previews_closing_and_the_gate(srv):
