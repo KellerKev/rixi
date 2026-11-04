@@ -368,6 +368,15 @@ def test_presigned_urls_work_until_they_expire(env):
     time.sleep(2)
     r = httpx.get(old, verify=False)
     assert r.status_code == 403 and b"expired" in r.content
+    # boto3's default for custom endpoints: Signature Version 2 query parameters
+    v2 = client(env, *key_for(env, A), signature_version="s3")
+    url = v2.generate_presigned_url("get_object", Params={"Bucket": "shared", "Key": "report.pdf",
+                                                          "ResponseContentType": "application/pdf"},
+                                    ExpiresIn=60)
+    assert "AWSAccessKeyId=" in url
+    r = httpx.get(url, verify=False)
+    assert r.status_code == 200 and r.content == b"%PDF", r.text
+    assert httpx.get(url.replace("report.pdf", "other.pdf"), verify=False).status_code == 403
 
 
 # ── money ───────────────────────────────────────────────────────────────

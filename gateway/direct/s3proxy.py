@@ -344,10 +344,13 @@ class Proxy:
                           "The access key you provided does not exist in our records.")
         if key.box_id and not await self._box_live(key.box_id):
             raise S3Error(403, "InvalidAccessKeyId", "This key belonged to a box that has ended.")
-        signing_key = sigv4.verify(signed, secret, method, raw_path, headers, now=self.clock())
+        signing_key = sigv4.verify(signed, secret, method, raw_path, headers, now=self.clock(),
+                                   v2_resource=raw_path if prefix_raw else
+                                   f"/{bucket_name}{raw_path}")
         caller = Caller(sub=key.owner, tenant=key.tenant)
         q = dict(signed.pairs)
-        for p in [p for p in q if p.startswith("X-Amz-")]:
+        for p in [p for p in q if p.startswith("X-Amz-") or
+                  (signed.v2 and p in ("AWSAccessKeyId", "Signature", "Expires"))]:
             q.pop(p)
 
         if not bucket_name:
@@ -425,8 +428,10 @@ class Proxy:
         path = f"/{bucket.real_name}" + (f"/{key_raw}" if has_key else "")
         if not has_key and raw_path.endswith("/") and prefix_raw:
             path = f"/{bucket.real_name}/"
+        auth_params = ("X-Amz-",) + (("AWSAccessKeyId=", "Signature=", "Expires=")
+                                     if signed.v2 else ())
         upstream_query = "&".join(part for part in raw_query.split("&")
-                                  if part and not part.startswith("X-Amz-"))
+                                  if part and not part.startswith(auth_params))
         endpoint = self.storage.client.endpoint(bucket.region)
         up_host = urlparse(endpoint).netloc
         signed_headers = sigv4.sign(method, up_host, path, upstream_query, fwd,

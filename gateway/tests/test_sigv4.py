@@ -8,7 +8,7 @@ import time
 import pytest
 
 botocore = pytest.importorskip("botocore")
-from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth  # noqa: E402
+from botocore.auth import HmacV1QueryAuth, S3SigV4Auth, S3SigV4QueryAuth  # noqa: E402
 from botocore.awsrequest import AWSRequest  # noqa: E402
 from botocore.credentials import Credentials  # noqa: E402
 
@@ -126,3 +126,20 @@ def test_a_reordered_or_truncated_chunk_stream_is_refused():
     dec = sigv4.ChunkDecoder(key, "b" * 64, "20261104T000000Z", scope, len(body) - 1)
     with pytest.raises(sigv4.SigError):
         dec.feed(wire)
+
+
+def test_signature_version_2_presigned_urls_from_botocore_verify():
+    for query in ("", "?response-content-type=text%2Fplain&versionId=v1"):
+        req = AWSRequest(method="GET", url=f"https://s3.example.com{PATH}{query}")
+        HmacV1QueryAuth(Credentials(AK, SK), expires=300).add_auth(req)
+        path, query_s, _ = _parts(req)
+        headers = {"host": "s3.example.com"}
+        s = sigv4.parse(query_s, headers)
+        assert s.v2 and s.presigned and s.access_key == AK
+        sigv4.verify(s, SK, "GET", path, headers)
+        with pytest.raises(sigv4.SigError, match="expired"):
+            sigv4.verify(s, SK, "GET", path, headers, now=time.time() + 301)
+        with pytest.raises(sigv4.SigError):
+            sigv4.verify(s, SK, "GET", path.replace("bucket", "other"), headers)
+        with pytest.raises(sigv4.SigError):
+            sigv4.verify(s, SK, "DELETE", path, headers)

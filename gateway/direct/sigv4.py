@@ -4,6 +4,10 @@ Both directions use the same canonical request. S3 differs from other AWS servic
 that matters here: the path is signed exactly as it was sent (already percent-encoded once), with
 no normalisation, so the canonical URI is the raw request path.
 
+Presigned URLs may also use the older Signature Version 2 query form (AWSAccessKeyId,
+Signature, Expires) — boto3 still makes those for custom endpoints unless told otherwise — so
+`parse` accepts it for presigned requests only, and `verify` checks it; it is never used upstream.
+
 Uploads may arrive in three body forms (`x-amz-content-sha256`):
   * a hex SHA-256 of the body, or UNSIGNED-PAYLOAD — the body is the object;
   * STREAMING-AWS4-HMAC-SHA256-PAYLOAD — aws-chunked, every chunk signed in a chain seeded by
@@ -13,6 +17,7 @@ Uploads may arrive in three body forms (`x-amz-content-sha256`):
 """
 from __future__ import annotations
 
+import base64
 import calendar
 import hashlib
 import hmac
@@ -114,6 +119,7 @@ class Signed:
     presigned: bool = False
     expires: Optional[int] = None
     pairs: List[Tuple[str, str]] = field(default_factory=list)   # query without X-Amz-Signature
+    v2: bool = False                # a Signature Version 2 presigned URL (expires = unix time)
 
     @property
     def scope(self) -> str:
@@ -144,6 +150,14 @@ def parse(raw_query: str, headers: Dict[str, str]) -> Optional[Signed]:
                       amz_date=headers.get("x-amz-date", ""),
                       signed_headers=m.group(2).split(";"), signature=m.group(3),
                       payload_hash=payload, pairs=pairs)
+    if "Signature" in q and "AWSAccessKeyId" in q and "Expires" in q:
+        try:
+            expires = int(q["Expires"])
+        except ValueError:
+            raise SigError("AccessDenied", "Expires must be a unix time")
+        return Signed(access_key=q["AWSAccessKeyId"], date="", region="", amz_date="",
+                      signed_headers=[], signature=q["Signature"], payload_hash=UNSIGNED,
+                      presigned=True, expires=expires, pairs=pairs, v2=True)
     if "X-Amz-Signature" in q:
         if q.get("X-Amz-Algorithm") != ALGORITHM:
             raise SigError("AuthorizationQueryParametersError", "only AWS4-HMAC-SHA256", 400)
@@ -159,10 +173,47 @@ def parse(raw_query: str, headers: Dict[str, str]) -> Optional[Signed]:
     return None
 
 
+# Query parameters that are part of what a Signature Version 2 request signs.
+_V2_SUBRESOURCES = {
+    "acl", "cors", "delete", "lifecycle", "location", "logging", "notification", "partNumber",
+    "policy", "requestPayment", "restore", "tagging", "torrent", "uploadId", "uploads",
+    "versionId", "versioning", "versions", "website", "response-content-type",
+    "response-content-language", "response-expires", "response-cache-control",
+    "response-content-disposition", "response-content-encoding", "select", "select-type",
+    "object-lock", "storageClass", "attributes"}
+
+
+def _verify_v2(s: Signed, secret: str, method: str, resource_path: str,
+               headers: Dict[str, str], now: float) -> None:
+    if now > s.expires:
+        raise SigError("AccessDenied", "Request has expired")
+    if s.expires > now + MAX_PRESIGN + MAX_SKEW:
+        raise SigError("AccessDenied", "Expires is too far in the future")
+    sub = sorted((k, v) for k, v in s.pairs if k in _V2_SUBRESOURCES)
+    resource = resource_path + ("?" + "&".join(f"{k}={v}" if v else k for k, v in sub)
+                                if sub else "")
+    amz = "".join(f"{h}:{headers[h].strip()}\n" for h in sorted(headers)
+                  if h.startswith("x-amz-"))
+    sts = "\n".join([method, headers.get("content-md5", ""), headers.get("content-type", ""),
+                     str(s.expires)]) + "\n" + amz + resource
+    want = base64.b64encode(hmac.new(secret.encode(), sts.encode(), hashlib.sha1).digest()).decode()
+    if not hmac.compare_digest(want, s.signature):
+        err = SigError("SignatureDoesNotMatch", "The request signature we calculated does not "
+                                                "match the signature you provided.")
+        err.canonical_request = sts
+        raise err
+
+
 def verify(s: Signed, secret: str, method: str, raw_path: str, headers: Dict[str, str],
-           now: Optional[float] = None) -> bytes:
-    """Check the signature and its time window; returns the signing key (for chunk chains)."""
+           now: Optional[float] = None, v2_resource: Optional[str] = None) -> bytes:
+    """Check the signature and its time window; returns the signing key (for chunk chains).
+
+    `v2_resource` is the /bucket/key path a Signature Version 2 URL signs (the request path, or
+    the bucket plus the path for a virtual-hosted request)."""
     now = time.time() if now is None else now
+    if s.v2:
+        _verify_v2(s, secret, method, v2_resource or raw_path, headers, now)
+        return b""
     t = _parse_amz_date(s.amz_date)
     if s.amz_date[:8] != s.date:
         raise SigError("AccessDenied", "X-Amz-Date does not match the credential scope")

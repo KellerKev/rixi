@@ -353,8 +353,10 @@ def _storage_cmd(args) -> int:
             api.revoke_s3_key(args.target or "")
             print(f"revoked {args.target}")
         else:
+            names = {b["id"]: b["name"] for b in api.buckets()}
             for k in api.s3_keys():
-                scope = ", ".join(k["buckets"]) if k.get("buckets") else "all buckets"
+                scope = ", ".join(names.get(b, b) for b in k["buckets"]) if k.get("buckets") \
+                    else "all buckets"
                 who = f"box {k['box_id']}" if k.get("box_id") else k["name"]
                 print(f"{k['access_key']}  {who:<24} {'rw' if k['write'] else 'ro'}  {scope}")
     except hosted.HostedError as exc:
