@@ -11,8 +11,13 @@
     POST   /api/volumes · GET · DELETE /api/volumes/<id>   persistent volumes
     POST   /api/buckets · GET · GET|PATCH|DELETE /api/buckets/<id>   S3 buckets (?force=1 empties)
     GET    /api/buckets/<id>/objects?prefix=&token=   one folder of a bucket (the console)
-    POST   /api/buckets/<id>/presign      {op, key, upload_id?, part?} — a URL for the browser
+    POST   /api/buckets/<id>/presign      {op, key, upload_id?, part?, inline?} — a URL for the browser
     POST   /api/buckets/<id>/delete-objects   {keys?, prefixes?}
+    POST   /api/buckets/<id>/shares       {key, hours, filename?, max_downloads?} — a share link
+    GET    /api/shares?bucket= · DELETE /api/shares/<id>   share links · revoke one
+    GET    /s/<token>                     public: opens a share link (a short-lived download)
+    GET    /api/storage/boxes             boxes that wrote objects with their own key
+    GET    /api/boxes/<id>/objects?before=   what that box wrote, newest first
     POST   /api/s3-keys · GET · DELETE /api/s3-keys/<access key>     S3 keys (secret shown once)
     POST   /api/tenants/<tenant>/stop     admin: release every box of a tenant
     POST   /gw/heartbeat                  box → gateway; authenticated by the box's own secret
@@ -28,6 +33,7 @@ run them in a worker thread.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 from typing import Optional
 
@@ -44,6 +50,18 @@ from .service import Caller, Denied, DirectService, NotFound
 def json_error(status: int, detail: str) -> ombott_ng.HTTPResponse:
     return ombott_ng.HTTPResponse(body=json.dumps({"detail": detail}), status=status,
                                   headers={"Content-Type": "application/json"})
+
+
+def _page(status: int, message: str) -> ombott_ng.HTTPResponse:
+    """A plain page for people who open a share link that no longer works."""
+    body = ("<!doctype html><meta charset=utf-8><meta name=viewport "
+            "content='width=device-width,initial-scale=1'><title>Link unavailable</title>"
+            "<body style='font:16px system-ui,sans-serif;max-width:32rem;margin:15vh auto;"
+            f"padding:0 1rem'><p>{html.escape(message)}</p></body>")
+    return ombott_ng.HTTPResponse(body=body, status=status, headers={
+        "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+        "Referrer-Policy": "no-referrer"})
 
 
 def _bearer() -> Optional[str]:
@@ -317,9 +335,60 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
     @app.use(ctxd.caller)
     async def presign(ctx, bucket_id):
         body = _body()
+        inline = body.get("inline", False)
+        if not isinstance(inline, bool):
+            raise json_error(400, "inline must be true or false")
         return await _call(_storage().presign, ctx.caller, bucket_id,
                            _str(body, "op", required=True), body.get("key"),
-                           _str(body, "upload_id"), body.get("part"), _str(body, "filename"))
+                           _str(body, "upload_id"), body.get("part"), _str(body, "filename"),
+                           inline=inline)
+
+    @app.route("/api/buckets/<bucket_id>/shares", method="POST")
+    @app.use(ctxd.caller)
+    async def create_share(ctx, bucket_id):
+        body = _body()
+        out = await _call(_storage().create_share, ctx.caller, bucket_id, body.get("key"),
+                          body.get("hours"), _str(body, "filename"), body.get("max_downloads"))
+        ombott_ng.response.status = 201
+        return out
+
+    @app.route("/api/shares")
+    @app.use(ctxd.caller)
+    async def shares(ctx):
+        return {"shares": await _call(_storage().list_shares, ctx.caller,
+                                      ombott_ng.request.query.get("bucket") or None)}
+
+    @app.route("/api/shares/<share_id>", method="DELETE")
+    @app.use(ctxd.caller)
+    async def revoke_share(ctx, share_id):
+        return await _call(_storage().revoke_share, ctx.caller, share_id)
+
+    @app.route("/s/<token>")
+    async def open_share(ctx, token):
+        try:
+            url = await asyncio.to_thread(_storage().open_share, token)
+        except NotFound:
+            return _page(404, "This link does not exist.")
+        except Denied as d:
+            return _page(d.status, d.reason)
+        return ombott_ng.HTTPResponse(status=302, headers={
+            "Location": url, "Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+    @app.route("/api/storage/boxes")
+    @app.use(ctxd.caller)
+    async def storage_boxes(ctx):
+        return {"boxes": await _call(_storage().box_summary, ctx.caller)}
+
+    @app.route("/api/boxes/<box_id>/objects")
+    @app.use(ctxd.caller)
+    async def box_objects(ctx, box_id):
+        q = ombott_ng.request.query
+        try:
+            before = float(q["before"]) if q.get("before") else None
+            limit = int(q.get("limit") or 200)
+        except ValueError:
+            raise json_error(400, "before and limit must be numbers")
+        return await _call(_storage().box_objects, ctx.caller, box_id, before, limit)
 
     @app.route("/api/buckets/<bucket_id>/delete-objects", method="POST")
     @app.use(ctxd.caller)

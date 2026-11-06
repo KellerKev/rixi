@@ -34,6 +34,7 @@
     access_key   = "${env:RIXI_S3_ACCESS_KEY}"        # the operator's key; never leaves the proxy
     secret_key   = "${env:RIXI_S3_SECRET_KEY}"
     key_secret   = "${env:RIXI_S3_KEY_SECRET}"        # Fernet key: customer secrets at rest
+    share_url    = "https://files.example.com/s"      # optional: share links; route /s/ here
 
     [template.l4]
     provider = "scaleway"
@@ -112,6 +113,7 @@ class StorageConfig:
     scan_interval: float = 3600.0          # how often each bucket's size is measured
     abort_multipart_days: int = 7          # unfinished uploads are dropped after this long
     cors_origins: Tuple[str, ...] = ()     # web pages that may call the proxy (a browser console)
+    share_url: str = ""                    # where the gateway's GET /s/<token> is reached; "" = no links
 
 
 @dataclass(frozen=True)
@@ -210,7 +212,18 @@ def _storage(st: dict, allowed: Optional[Tuple[str, ...]]) -> Optional[StorageCo
         eur_per_gb_egress=float(st.get("eur_per_gb_egress", 0.01)),
         scan_interval=_duration(st.get("scan_interval", "1h")),
         abort_multipart_days=int(st.get("abort_multipart_days", 7)),
-        cors_origins=_origins(st.get("cors_origins", [])))
+        cors_origins=_origins(st.get("cors_origins", [])),
+        share_url=_share_url(st.get("share_url", ""), bool(st.get("allow_http"))))
+
+
+def _share_url(v, allow_http: bool) -> str:
+    if not v:
+        return ""
+    if not isinstance(v, str) or not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d+)?(/[\w./-]*)?", v):
+        raise ConfigError("[direct.storage] share_url must be a URL like https://host/s")
+    if not v.startswith("https://") and not allow_http:
+        raise ConfigError("[direct.storage] share_url must be https")
+    return v.rstrip("/")
 
 
 def _origins(v) -> Tuple[str, ...]:

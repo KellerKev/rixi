@@ -15,6 +15,7 @@ from gateway.auth import JwtVerifier  # noqa: E402
 from gateway.direct.config import ConfigError, parse  # noqa: E402
 from gateway.direct.s3client import S3Error  # noqa: E402
 from gateway.direct.storage import StorageService  # noqa: E402
+from gateway.direct.store import BoxObject  # noqa: E402
 from gateway.direct.web import asgi, build_app  # noqa: E402
 
 from test_direct import SyncClient, _conf, _keys, _settle, _svc  # noqa: E402
@@ -61,14 +62,19 @@ class StubS3:
         for k in keys:
             self.buckets[name]["objects"].pop(k, None)
 
+    def call(self, method, region, name, key="", query="", ok=(200, 204)):
+        assert method == "HEAD"
+        if key not in self.buckets.get(name, {}).get("objects", {}):
+            raise S3Error(404, "NoSuchKey", "")
+
     def measure(self, region, name):
         objs = self.buckets[name]["objects"]
         return {"STANDARD": float(sum(objs.values())), "ONEZONE_IA": 0.0, "objects": len(objs)}
 
 
-def _api(**extra):
+def _api(storage=None, **extra):
     priv, pub = _keys()
-    svc = _svc(storage=dict(STORAGE), **extra)
+    svc = _svc(storage=dict(storage or STORAGE), **extra)
     stub = StubS3()
     svc.storage = StorageService(svc.cfg, svc.store, client=stub, clock=svc.clock)
     tc = SyncClient(asgi(build_app(svc, JwtVerifier(public_key_pem=pub,
@@ -114,6 +120,123 @@ def test_the_console_routes_list_sign_and_delete_within_the_tenant():
     assert stub.buckets[real]["objects"] == {"top": 5}
     keys = tc.get("/api/s3-keys", headers=h("alice", "t-a")).json()["keys"]
     assert keys == []                                   # the console's key is not listed
+
+
+def test_previews_are_inline_only_for_types_that_cannot_run_script():
+    tc, svc, stub, h = _api()
+    b = tc.post("/api/buckets", json={"name": "files"}, headers=h("alice", "t-a")).json()
+
+    def sign(key):
+        return tc.post(f"/api/buckets/{b['id']}/presign",
+                       json={"op": "get", "key": key, "inline": True}, headers=h("alice", "t-a"))
+    r = sign("plots/loss.PNG")
+    assert r.status_code == 200
+    assert "response-content-disposition=inline" in r.json()["url"]
+    assert "response-content-type=image%2Fpng" in r.json()["url"]
+    assert "response-content-type=application%2Fpdf" in sign("paper.pdf").json()["url"]
+    for key in ("index.html", "logo.svg", "noextension", "data.csv"):
+        assert sign(key).status_code == 400, key
+    r = tc.post(f"/api/buckets/{b['id']}/presign", json={"op": "get", "key": "a", "inline": 1},
+                headers=h("alice", "t-a"))
+    assert r.status_code == 400
+
+
+def test_share_links_open_until_they_expire_run_out_or_are_revoked():
+    tc, svc, stub, h = _api(storage={**STORAGE, "share_url": "https://files.example.test/s/"})
+    b = tc.post("/api/buckets", json={"name": "files"}, headers=h("alice", "t-a")).json()
+    real = svc.store.get_bucket(b["id"]).real_name
+    stub.buckets[real]["objects"]["out/report.pdf"] = 10
+    url = f"/api/buckets/{b['id']}/shares"
+    assert tc.post(url, json={"key": "out/none", "hours": 1},
+                   headers=h("alice", "t-a")).status_code == 404
+    for hours in (0, 169, "24", True):
+        assert tc.post(url, json={"key": "out/report.pdf", "hours": hours},
+                       headers=h("alice", "t-a")).status_code == 400, hours
+    assert tc.post(url, json={"key": "out/report.pdf", "hours": 1},
+                   headers=h("bob", "t-b")).status_code == 404
+    r = tc.post(url, json={"key": "out/report.pdf", "hours": 24, "max_downloads": 2},
+                headers=h("alice", "t-a"))
+    assert r.status_code == 201, r.text
+    sh = r.json()
+    assert sh["state"] == "active" and sh["filename"] == "report.pdf"
+    assert sh["url"].startswith("https://files.example.test/s/")
+    token = sh["url"].rsplit("/", 1)[1]
+    assert token not in json.dumps(svc.store.get_share(sh["id"]).__dict__)   # only a hash
+    r = tc.get(f"/s/{token}")
+    assert r.status_code == 302 and r.headers["cache-control"] == "no-store"
+    loc = r.headers["location"]
+    assert loc.startswith("https://s3.example.test/files/out/report.pdf?")
+    assert "X-Amz-Expires=300" in loc and "attachment" in loc
+    assert tc.get(f"/s/{token}").status_code == 302
+    r = tc.get(f"/s/{token}")
+    assert r.status_code == 410 and "download limit" in r.text           # max_downloads: 2
+    listed = tc.get("/api/shares", headers=h("alice", "t-a")).json()["shares"]
+    assert [(s["id"], s["downloads"], s["state"]) for s in listed] == [(sh["id"], 2, "used up")]
+    assert tc.get("/api/shares", headers=h("bob", "t-b")).json()["shares"] == []
+    assert tc.get(f"/s/{'x' * 32}").status_code == 404
+    assert tc.get("/s/<script>").status_code == 404
+
+    # revoked, by its owner only
+    sh2 = tc.post(url, json={"key": "out/report.pdf", "hours": 1},
+                  headers=h("alice", "t-a")).json()
+    token2 = sh2["url"].rsplit("/", 1)[1]
+    assert tc.delete(f"/api/shares/{sh2['id']}", headers=h("bob", "t-b")).status_code == 404
+    assert tc.get(f"/s/{token2}").status_code == 302
+    r = tc.delete(f"/api/shares/{sh2['id']}", headers=h("alice", "t-a"))
+    assert r.json()["state"] == "revoked"
+    assert tc.get(f"/s/{token2}").status_code == 410
+
+    # expired; the signed URL never outlives the link
+    sh3 = tc.post(url, json={"key": "out/report.pdf", "hours": 0.05},
+                  headers=h("alice", "t-a")).json()
+    token3 = sh3["url"].rsplit("/", 1)[1]
+    svc.clock.t += 0.05 * 3600 - 60
+    assert "X-Amz-Expires=60" in tc.get(f"/s/{token3}").headers["location"]
+    svc.clock.t += 61
+    assert tc.get(f"/s/{token3}").status_code == 410
+
+    # the file went away
+    sh4 = tc.post(url, json={"key": "out/report.pdf", "hours": 1},
+                  headers=h("alice", "t-a")).json()
+    del stub.buckets[real]["objects"]["out/report.pdf"]
+    assert tc.get(f"/s/{sh4['url'].rsplit('/', 1)[1]}").status_code == 410
+
+
+def test_share_links_need_a_share_url():
+    tc, svc, stub, h = _api()
+    b = tc.post("/api/buckets", json={"name": "files"}, headers=h("alice", "t-a")).json()
+    stub.buckets[svc.store.get_bucket(b["id"]).real_name]["objects"]["f"] = 1
+    r = tc.post(f"/api/buckets/{b['id']}/shares", json={"key": "f", "hours": 1},
+                headers=h("alice", "t-a"))
+    assert r.status_code == 404 and "share_url" in r.json()["detail"]
+    with pytest.raises(ConfigError, match="share_url"):
+        parse(_conf(storage={**STORAGE, "share_url": "files.example.test/s"}))
+
+
+def test_what_a_box_wrote_is_listed_for_its_tenant_and_forgotten_when_deleted():
+    tc, svc, stub, h = _api()
+    b = tc.post("/api/buckets", json={"name": "runs"}, headers=h("alice", "t-a")).json()
+    real = svc.store.get_bucket(b["id"]).real_name
+    stub.buckets[real]["objects"].update({"r1/a.csv": 3, "r1/b.csv": 4})
+    svc.store.record_box_objects([
+        BoxObject(box_id="bx1", tenant="t-a", bucket_id=b["id"], key="r1/a.csv", size=3,
+                  written_at=10.0),
+        BoxObject(box_id="bx1", tenant="t-a", bucket_id=b["id"], key="r1/b.csv", size=None,
+                  written_at=20.0)])
+    svc.store.record_box_objects([BoxObject(box_id="bx1", tenant="t-a", bucket_id=b["id"],
+                                            key="r1/a.csv", size=5, written_at=30.0)])
+    summary = tc.get("/api/storage/boxes", headers=h("alice", "t-a")).json()["boxes"]
+    assert [(s["box_id"], s["objects"], s["bytes"]) for s in summary] == [("bx1", 2, 5.0)]
+    assert tc.get("/api/storage/boxes", headers=h("bob", "t-b")).json()["boxes"] == []
+    r = tc.get("/api/boxes/bx1/objects?limit=1", headers=h("alice", "t-a")).json()
+    assert [o["key"] for o in r["objects"]] == ["r1/a.csv"] and r["before"] == 30.0
+    r = tc.get("/api/boxes/bx1/objects?before=30", headers=h("alice", "t-a")).json()
+    assert [(o["bucket"], o["key"]) for o in r["objects"]] == [("runs", "r1/b.csv")]
+    assert tc.get("/api/boxes/bx1/objects", headers=h("bob", "t-b")).status_code == 404
+    tc.post(f"/api/buckets/{b['id']}/delete-objects", json={"keys": ["r1/a.csv"]},
+            headers=h("alice", "t-a"))
+    r = tc.get("/api/boxes/bx1/objects", headers=h("alice", "t-a")).json()
+    assert [o["key"] for o in r["objects"]] == ["r1/b.csv"]
 
 
 def test_config_checks_storage():

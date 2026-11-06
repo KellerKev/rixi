@@ -40,7 +40,7 @@ import httpx
 from . import sigv4
 from .service import Caller, Denied, NotFound
 from .storage import StorageService, valid_bucket_name
-from .store import LIVE_STATES, Bucket, S3Key
+from .store import LIVE_STATES, BoxObject, Bucket, S3Key
 
 log = logging.getLogger("rixi.direct.s3proxy")
 
@@ -173,6 +173,9 @@ class Proxy:
         self._tenant_bytes: Dict[str, Tuple[float, float]] = {}
         self._traffic: Dict[str, List[float]] = {}
         self._key_seen: Dict[str, float] = {}       # access key → when it last signed a request
+        # objects written with a box's key, and objects deleted, since the last flush
+        self._box_writes: Dict[Tuple[str, str], BoxObject] = {}
+        self._deleted: Dict[Tuple[str, str], None] = {}
         self._flusher: Optional[asyncio.Task] = None
 
     # -- cached lookups ---------------------------------------------------
@@ -243,6 +246,18 @@ class Proxy:
                 await asyncio.to_thread(self.store.update_s3_key, ak, last_used_at=at)
             except Exception:
                 log.exception("could not record use of key %s", ak)
+        writes, self._box_writes = self._box_writes, {}
+        deleted, self._deleted = self._deleted, {}
+        try:
+            if writes:
+                await asyncio.to_thread(self.store.record_box_objects, list(writes.values()))
+            by_bucket: Dict[str, List[str]] = {}
+            for bid, k in deleted:
+                by_bucket.setdefault(bid, []).append(k)
+            for bid, keys in by_bucket.items():
+                await asyncio.to_thread(self.store.forget_box_objects, bid, keys)
+        except Exception:
+            log.exception("could not record objects written by boxes")
         traffic, self._traffic = self._traffic, {}
         for bid, (e, i, r) in traffic.items():
             try:
@@ -478,6 +493,28 @@ class Proxy:
         finally:
             await resp.aclose()
             self._count(bucket.id, requests=1)
+        if 200 <= resp.status_code < 300 and has_key:
+            self._note(op, key, bucket, unquote(key_raw), headers, copy_src)
+
+    def _note(self, op: Op, key: S3Key, bucket: Bucket, obj: str, headers: Dict[str, str],
+              copied: Optional[str]) -> None:
+        """Remember what a box wrote (and what anyone deleted), so a box's files can be listed."""
+        where = (bucket.id, obj)
+        if op.name == "DeleteObject":
+            self._box_writes.pop(where, None)
+            self._deleted[where] = None
+        elif op.name in ("PutObject", "CompleteMultipartUpload") and key.box_id:
+            size = None
+            if op.name == "PutObject" and not copied:
+                try:
+                    size = float(headers.get("x-amz-decoded-content-length") or
+                                 headers.get("content-length") or 0)
+                except ValueError:
+                    pass
+            self._deleted.pop(where, None)
+            self._box_writes[where] = BoxObject(box_id=key.box_id, tenant=key.tenant,
+                                                bucket_id=bucket.id, key=obj, size=size,
+                                                written_at=self.clock())
 
     # -- pieces -----------------------------------------------------------
     def _forward_headers(self, headers: Dict[str, str], op: Op) -> Dict[str, str]:

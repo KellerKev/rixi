@@ -100,7 +100,7 @@ def env(tmp_path_factory):
                     "upstream": f"http://127.0.0.1:{up_port}", "regions": ["fr-par", "nl-ams"],
                     "access_key": OP_KEY, "secret_key": OP_SECRET,
                     "key_secret": Fernet.generate_key().decode(),
-                    "cors_origins": [CONSOLE]}},
+                    "cors_origins": [CONSOLE], "share_url": "https://files.example.com/s"}},
         "template": {"cpu": {"provider": "dummy", "type": "x", "zones": ["fr-par-1"]}}})
     e = Env()
     e.fake = FakeS3(OP_KEY, OP_SECRET)
@@ -250,6 +250,70 @@ def test_a_box_key_dies_with_its_box(env):
     assert code(e) == "InvalidAccessKeyId"
     env.storage.revoke_box_keys("bx1")
     assert env.store.get_s3_key(k.access_key).revoked_at is not None
+
+
+def _until(cond, timeout=5.0):
+    deadline = time.time() + timeout
+    while not cond():
+        if time.time() > deadline:
+            raise AssertionError("condition not met in time")
+        time.sleep(0.05)
+
+
+def test_what_a_box_writes_is_recorded_by_box_and_forgotten_when_deleted(env):
+    s3 = client(env, *key_for(env, A))
+    s3.create_bucket(Bucket="runout")
+    s3.put_object(Bucket="runout", Key="by-hand.txt", Body=b"mine")     # not a box: not recorded
+    env.store.insert(Box(id="bx2", tenant="t-a", owner="alice", template="cpu", provider="dummy",
+                         instance_type="x", zone="fr-par-1", eur_per_hour=0.1,
+                         hostname="b-bx2.run.example.com", state="ready",
+                         created_at=time.time()))
+    k, secret = env.storage.box_key("t-a", "alice", "bx2", ["runout"], True)
+    boxs3 = client(env, k.access_key, secret)
+    boxs3.put_object(Bucket="runout", Key="run 1/metrics.json", Body=b'{"loss": 0.1}')
+    from boto3.s3.transfer import TransferConfig
+    boxs3.upload_fileobj(io.BytesIO(b"x" * (6 * 1024 * 1024)), "runout", "run 1/model.bin",
+                         Config=TransferConfig(multipart_threshold=5 * 1024 * 1024,
+                                               multipart_chunksize=5 * 1024 * 1024))
+    boxs3.copy_object(Bucket="runout", Key="run 1/copy.txt",
+                      CopySource={"Bucket": "runout", "Key": "by-hand.txt"})
+    bid = env.store.find_bucket("t-a", "runout").id
+    _until(lambda: len(env.store.list_box_objects("t-a", "bx2")) == 3)
+    got = {o.key: o.size for o in env.store.list_box_objects("t-a", "bx2")}
+    assert got == {"run 1/metrics.json": 13.0, "run 1/model.bin": None, "run 1/copy.txt": None}
+    assert all(o.bucket_id == bid for o in env.store.list_box_objects("t-a", "bx2"))
+    s3.delete_object(Bucket="runout", Key="run 1/copy.txt")             # anyone's delete counts
+    _until(lambda: len(env.store.list_box_objects("t-a", "bx2")) == 2)
+    view = env.storage.box_objects(A, "bx2")
+    assert [o["key"] for o in view["objects"]] == ["run 1/model.bin", "run 1/metrics.json"]
+    assert view["objects"][0]["bucket"] == "runout"
+    with pytest.raises(NotFound):
+        env.storage.box_objects(B, "bx2")
+
+
+def test_a_preview_url_streams_through_the_proxy(env):
+    b = env.storage.create_bucket(A, "previews")
+    assert _do(env, env.storage.presign(A, b.id, "put", "plot.png"), b"\x89PNG").status_code == 200
+    r = _do(env, env.storage.presign(A, b.id, "get", "plot.png", inline=True))
+    assert r.status_code == 200 and r.content == b"\x89PNG"
+
+
+def test_a_share_link_downloads_through_the_proxy_and_stops_when_revoked(env):
+    b = env.storage.create_bucket(A, "sharelinks")
+    assert _do(env, env.storage.presign(A, b.id, "put", "out/report.csv"), b"a,b").status_code \
+        == 200
+    sh = env.storage.create_share(A, b.id, "out/report.csv", 24, filename="Q3 report.csv")
+    token = sh["url"].rsplit("/", 1)[1]
+    url = env.storage.open_share(token)
+    assert "filename%2A%3DUTF-8%27%27Q3%2520report.csv" in url
+    r = httpx.get(url, verify=False)
+    assert r.status_code == 200 and r.content == b"a,b"
+    env.storage.revoke_share(A, sh["id"])
+    with pytest.raises(Denied) as e:
+        env.storage.open_share(token)
+    assert e.value.status == 410
+    with pytest.raises(NotFound):
+        env.storage.revoke_share(B, sh["id"])
 
 
 # ── bodies ──────────────────────────────────────────────────────────────

@@ -67,3 +67,5 @@ root_volume_gb = 100
 # secret_key   = "${env:RIXI_S3_SECRET_KEY}"
 # key_secret   = "${env:RIXI_S3_KEY_SECRET}"         # Fernet key for tenants' secrets at rest
 # scan_interval = "1h"
+# cors_origins = ["https://files.example.com"]       # a browser console that signs through the API
+# share_url    = "https://files.example.com/s"       # share links; route /s/ there to the gateway

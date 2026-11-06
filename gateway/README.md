@@ -108,7 +108,23 @@ and `Host` unchanged and turn request buffering off):
   `POST /api/buckets/<id>/delete-objects {keys?, prefixes?}` removes files and whole folders. The
   URLs are signed with a per-tenant key the tenant never sees, so the browser talks to the proxy
   directly and the same checks and counters apply. List the console's origin in `cors_origins`
-  (exact `scheme://host`, no wildcards); other origins get no CORS headers.
+  (exact `scheme://host`, no wildcards); other origins get no CORS headers. `inline: true` on a
+  `get` makes a URL a browser can show (PDF, images, audio, video, `.txt`), always served with the
+  type its extension implies; HTML, SVG and anything else are refused, so nothing stored can run
+  script when opened.
+- **Share links.** With `share_url` set (where `GET /s/<token>` of the gateway is reached, e.g.
+  `https://files.example.com/s`), `POST /api/buckets/<id>/shares {key, hours, filename?,
+  max_downloads?}` makes a link anyone can open to download one file, for at most a week
+  (`hours` ≤ 168). Each opening counts a download and redirects to a 5-minute URL, so a link
+  stops within minutes of `DELETE /api/shares/<id>`, its expiry, its download limit, or the file
+  or bucket going away. Only a hash of the token is looked up; the token is kept encrypted, so
+  `GET /api/shares[?bucket=]` can show the link again. Downloads through links are counted and
+  billed like any other.
+- **What boxes wrote.** The proxy records each object a box writes with its own key (uploads,
+  multipart, copies), and forgets it when it is deleted through the proxy or the console API.
+  `GET /api/storage/boxes` lists the boxes that wrote something; `GET /api/boxes/<id>/objects
+  ?before=&limit=` lists one box's objects, newest first. Batch deletes by other S3 clients are
+  not tracked, so a listed object may be gone.
 
 `POST /api/buckets {name, region?, expire_days?}` · `GET /api/buckets` · `PATCH /api/buckets/<id>
 {expire_days}` · `DELETE /api/buckets/<id>[?force=1]` (force empties it first).

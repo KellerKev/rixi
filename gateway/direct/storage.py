@@ -12,6 +12,7 @@ running totals, so a billing pass that repeats can never charge twice.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -28,7 +29,7 @@ from . import sigv4
 from .config import DirectConfig
 from .s3client import S3Client, S3Error
 from .service import Caller, Denied, NotFound
-from .store import BUCKET_LIVE, Bucket, S3Key, Store
+from .store import BUCKET_LIVE, Bucket, S3Key, Share, Store
 
 log = logging.getLogger("rixi.direct.storage")
 
@@ -41,6 +42,20 @@ _KEYNAME = re.compile(r"^[\w .@:/-]{1,64}$")
 CONSOLE_KEY = "#console"
 CONSOLE_EXPIRES = 15 * 60
 MAX_DELETE = 10000
+# Share links: at most a week (as long as a presigned URL may live), and each opening gets a
+# fresh URL valid for a few minutes, so a revoked link stops working within that.
+SHARE_MAX_HOURS = 7 * 24
+SHARE_URL_EXPIRES = 5 * 60
+MAX_SHARES = 1000                           # live links per tenant
+_TOKEN = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+# What a browser may show inline, by extension, always with this content type: nothing that runs
+# script when opened (no HTML, no SVG), whatever the uploader claimed.
+INLINE_TYPES = {
+    "pdf": "application/pdf", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "webp": "image/webp", "avif": "image/avif", "mp4": "video/mp4",
+    "webm": "video/webm", "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
+    "txt": "text/plain; charset=utf-8",
+}
 
 
 def valid_bucket_name(name) -> bool:
@@ -235,6 +250,7 @@ class StorageService:
         self._account(b, now, 0.0, 0.0, 0, b.ingress_bytes)
         self.store.transition_bucket(b.id, ("deleting",), state="deleted", deleted_at=now,
                                      error=None)
+        self.store.forget_box_objects(b.id)
         self.audit("bucket.deleted", bucket=b.id, tenant=b.tenant)
 
     # -- keys -------------------------------------------------------------
@@ -316,13 +332,30 @@ class StorageService:
             raise Denied("key: no leading /, no . or .. segments, no control characters", 400)
         return key
 
+    @staticmethod
+    def _attachment(key: str, filename: Optional[str]) -> str:
+        name = filename if isinstance(filename, str) and filename else key.rsplit("/", 1)[-1]
+        return "response-content-disposition=" + quote(
+            "attachment; filename*=UTF-8''" + quote(name, safe=""), safe="")
+
+    def _sign(self, b: Bucket, tenant: str, sub: str, method: str, key: str, query: str,
+              expires: int) -> dict:
+        k, secret = self._console_key(tenant, sub)
+        host = urlparse(self.st.endpoint_url).netloc
+        path = "/" + b.name + "/" + quote(key, safe="/-_.~")
+        qs = sigv4.presign(method, host, path, query, k.access_key, secret, b.region,
+                           int(expires), now=self.clock())
+        return {"method": method, "url": self.st.endpoint_url.rstrip("/") + path + "?" + qs,
+                "expires_at": self.clock() + int(expires)}
+
     def presign(self, caller: Caller, bucket_id: str, op: str, key: str,
                 upload_id: Optional[str] = None, part: Optional[int] = None,
-                filename: Optional[str] = None, expires: int = CONSOLE_EXPIRES) -> dict:
+                filename: Optional[str] = None, expires: int = CONSOLE_EXPIRES,
+                inline: bool = False) -> dict:
         """A URL the browser uses against the proxy, signed with the tenant's console key, so
         the data goes browser ⇄ proxy and the proxy applies the same checks and counters as for
-        any other client. op: get (download), put, create_multipart, upload_part,
-        complete_multipart, abort_multipart, delete."""
+        any other client. op: get (download; `inline` to show it, for INLINE_TYPES only), put,
+        create_multipart, upload_part, complete_multipart, abort_multipart, delete."""
         tenant = self._tenant(caller)
         b = self._ready(caller, bucket_id)
         key = self._object_key(key)
@@ -341,17 +374,15 @@ class StorageService:
         }.get(op, (None, None))
         if method is None:
             raise Denied(f"unknown op {op!r}", 400)
-        if op == "get":
-            name = filename if isinstance(filename, str) and filename else key.rsplit("/", 1)[-1]
-            query = "response-content-disposition=" + quote(
-                "attachment; filename*=UTF-8''" + quote(name, safe=""), safe="")
-        k, secret = self._console_key(tenant, caller.sub)
-        host = urlparse(self.st.endpoint_url).netloc
-        path = "/" + b.name + "/" + quote(key, safe="/-_.~")
-        qs = sigv4.presign(method, host, path, query, k.access_key, secret, b.region,
-                           int(expires), now=self.clock())
-        return {"method": method, "url": self.st.endpoint_url.rstrip("/") + path + "?" + qs,
-                "expires_at": self.clock() + int(expires)}
+        if op == "get" and inline:
+            ctype = INLINE_TYPES.get(key.rsplit(".", 1)[-1].lower() if "." in key else "")
+            if ctype is None:
+                raise Denied("this kind of file cannot be shown inline", 400)
+            query = "response-content-disposition=inline&response-content-type=" + \
+                quote(ctype, safe="")
+        elif op == "get":
+            query = self._attachment(key, filename)
+        return self._sign(b, tenant, caller.sub, method, key, query, expires)
 
     def list_objects(self, caller: Caller, bucket_id: str, prefix: str = "",
                      token: Optional[str] = None, max_keys: int = 200) -> dict:
@@ -389,9 +420,145 @@ class StorageService:
                 self.client.delete_keys(b.region, real, todo[i:i + 1000])
         except S3Error as e:
             raise Denied(f"delete failed: {e.code}", 502)
+        self.store.forget_box_objects(b.id, todo)
         self.audit("objects.deleted", bucket=b.id, tenant=b.tenant, sub=caller.sub,
                    count=len(todo), prefixes=prefixes[:5])
         return {"deleted": len(todo), "more": more}
+
+    # -- share links ------------------------------------------------------
+    def _share_view(self, sh: Share, buckets: Optional[dict] = None) -> dict:
+        now = self.clock()
+        b = (buckets or {}).get(sh.bucket_id) or self.store.get_bucket(sh.bucket_id)
+        state = ("revoked" if sh.revoked_at is not None else
+                 "expired" if sh.expires_at <= now else
+                 "gone" if b is None or b.state != "ready" else
+                 "used up" if sh.max_downloads is not None and sh.downloads >= sh.max_downloads
+                 else "active")
+        token = self.fernet.decrypt(sh.token_enc.encode()).decode()
+        return {"id": sh.id, "bucket_id": sh.bucket_id, "bucket": b.name if b else None,
+                "key": sh.key, "filename": sh.filename, "created_at": sh.created_at,
+                "expires_at": sh.expires_at, "revoked_at": sh.revoked_at,
+                "max_downloads": sh.max_downloads, "downloads": sh.downloads,
+                "last_download_at": sh.last_download_at, "state": state,
+                "active": state == "active", "url": f"{self.st.share_url}/{token}"}
+
+    def create_share(self, caller: Caller, bucket_id: str, key: str, hours,
+                     filename: Optional[str] = None, max_downloads=None) -> dict:
+        """A link anyone can open to download `key`, for `hours` (at most a week)."""
+        tenant = self._tenant(caller)
+        if not self.st.share_url:
+            raise Denied("this gateway has no share_url configured", 404)
+        b = self._ready(caller, bucket_id)
+        key = self._object_key(key)
+        if isinstance(hours, bool) or not isinstance(hours, (int, float)) or \
+                not 0 < hours <= SHARE_MAX_HOURS:
+            raise Denied(f"hours must be more than 0 and at most {SHARE_MAX_HOURS}", 400)
+        if max_downloads is not None and (isinstance(max_downloads, bool) or
+                                          not isinstance(max_downloads, int) or
+                                          not 1 <= max_downloads <= 100000):
+            raise Denied("max_downloads must be 1-100000 (or omitted)", 400)
+        if filename is not None and (not isinstance(filename, str) or not filename or
+                                     len(filename) > 255 or "/" in filename or
+                                     any(ord(c) < 32 for c in filename)):
+            raise Denied("filename: 1-255 characters, no / or control characters", 400)
+        now = self.clock()
+        live = [sh for sh in self.store.list_shares(tenant, expired_since=now)
+                if sh.revoked_at is None]
+        if len(live) >= MAX_SHARES:
+            raise Denied(f"share link limit reached ({MAX_SHARES} active)", 429)
+        try:
+            self.client.call("HEAD", b.region, b.real_name, key, ok=(200,))
+        except S3Error as e:
+            if e.status == 404:
+                raise Denied("no such file", 404)
+            raise Denied(f"could not check the file: {e.code}", 502)
+        token = secrets.token_urlsafe(24)
+        sh = Share(id=secrets.token_hex(6), tenant=tenant, owner=caller.sub, bucket_id=b.id,
+                   key=key, filename=filename or key.rsplit("/", 1)[-1],
+                   token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                   token_enc=self.fernet.encrypt(token.encode()).decode(), created_at=now,
+                   expires_at=now + float(hours) * 3600, max_downloads=max_downloads)
+        self.store.insert_share(sh)
+        self.audit("share.created", share=sh.id, bucket=b.id, tenant=tenant, sub=caller.sub,
+                   hours=hours, max_downloads=max_downloads)
+        return self._share_view(sh, {b.id: b})
+
+    def list_shares(self, caller: Caller, bucket_id: Optional[str] = None) -> List[dict]:
+        """Live links and those that ended in the last week."""
+        tenant = None if caller.admin and not caller.tenant else self._tenant(caller)
+        if bucket_id is not None:
+            self._visible(caller, self.store.get_bucket(bucket_id))
+        rows = self.store.list_shares(tenant, bucket_id,
+                                      expired_since=self.clock() - SHARE_MAX_HOURS * 3600)
+        buckets = {b.id: b for b in self.store.list_buckets(tenant)}
+        return [self._share_view(sh, buckets) for sh in rows]
+
+    def revoke_share(self, caller: Caller, share_id: str) -> dict:
+        sh = self.store.get_share(share_id) if isinstance(share_id, str) else None
+        if sh is None or not (caller.admin or sh.tenant == caller.tenant):
+            raise NotFound()
+        if sh.revoked_at is None:
+            self.store.update_share(sh.id, revoked_at=self.clock())
+            self.audit("share.revoked", share=sh.id, tenant=sh.tenant, sub=caller.sub)
+        return self._share_view(self.store.get_share(sh.id))
+
+    def open_share(self, token: str) -> str:
+        """The URL to send someone who opened a share link to: a download that works for a few
+        minutes. Raises NotFound for an unknown token and Denied(410) for one that has ended."""
+        if not isinstance(token, str) or not _TOKEN.match(token):
+            raise NotFound()
+        sh = self.store.find_share(hashlib.sha256(token.encode()).hexdigest())
+        if sh is None:
+            raise NotFound()
+        now = self.clock()
+        if sh.revoked_at is not None or sh.expires_at <= now:
+            raise Denied("This link has expired.", 410)
+        b = self.store.get_bucket(sh.bucket_id)
+        if b is None or b.state != "ready":
+            raise Denied("This file is no longer available.", 410)
+        try:
+            self.client.call("HEAD", b.region, b.real_name, sh.key, ok=(200,))
+        except S3Error as e:
+            if e.status == 404:
+                raise Denied("This file is no longer available.", 410)
+            raise Denied("Storage is not reachable; try again in a minute.", 502)
+        if not self.store.take_download(sh.id, now):
+            raise Denied("This link has reached its download limit.", 410)
+        signed = self._sign(b, sh.tenant, sh.owner, "GET", sh.key,
+                            self._attachment(sh.key, sh.filename),
+                            max(1, min(SHARE_URL_EXPIRES, int(sh.expires_at - now))))
+        return signed["url"]
+
+    # -- what boxes wrote -------------------------------------------------
+    def box_summary(self, caller: Caller) -> List[dict]:
+        """Every box that wrote objects that are still there (as far as the proxy saw)."""
+        tenant = None if caller.admin and not caller.tenant else self._tenant(caller)
+        out = []
+        for row in self.store.box_object_summary(tenant):
+            box = self.store.get(row["box_id"])
+            out.append({**row, "template": box.template if box else None,
+                        "state": box.state if box else None,
+                        "created_at": box.created_at if box else None,
+                        "ended_at": box.ended_at if box else None})
+        return out
+
+    def box_objects(self, caller: Caller, box_id: str, before: Optional[float] = None,
+                    limit: int = 200) -> dict:
+        """The objects a box wrote with its own key, newest first (`before` pages back)."""
+        tenant = None if caller.admin and not caller.tenant else self._tenant(caller)
+        box = self.store.get(box_id) if isinstance(box_id, str) else None
+        if box is not None and not (caller.admin or box.tenant == caller.tenant):
+            raise NotFound()
+        limit = max(1, min(int(limit), 1000))
+        rows = self.store.list_box_objects(tenant, box_id, before, limit + 1)
+        if not rows and box is None:
+            raise NotFound()
+        buckets = {b.id: b for b in self.store.list_buckets(tenant, live_only=True)}
+        objects = [{"bucket_id": o.bucket_id, "bucket": buckets[o.bucket_id].name,
+                    "key": o.key, "size": o.size, "written_at": o.written_at}
+                   for o in rows[:limit] if o.bucket_id in buckets]
+        return {"box_id": box_id, "objects": objects,
+                "before": rows[limit - 1].written_at if len(rows) > limit else None}
 
     # -- measuring --------------------------------------------------------
     def _account(self, b: Bucket, now: float, std: float, onezone: float, objects: int,

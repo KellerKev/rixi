@@ -1,5 +1,5 @@
-"""Durable state for direct mode — boxes, volumes, buckets and S3 keys, heartbeat credentials,
-and revoked tokens.
+"""Durable state for direct mode — boxes, volumes, buckets, S3 keys, share links, the objects
+boxes wrote, heartbeat credentials, and revoked tokens.
 
 Everything that must survive a gateway restart lives here: which boxes exist, who owns them, what
 they cost, and when they started and stopped (the usage record billing is built on). Built on
@@ -214,6 +214,38 @@ class S3Key:
                 "active": self.revoked_at is None}
 
 
+@dataclass
+class Share:
+    """A link anyone can open to download one object, until it expires or is revoked. Only a
+    hash of its token is looked up; the token itself is kept encrypted, so the owner can copy
+    the link again."""
+    id: str
+    tenant: str
+    owner: str
+    bucket_id: str
+    key: str
+    filename: str
+    token_hash: str
+    token_enc: str
+    created_at: float = 0.0
+    expires_at: float = 0.0
+    revoked_at: Optional[float] = None
+    max_downloads: Optional[int] = None
+    downloads: int = 0
+    last_download_at: Optional[float] = None
+
+
+@dataclass
+class BoxObject:
+    """An object a box wrote with its own key, so its files can be found by box."""
+    box_id: str
+    tenant: str
+    bucket_id: str
+    key: str
+    size: Optional[float] = None            # unknown for multipart uploads and copies
+    written_at: float = 0.0
+
+
 _BFIELDS = [f.name for f in fields(Bucket)]
 _BDOUBLE = {"created_at", "deleted_at", "eur_per_gb_hour", "eur_per_gb_hour_onezone",
             "eur_per_gb_egress", "bytes_std", "bytes_onezone", "scanned_at", "gbh_std",
@@ -221,6 +253,8 @@ _BDOUBLE = {"created_at", "deleted_at", "eur_per_gb_hour", "eur_per_gb_hour_onez
 _BINT = {"expire_days", "objects", "requests", "purge"}
 _KFIELDS = [f.name for f in fields(S3Key)]
 _KDOUBLE = {"created_at", "revoked_at", "last_used_at"}
+_SHFIELDS = [f.name for f in fields(Share)]
+_BOFIELDS = [f.name for f in fields(BoxObject)]
 
 
 def _plain_field(name: str, doubles: set, ints: set = frozenset(), texts: set = frozenset()):
@@ -289,6 +323,16 @@ class Store:
             Field("access_key", "string", length=32, unique=True, notnull=True)
             if n == "access_key" else _plain_field(n, _KDOUBLE, {"write"}, {"secret_enc", "buckets"})
             for n in _KFIELDS])
+        self.db.define_table("rixi_share", *[
+            Field("share_id", "string", length=32, unique=True, notnull=True) if n == "id" else
+            Field("token_hash", "string", length=64, unique=True, notnull=True)
+            if n == "token_hash" else
+            Field(n, "integer", default=None if n == "max_downloads" else 0)
+            if n in ("max_downloads", "downloads") else
+            _plain_field(n, {"created_at", "expires_at", "revoked_at", "last_download_at"},
+                         texts={"key", "token_enc"}) for n in _SHFIELDS])
+        self.db.define_table("rixi_box_object", *[
+            _plain_field(n, {"size", "written_at"}, texts={"key"}) for n in _BOFIELDS])
         self.db.define_table("rixi_revoked_jti",
                              Field("box_id", "string", length=32, notnull=True),
                              Field("jti", "string", length=128, notnull=True),
@@ -517,6 +561,97 @@ class Store:
             raise KeyError(f"unknown key fields: {sorted(bad)}")
         self.db(self.db.rixi_s3_key.access_key == access_key).update(**changes)
         self.db.commit()
+
+    # -- share links ------------------------------------------------------
+    def _share(self, row) -> Share:
+        return Share(**{n: row["share_id" if n == "id" else n] for n in _SHFIELDS})
+
+    def insert_share(self, sh: Share) -> None:
+        self.db.rixi_share.insert(**{("share_id" if n == "id" else n): getattr(sh, n)
+                                     for n in _SHFIELDS})
+        self.db.commit()
+
+    def get_share(self, share_id: str) -> Optional[Share]:
+        row = self.db(self.db.rixi_share.share_id == share_id).select().first()
+        self.db.commit()
+        return self._share(row) if row else None
+
+    def find_share(self, token_hash: str) -> Optional[Share]:
+        row = self.db(self.db.rixi_share.token_hash == token_hash).select().first()
+        self.db.commit()
+        return self._share(row) if row else None
+
+    def list_shares(self, tenant: Optional[str] = None, bucket_id: Optional[str] = None,
+                    expired_since: float = 0.0) -> List[Share]:
+        t = self.db.rixi_share
+        q = t.expires_at >= expired_since
+        if tenant is not None:
+            q &= t.tenant == tenant
+        if bucket_id is not None:
+            q &= t.bucket_id == bucket_id
+        rows = self.db(q).select(orderby=~t.created_at)
+        self.db.commit()
+        return [self._share(r) for r in rows]
+
+    def update_share(self, share_id: str, **changes) -> None:
+        bad = set(changes) - set(_SHFIELDS)
+        if bad:
+            raise KeyError(f"unknown share fields: {sorted(bad)}")
+        self.db(self.db.rixi_share.share_id == share_id).update(**changes)
+        self.db.commit()
+
+    def take_download(self, share_id: str, at: float) -> bool:
+        """Count one download, unless the link has reached its limit (atomically)."""
+        from sqlalchemy import text
+        n = self.db._connection.execute(text(
+            "UPDATE rixi_share SET downloads = COALESCE(downloads, 0) + 1, last_download_at = :at "
+            "WHERE share_id = :s AND (max_downloads IS NULL OR "
+            "COALESCE(downloads, 0) < max_downloads)"), {"at": float(at), "s": share_id}).rowcount
+        self.db.commit()
+        return n == 1
+
+    # -- objects written by boxes -----------------------------------------
+    def record_box_objects(self, rows: List[BoxObject]) -> None:
+        t = self.db.rixi_box_object
+        for o in rows:
+            where = (t.bucket_id == o.bucket_id) & (t.key == o.key)
+            if not self.db(where).update(box_id=o.box_id, tenant=o.tenant, size=o.size,
+                                         written_at=o.written_at):
+                t.insert(**{n: getattr(o, n) for n in _BOFIELDS})
+        self.db.commit()
+
+    def forget_box_objects(self, bucket_id: str, keys: Optional[List[str]] = None) -> None:
+        """Drop records of deleted objects (all of a bucket's when `keys` is None)."""
+        t = self.db.rixi_box_object
+        q = t.bucket_id == bucket_id
+        if keys is None:
+            self.db(q).delete()
+        for i in range(0, len(keys or []), 500):
+            self.db(q & t.key.belongs(keys[i:i + 500])).delete()
+        self.db.commit()
+
+    def list_box_objects(self, tenant: Optional[str], box_id: str, before: Optional[float] = None,
+                         limit: int = 200) -> List[BoxObject]:
+        t = self.db.rixi_box_object
+        q = t.box_id == box_id
+        if tenant is not None:
+            q &= t.tenant == tenant
+        if before is not None:
+            q &= t.written_at < before
+        rows = self.db(q).select(orderby=~t.written_at, limitby=(0, limit))
+        self.db.commit()
+        return [BoxObject(**{n: r[n] for n in _BOFIELDS}) for r in rows]
+
+    def box_object_summary(self, tenant: Optional[str]) -> List[dict]:
+        """Per box: how many objects it wrote that are still recorded, their known size, and
+        when it last wrote one."""
+        t = self.db.rixi_box_object
+        q = t.id > 0 if tenant is None else t.tenant == tenant
+        n, size, last = t.id.count(), t.size.sum(), t.written_at.max()
+        rows = self.db(q).select(t.box_id, n, size, last, groupby=t.box_id, orderby=~last)
+        self.db.commit()
+        return [{"box_id": r.rixi_box_object.box_id, "objects": r[n], "bytes": r[size] or 0.0,
+                 "last_written_at": r[last]} for r in rows]
 
     # -- token revocation -------------------------------------------------
     def revoke(self, box_id: str, jti: str) -> None:
