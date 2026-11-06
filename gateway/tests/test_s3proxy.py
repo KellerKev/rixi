@@ -31,13 +31,14 @@ from cryptography.x509.oid import NameOID  # noqa: E402
 from gateway.direct import s3proxy, sigv4  # noqa: E402
 from gateway.direct.config import parse  # noqa: E402
 from gateway.direct.s3proxy import Proxy  # noqa: E402
-from gateway.direct.service import Caller  # noqa: E402
+from gateway.direct.service import Caller, Denied, NotFound  # noqa: E402
 from gateway.direct.storage import StorageService  # noqa: E402
 from gateway.direct.store import Box, Store  # noqa: E402
 
 from fake_s3 import FakeS3  # noqa: E402  (pytest puts this folder on sys.path)
 
 OP_KEY, OP_SECRET = "SCWOPERATOR0000000", "operator-secret"
+CONSOLE = "https://console.example.com"
 A = Caller(sub="alice", tenant="t-a")
 B = Caller(sub="bob", tenant="t-b")
 
@@ -98,7 +99,8 @@ def env(tmp_path_factory):
         "storage": {"endpoint_url": f"https://localhost:{px_port}",
                     "upstream": f"http://127.0.0.1:{up_port}", "regions": ["fr-par", "nl-ams"],
                     "access_key": OP_KEY, "secret_key": OP_SECRET,
-                    "key_secret": Fernet.generate_key().decode()}},
+                    "key_secret": Fernet.generate_key().decode(),
+                    "cors_origins": [CONSOLE]}},
         "template": {"cpu": {"provider": "dummy", "type": "x", "zones": ["fr-par-1"]}}})
     e = Env()
     e.fake = FakeS3(OP_KEY, OP_SECRET)
@@ -112,7 +114,9 @@ def env(tmp_path_factory):
     kp, cp = _cert(str(folder))
     e.servers = [_serve(e.fake, up_port),
                  _serve(e.proxy, px_port, ssl_keyfile=kp, ssl_certfile=cp),
-                 _serve(e.proxy, plain_port)]
+                 # its own Proxy: each server runs its own event loop, and a connection pool
+                 # shared between two loops hands one a connection bound to the other
+                 _serve(Proxy(e.storage), plain_port)]
     e.endpoint = f"https://localhost:{px_port}"
     e.plain = f"http://127.0.0.1:{plain_port}"
     e.cfg = cfg
@@ -483,3 +487,109 @@ def test_a_refused_upload_does_not_garble_the_next_request_on_the_connection(env
         assert code(e) == "NotImplemented"
     s3.put_object(Bucket="keepalive", Key="k", Body=b"fine")
     assert s3.get_object(Bucket="keepalive", Key="k")["Body"].read() == b"fine"
+
+
+# ── the browser console ─────────────────────────────────────────────────
+
+def _do(env, signed: dict, body: bytes = b"", **kw) -> httpx.Response:
+    return httpx.request(signed["method"], signed["url"], content=body, verify=False, **kw)
+
+
+def test_the_console_uploads_downloads_and_deletes_with_presigned_urls(env):
+    b = env.storage.create_bucket(A, "console")
+    put = env.storage.presign(A, b.id, "put", "reports/q3 €.csv")
+    assert put["url"].startswith(env.endpoint + "/console/reports/q3%20%E2%82%AC.csv?")
+    assert _do(env, put, b"a,b\n1,2\n", headers={"content-type": "text/csv"}).status_code == 200
+    got = _do(env, env.storage.presign(A, b.id, "get", "reports/q3 €.csv"))
+    assert got.status_code == 200 and got.content == b"a,b\n1,2\n"
+    assert "response-content-disposition=attachment" in \
+        env.storage.presign(A, b.id, "get", "reports/q3 €.csv")["url"]
+    assert _do(env, env.storage.presign(A, b.id, "delete", "reports/q3 €.csv")).status_code == 204
+    assert "reports/q3 €.csv" not in env.fake.buckets[b.real_name]["objects"]
+
+
+def test_the_console_uploads_big_files_in_parts(env):
+    b = env.storage.create_bucket(A, "console-mp")
+    r = _do(env, env.storage.presign(A, b.id, "create_multipart", "big.bin"))
+    assert r.status_code == 200 and b"<Bucket>console-mp</Bucket>" in r.content
+    upload_id = r.text.split("<UploadId>")[1].split("</UploadId>")[0]
+    etags = []
+    for n, chunk in enumerate([b"a" * 6000, b"b" * 10], start=1):
+        signed = env.storage.presign(A, b.id, "upload_part", "big.bin", upload_id=upload_id,
+                                     part=n)
+        r = _do(env, signed, chunk)
+        assert r.status_code == 200
+        etags.append(r.headers["etag"])
+    done = "".join(f"<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"
+                   for n, e in enumerate(etags, start=1))
+    r = _do(env, env.storage.presign(A, b.id, "complete_multipart", "big.bin",
+                                     upload_id=upload_id),
+            f"<CompleteMultipartUpload>{done}</CompleteMultipartUpload>".encode())
+    assert r.status_code == 200, r.text
+    assert env.fake.buckets[b.real_name]["objects"]["big.bin"]["data"] == b"a" * 6000 + b"b" * 10
+
+
+def test_the_console_lists_folders_and_deletes_whole_folders(env):
+    b = env.storage.create_bucket(A, "console-tree")
+    for k in ("runs/1/out.csv", "runs/1/log.txt", "runs/2/out.csv", "readme.md"):
+        _do(env, env.storage.presign(A, b.id, "put", k), b"x")
+    top = env.storage.list_objects(A, b.id)
+    assert top["folders"] == ["runs/"] and [o["key"] for o in top["objects"]] == ["readme.md"]
+    assert top["objects"][0]["size"] == 1 and top["next_token"] is None
+    assert env.storage.list_objects(A, b.id, "runs/")["folders"] == ["runs/1/", "runs/2/"]
+    out = env.storage.delete_objects(A, b.id, keys=["readme.md"], prefixes=["runs/1/"])
+    assert out == {"deleted": 3, "more": False}
+    assert sorted(env.fake.buckets[b.real_name]["objects"]) == ["runs/2/out.csv"]
+    with pytest.raises(Denied):
+        env.storage.delete_objects(A, b.id, prefixes=["runs"])       # not a folder
+
+
+def test_the_console_key_is_invisible_and_stays_inside_the_tenant(env):
+    b = env.storage.create_bucket(A, "console-own")
+    env.storage.presign(A, b.id, "put", "x")
+    assert all(k.name != "#console" for k in env.storage.list_keys(A))
+    console = [k for k in env.store.list_s3_keys("t-a") if k.name == "#console"]
+    assert len(console) == 1 and console[0].write
+    with pytest.raises(NotFound):
+        env.storage.revoke_key(A, console[0].access_key)
+    for op in ("get", "put"):
+        with pytest.raises(NotFound):
+            env.storage.presign(B, b.id, op, "x")
+    with pytest.raises(NotFound):
+        env.storage.list_objects(B, b.id)
+    for bad in ("", "/abs", "a/../b", "./a", "a\x00b"):
+        with pytest.raises(Denied):
+            env.storage.presign(A, b.id, "put", bad)
+    with pytest.raises(Denied):
+        env.storage.presign(A, b.id, "upload_part", "x", upload_id="u", part=0)
+
+
+def test_console_uploads_need_credit_like_any_other(env):
+    b = env.storage.create_bucket(A, "console-broke")
+    _do(env, env.storage.presign(A, b.id, "put", "keep"), b"1")
+    env.allow["t-a"] = False
+    try:
+        r = _do(env, env.storage.presign(A, b.id, "put", "more"), b"2")
+        assert r.status_code == 403 and b"no credit" in r.content
+        assert _do(env, env.storage.presign(A, b.id, "get", "keep")).content == b"1"
+    finally:
+        env.allow["t-a"] = True
+
+
+def test_only_the_console_origin_gets_cors(env):
+    b = env.storage.create_bucket(A, "console-cors")
+    pre = {"origin": CONSOLE, "access-control-request-method": "PUT",
+           "access-control-request-headers": "content-type, x-weird header"}
+    r = httpx.options(env.endpoint + "/console-cors/f", headers=pre, verify=False)
+    assert r.status_code == 204
+    assert r.headers["access-control-allow-origin"] == CONSOLE
+    assert r.headers["access-control-allow-headers"] == "content-type"
+    r = httpx.options(env.endpoint + "/console-cors/f", verify=False,
+                      headers={**pre, "origin": "https://evil.example.com"})
+    assert r.status_code == 403 and "access-control-allow-origin" not in r.headers
+    r = _do(env, env.storage.presign(A, b.id, "put", "f"), b"1", headers={"origin": CONSOLE})
+    assert r.headers["access-control-allow-origin"] == CONSOLE
+    assert "ETag" in r.headers["access-control-expose-headers"]
+    r = _do(env, env.storage.presign(A, b.id, "get", "f"),
+            headers={"origin": "https://evil.example.com"})
+    assert r.status_code == 200 and "access-control-allow-origin" not in r.headers

@@ -20,9 +20,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Tuple
+from urllib.parse import quote, urlparse
 
 from cryptography.fernet import Fernet
 
+from . import sigv4
 from .config import DirectConfig
 from .s3client import S3Client, S3Error
 from .service import Caller, Denied, NotFound
@@ -34,6 +36,11 @@ _TENANT = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 # S3 names, without dots: a dotted name breaks TLS for virtual-hosted requests.
 _BUCKET = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 _KEYNAME = re.compile(r"^[\w .@:/-]{1,64}$")
+# The key a tenant's browser console signs with. Customers never see it or its secret; "#" is
+# outside _KEYNAME, so no key a customer makes can carry this name.
+CONSOLE_KEY = "#console"
+CONSOLE_EXPIRES = 15 * 60
+MAX_DELETE = 10000
 
 
 def valid_bucket_name(name) -> bool:
@@ -255,7 +262,8 @@ class StorageService:
             raise Denied("buckets must be a non-empty list of bucket names (or omitted for all)",
                          400)
         ids = self._resolve(tenant, buckets) if buckets is not None else None
-        mine = [k for k in self.store.list_s3_keys(tenant) if not k.box_id]
+        mine = [k for k in self.store.list_s3_keys(tenant) if not k.box_id and
+                k.name != CONSOLE_KEY]
         if len(mine) >= self.cfg.limits.max_s3_keys:
             raise Denied(f"S3 key limit reached ({self.cfg.limits.max_s3_keys})", 429)
         return self._new_key(tenant, caller.sub, name, ids, bool(write))
@@ -267,11 +275,13 @@ class StorageService:
         return self._new_key(tenant, sub, f"box {box_id}", ids, write, box_id=box_id)
 
     def list_keys(self, caller: Caller) -> List[S3Key]:
-        return self.store.list_s3_keys(None if caller.admin else caller.tenant or "\0")
+        return [k for k in self.store.list_s3_keys(None if caller.admin else caller.tenant or "\0")
+                if k.name != CONSOLE_KEY]
 
     def revoke_key(self, caller: Caller, access_key: str) -> S3Key:
         k = self.store.get_s3_key(access_key)
-        if k is None or k.revoked_at is not None or not (caller.admin or k.tenant == caller.tenant):
+        if k is None or k.revoked_at is not None or k.name == CONSOLE_KEY or \
+                not (caller.admin or k.tenant == caller.tenant):
             raise NotFound()
         self.store.update_s3_key(access_key, revoked_at=self.clock())
         self.audit("s3key.revoked", tenant=k.tenant, sub=caller.sub, access_key=access_key)
@@ -283,6 +293,105 @@ class StorageService:
 
     def secret(self, k: S3Key) -> str:
         return self.fernet.decrypt(k.secret_enc.encode()).decode()
+
+    # -- the browser console ----------------------------------------------
+    def _console_key(self, tenant: str, sub: str) -> Tuple[S3Key, str]:
+        for k in self.store.list_s3_keys(tenant):
+            if k.name == CONSOLE_KEY and not k.box_id:
+                return k, self.secret(k)
+        return self._new_key(tenant, sub, CONSOLE_KEY, None, True)
+
+    def _ready(self, caller: Caller, bucket_id: str) -> Bucket:
+        b = self._visible(caller, self.store.get_bucket(bucket_id))
+        if b.state != "ready":
+            raise Denied(f"bucket is {b.state}", 409)
+        return b
+
+    @staticmethod
+    def _object_key(key) -> str:
+        if not isinstance(key, str) or not key or len(key.encode()) > 1024:
+            raise Denied("key: 1-1024 bytes", 400)
+        if key.startswith("/") or any(seg in (".", "..") for seg in key.split("/")) or \
+                any(ord(ch) < 32 for ch in key):
+            raise Denied("key: no leading /, no . or .. segments, no control characters", 400)
+        return key
+
+    def presign(self, caller: Caller, bucket_id: str, op: str, key: str,
+                upload_id: Optional[str] = None, part: Optional[int] = None,
+                filename: Optional[str] = None, expires: int = CONSOLE_EXPIRES) -> dict:
+        """A URL the browser uses against the proxy, signed with the tenant's console key, so
+        the data goes browser ⇄ proxy and the proxy applies the same checks and counters as for
+        any other client. op: get (download), put, create_multipart, upload_part,
+        complete_multipart, abort_multipart, delete."""
+        tenant = self._tenant(caller)
+        b = self._ready(caller, bucket_id)
+        key = self._object_key(key)
+        if op in ("upload_part", "complete_multipart", "abort_multipart") and (
+                not isinstance(upload_id, str) or not upload_id):
+            raise Denied("upload_id is required", 400)
+        if op == "upload_part" and (isinstance(part, bool) or not isinstance(part, int) or
+                                    not 1 <= part <= 10000):
+            raise Denied("part must be 1-10000", 400)
+        method, query = {
+            "get": ("GET", ""), "put": ("PUT", ""), "delete": ("DELETE", ""),
+            "create_multipart": ("POST", "uploads="),
+            "upload_part": ("PUT", f"partNumber={part}&uploadId={quote(upload_id or '', safe='')}"),
+            "complete_multipart": ("POST", f"uploadId={quote(upload_id or '', safe='')}"),
+            "abort_multipart": ("DELETE", f"uploadId={quote(upload_id or '', safe='')}"),
+        }.get(op, (None, None))
+        if method is None:
+            raise Denied(f"unknown op {op!r}", 400)
+        if op == "get":
+            name = filename if isinstance(filename, str) and filename else key.rsplit("/", 1)[-1]
+            query = "response-content-disposition=" + quote(
+                "attachment; filename*=UTF-8''" + quote(name, safe=""), safe="")
+        k, secret = self._console_key(tenant, caller.sub)
+        host = urlparse(self.st.endpoint_url).netloc
+        path = "/" + b.name + "/" + quote(key, safe="/-_.~")
+        qs = sigv4.presign(method, host, path, query, k.access_key, secret, b.region,
+                           int(expires), now=self.clock())
+        return {"method": method, "url": self.st.endpoint_url.rstrip("/") + path + "?" + qs,
+                "expires_at": self.clock() + int(expires)}
+
+    def list_objects(self, caller: Caller, bucket_id: str, prefix: str = "",
+                     token: Optional[str] = None, max_keys: int = 200) -> dict:
+        b = self._ready(caller, bucket_id)
+        if not isinstance(prefix, str) or len(prefix.encode()) > 1024:
+            raise Denied("prefix: at most 1024 bytes", 400)
+        try:
+            page = self.client.page(b.region, b.real_name, prefix, token,
+                                    max(1, min(int(max_keys), 1000)))
+        except S3Error as e:
+            raise Denied(f"listing failed: {e.code}", 502)
+        return {"bucket": b.name, "prefix": prefix, **page}
+
+    def delete_objects(self, caller: Caller, bucket_id: str, keys: Optional[List[str]] = None,
+                       prefixes: Optional[List[str]] = None) -> dict:
+        """Delete objects, and everything under folder prefixes (at most MAX_DELETE a call;
+        `more` says to call again)."""
+        b = self._ready(caller, bucket_id)
+        keys = [self._object_key(k) for k in (keys or [])]
+        prefixes = list(prefixes or [])
+        if any(not isinstance(p, str) or not p.endswith("/") for p in prefixes):
+            raise Denied("prefixes must be folder names ending in /", 400)
+        real = b.real_name
+        todo, more = list(dict.fromkeys(keys)), False
+        for p in prefixes:
+            for k, _size, _cls in self.client.objects(b.region, real, p):
+                if len(todo) >= MAX_DELETE:
+                    more = True
+                    break
+                todo.append(k)
+        if len(todo) > MAX_DELETE:
+            todo, more = todo[:MAX_DELETE], True
+        try:
+            for i in range(0, len(todo), 1000):
+                self.client.delete_keys(b.region, real, todo[i:i + 1000])
+        except S3Error as e:
+            raise Denied(f"delete failed: {e.code}", 502)
+        self.audit("objects.deleted", bucket=b.id, tenant=b.tenant, sub=caller.sub,
+                   count=len(todo), prefixes=prefixes[:5])
+        return {"deleted": len(todo), "more": more}
 
     # -- measuring --------------------------------------------------------
     def _account(self, b: Bucket, now: float, std: float, onezone: float, objects: int,

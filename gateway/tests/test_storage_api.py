@@ -47,6 +47,20 @@ class StubS3:
     def empty(self, region, name):
         self.buckets[name]["objects"].clear()
 
+    def page(self, region, name, prefix="", token=None, max_keys=200):
+        keys = sorted(k for k in self.buckets[name]["objects"] if k.startswith(prefix))
+        return {"folders": [], "objects": [{"key": k, "size": self.buckets[name]["objects"][k],
+                                            "modified": None, "storage_class": "STANDARD"}
+                                           for k in keys][:max_keys], "next_token": None}
+
+    def objects(self, region, name, prefix=""):
+        return [(k, v, "STANDARD") for k, v in sorted(self.buckets[name]["objects"].items())
+                if k.startswith(prefix)]
+
+    def delete_keys(self, region, name, keys):
+        for k in keys:
+            self.buckets[name]["objects"].pop(k, None)
+
     def measure(self, region, name):
         objs = self.buckets[name]["objects"]
         return {"STANDARD": float(sum(objs.values())), "ONEZONE_IA": 0.0, "objects": len(objs)}
@@ -67,6 +81,39 @@ def _api(**extra):
             claims["tenant"] = tenant
         return {"Authorization": f"Bearer {jwt.encode(claims, priv, 'RS256')}"}
     return tc, svc, stub, h
+
+
+def test_config_checks_cors_origins():
+    assert parse(_conf(storage={**STORAGE, "cors_origins": ["https://c.example.test/"]})
+                 ).storage.cors_origins == ("https://c.example.test",)
+    for bad in (["*"], ["https://c.example.test/path"], "https://c.example.test"):
+        with pytest.raises(ConfigError, match="cors_origins"):
+            parse(_conf(storage={**STORAGE, "cors_origins": bad}))
+
+
+def test_the_console_routes_list_sign_and_delete_within_the_tenant():
+    tc, svc, stub, h = _api()
+    b = tc.post("/api/buckets", json={"name": "files"}, headers=h("alice", "t-a")).json()
+    real = svc.store.get_bucket(b["id"]).real_name
+    stub.buckets[real]["objects"].update({"a/1": 3, "a/2": 4, "top": 5})
+    r = tc.get(f"/api/buckets/{b['id']}/objects?prefix=a/", headers=h("alice", "t-a"))
+    assert r.status_code == 200 and [o["key"] for o in r.json()["objects"]] == ["a/1", "a/2"]
+    r = tc.post(f"/api/buckets/{b['id']}/presign", json={"op": "get", "key": "a/1"},
+                headers=h("alice", "t-a"))
+    assert r.status_code == 200 and r.json()["method"] == "GET"
+    assert r.json()["url"].startswith("https://s3.example.test/files/a/1?")
+    assert tc.post(f"/api/buckets/{b['id']}/presign", json={"op": "chmod", "key": "a/1"},
+                   headers=h("alice", "t-a")).status_code == 400
+    for path, body in ((f"/api/buckets/{b['id']}/presign", {"op": "get", "key": "a/1"}),
+                       (f"/api/buckets/{b['id']}/delete-objects", {"keys": ["top"]})):
+        assert tc.post(path, json=body, headers=h("bob", "t-b")).status_code == 404
+    assert tc.get(f"/api/buckets/{b['id']}/objects", headers=h("bob", "t-b")).status_code == 404
+    r = tc.post(f"/api/buckets/{b['id']}/delete-objects", json={"prefixes": ["a/"]},
+                headers=h("alice", "t-a"))
+    assert r.json() == {"deleted": 2, "more": False}
+    assert stub.buckets[real]["objects"] == {"top": 5}
+    keys = tc.get("/api/s3-keys", headers=h("alice", "t-a")).json()["keys"]
+    assert keys == []                                   # the console's key is not listed
 
 
 def test_config_checks_storage():

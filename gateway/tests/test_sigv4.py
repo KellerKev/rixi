@@ -143,3 +143,21 @@ def test_signature_version_2_presigned_urls_from_botocore_verify():
             sigv4.verify(s, SK, "GET", path.replace("bucket", "other"), headers)
         with pytest.raises(sigv4.SigError):
             sigv4.verify(s, SK, "DELETE", path, headers)
+
+
+def test_our_presigned_urls_match_botocore_and_verify():
+    now = time.time()
+    path, query = "/bucket/dir/a%20b%2Bc~%C3%A4.bin", "partNumber=3&uploadId=x%2Fy"
+    qs = sigv4.presign("PUT", "s3.example.com", path, query, AK, SK, "fr-par", 900, now=now)
+    req = AWSRequest(method="PUT", url=f"https://s3.example.com{path}?{query}")
+    req.context["timestamp"] = sigv4.amz_now(now)
+    S3SigV4QueryAuth(Credentials(AK, SK), "s3", "fr-par", expires=900).add_auth(req)
+    assert dict(sigv4.query_pairs(qs))["X-Amz-Signature"] == \
+        dict(sigv4.query_pairs(req.url.split("?", 1)[1]))["X-Amz-Signature"]
+    headers = {"host": "s3.example.com"}
+    s = sigv4.parse(qs, headers)
+    sigv4.verify(s, SK, "PUT", path, headers, now=now)
+    with pytest.raises(sigv4.SigError):
+        sigv4.verify(s, SK, "GET", path, headers, now=now)
+    with pytest.raises(sigv4.SigError, match="expired"):
+        sigv4.verify(s, SK, "PUT", path, headers, now=now + 901)

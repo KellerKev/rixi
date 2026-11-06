@@ -283,6 +283,11 @@ class Proxy:
                   hdrs.get(b"content-length", b"0").strip(b"0") != b""}
         receive = _tracking(receive, unread)
         path = scope.get("path", "")
+        origin = hdrs.get(b"origin", b"").decode("latin-1")
+        if origin and origin in self.st.cors_origins:
+            if scope["method"] == "OPTIONS" and hdrs.get(b"access-control-request-method"):
+                return await self._preflight(send, origin, hdrs, rid)
+            send = _with_cors(send, origin)
         try:
             await self.handle(scope, receive, send, rid)
         except S3Error as e:
@@ -296,6 +301,19 @@ class Proxy:
             log.exception("request %s failed", rid)
             await self._send_error(send, 500, "InternalError", "We encountered an internal error. "
                                    "Please try again.", path, rid, unread["open"])
+
+    async def _preflight(self, send, origin: str, hdrs: Dict[bytes, bytes], rid: str) -> None:
+        """A browser asking whether the console's page may send this request. The answer
+        allows nothing by itself: the request that follows must still be signed."""
+        asked = hdrs.get(b"access-control-request-headers", b"").decode("latin-1")
+        allow = ",".join(h for h in (x.strip().lower() for x in asked.split(","))
+                         if re.fullmatch(r"[a-z0-9-]{1,64}", h))
+        headers = [("access-control-allow-origin", origin),
+                   ("access-control-allow-methods", "GET, HEAD, PUT, POST, DELETE"),
+                   ("access-control-max-age", "600"), ("vary", "Origin")]
+        if allow:
+            headers.append(("access-control-allow-headers", allow))
+        await self._send(send, 204, b"", headers, rid)
 
     async def _send_error(self, send, status, code, message, resource, rid,
                           close: bool = False) -> None:
@@ -661,6 +679,20 @@ class Proxy:
             raise S3Error(503 if d.status >= 500 else 403, "AccessDenied", d.reason)
         self._buckets.pop((key.tenant, b.name), None)
         await self._send(send, 204, b"", [], rid)
+
+
+_EXPOSE = b"ETag, Content-Length, Content-Range, Content-Type, Last-Modified, x-amz-request-id"
+
+
+def _with_cors(send, origin: str):
+    """`send`, with the CORS headers that let the console's page read the response."""
+    async def wrapped(msg):
+        if msg["type"] == "http.response.start":
+            msg = {**msg, "headers": list(msg.get("headers") or []) + [
+                (b"access-control-allow-origin", origin.encode("latin-1")),
+                (b"access-control-expose-headers", _EXPOSE), (b"vary", b"Origin")]}
+        await send(msg)
+    return wrapped
 
 
 def _tracking(receive, unread: dict):

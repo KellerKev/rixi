@@ -133,14 +133,26 @@ class FakeS3:
                                 f"</Bucket>{ups}<IsTruncated>false</IsTruncated>" \
                                 f"</ListMultipartUploadsResult>".encode()
             if method == "GET":
-                prefix = q.get("prefix", "")
-                items = "".join(
-                    f"<Contents><Key>{_x(k)}</Key><Size>{len(o['data'])}</Size>"
-                    f"<ETag>\"{o['etag']}\"</ETag><StorageClass>{o['class']}</StorageClass>"
-                    f"</Contents>" for k, o in sorted(b["objects"].items()) if k.startswith(prefix))
+                prefix, delim = q.get("prefix", ""), q.get("delimiter", "")
+                folders, items = [], ""
+                for k, o in sorted(b["objects"].items()):
+                    if not k.startswith(prefix):
+                        continue
+                    cut = k.find(delim, len(prefix)) if delim else -1
+                    if cut >= 0:
+                        if k[:cut + 1] not in folders:
+                            folders.append(k[:cut + 1])
+                        continue
+                    items += (f"<Contents><Key>{_x(k)}</Key><Size>{len(o['data'])}</Size>"
+                              f"<LastModified>2026-11-06T10:00:00.000Z</LastModified>"
+                              f"<ETag>\"{o['etag']}\"</ETag><StorageClass>{o['class']}"
+                              f"</StorageClass></Contents>")
+                common = "".join(f"<CommonPrefixes><Prefix>{_x(f)}</Prefix></CommonPrefixes>"
+                                 for f in folders)
                 return 200, {"content-type": "application/xml"}, \
                     f'<ListBucketResult xmlns="{NS}"><Name>{name}</Name><Prefix>{_x(prefix)}' \
-                    f"</Prefix><IsTruncated>false</IsTruncated>{items}</ListBucketResult>".encode()
+                    f"</Prefix><IsTruncated>false</IsTruncated>{items}{common}" \
+                    f"</ListBucketResult>".encode()
             return self._err(501, "NotImplemented")
         if b is None:
             return self._err(404, "NoSuchBucket", name)

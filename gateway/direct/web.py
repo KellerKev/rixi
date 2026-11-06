@@ -10,6 +10,9 @@
     POST   /api/boxes/<id>/stop · /start   power a ready box off (disk kept) · back on
     POST   /api/volumes · GET · DELETE /api/volumes/<id>   persistent volumes
     POST   /api/buckets · GET · GET|PATCH|DELETE /api/buckets/<id>   S3 buckets (?force=1 empties)
+    GET    /api/buckets/<id>/objects?prefix=&token=   one folder of a bucket (the console)
+    POST   /api/buckets/<id>/presign      {op, key, upload_id?, part?} — a URL for the browser
+    POST   /api/buckets/<id>/delete-objects   {keys?, prefixes?}
     POST   /api/s3-keys · GET · DELETE /api/s3-keys/<access key>     S3 keys (secret shown once)
     POST   /api/tenants/<tenant>/stop     admin: release every box of a tenant
     POST   /gw/heartbeat                  box → gateway; authenticated by the box's own secret
@@ -298,6 +301,36 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
     async def delete_bucket(ctx, bucket_id):
         force = ombott_ng.request.query.get("force", "") in ("1", "true", "yes")
         return (await _call(_storage().delete_bucket, ctx.caller, bucket_id, force)).public()
+
+    @app.route("/api/buckets/<bucket_id>/objects")
+    @app.use(ctxd.caller)
+    async def objects(ctx, bucket_id):
+        q = ombott_ng.request.query
+        try:
+            max_keys = int(q.get("max_keys") or 200)
+        except ValueError:
+            raise json_error(400, "max_keys must be a number")
+        return await _call(_storage().list_objects, ctx.caller, bucket_id, q.get("prefix") or "",
+                           q.get("token") or None, max_keys)
+
+    @app.route("/api/buckets/<bucket_id>/presign", method="POST")
+    @app.use(ctxd.caller)
+    async def presign(ctx, bucket_id):
+        body = _body()
+        return await _call(_storage().presign, ctx.caller, bucket_id,
+                           _str(body, "op", required=True), body.get("key"),
+                           _str(body, "upload_id"), body.get("part"), _str(body, "filename"))
+
+    @app.route("/api/buckets/<bucket_id>/delete-objects", method="POST")
+    @app.use(ctxd.caller)
+    async def delete_objects(ctx, bucket_id):
+        body = _body()
+        keys, prefixes = body.get("keys") or [], body.get("prefixes") or []
+        if not isinstance(keys, list) or not isinstance(prefixes, list):
+            raise json_error(400, "keys and prefixes must be lists")
+        if not keys and not prefixes:
+            raise json_error(400, "nothing to delete")
+        return await _call(_storage().delete_objects, ctx.caller, bucket_id, keys, prefixes)
 
     @app.route("/api/s3-keys", method="POST")
     @app.use(ctxd.caller)

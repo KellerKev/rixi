@@ -94,13 +94,21 @@ and `Host` unchanged and turn request buffering off):
 - The proxy checks each request's sigv4 (headers or presigned URL, signed chunks chunk by chunk, a
   signed body hash before the last piece is forwarded), keeps it inside the key's buckets, allows
   object, multipart, listing and tagging operations only — no bucket policies, ACLs other than
-  private, CORS, website or replication — and re-signs it with the operator's key. Bodies stream
+  private, bucket CORS, website or replication — and re-signs it with the operator's key. Bodies stream
   through; only listings and errors are rewritten (to the tenant's bucket name).
 - Adding data asks the authorizer (`action: "storage.write"`, cached for a minute) and stops at
   `limits.max_storage_gb`; reading and deleting never ask, so a tenant who runs out of credit can
   still take their data out and clean up.
 - Metering: the gateway measures each bucket every `scan_interval` and accumulates GB-hours by
   storage class (Standard and One Zone IA); the proxy counts downloaded bytes.
+
+- A browser console needs no key of its own: `GET /api/buckets/<id>/objects?prefix=&token=`
+  lists one folder, `POST /api/buckets/<id>/presign {op, key, upload_id?, part?}` returns a
+  15-minute URL for `get` (as a download), `put`, `delete` and the multipart steps, and
+  `POST /api/buckets/<id>/delete-objects {keys?, prefixes?}` removes files and whole folders. The
+  URLs are signed with a per-tenant key the tenant never sees, so the browser talks to the proxy
+  directly and the same checks and counters apply. List the console's origin in `cors_origins`
+  (exact `scheme://host`, no wildcards); other origins get no CORS headers.
 
 `POST /api/buckets {name, region?, expire_days?}` · `GET /api/buckets` · `PATCH /api/buckets/<id>
 {expire_days}` · `DELETE /api/buckets/<id>[?force=1]` (force empties it first).

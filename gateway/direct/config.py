@@ -111,6 +111,7 @@ class StorageConfig:
     eur_per_gb_egress: float = 0.01
     scan_interval: float = 3600.0          # how often each bucket's size is measured
     abort_multipart_days: int = 7          # unfinished uploads are dropped after this long
+    cors_origins: Tuple[str, ...] = ()     # web pages that may call the proxy (a browser console)
 
 
 @dataclass(frozen=True)
@@ -208,7 +209,19 @@ def _storage(st: dict, allowed: Optional[Tuple[str, ...]]) -> Optional[StorageCo
         eur_per_gb_hour_onezone=float(st.get("eur_per_gb_hour_onezone", 0.000011)),
         eur_per_gb_egress=float(st.get("eur_per_gb_egress", 0.01)),
         scan_interval=_duration(st.get("scan_interval", "1h")),
-        abort_multipart_days=int(st.get("abort_multipart_days", 7)))
+        abort_multipart_days=int(st.get("abort_multipart_days", 7)),
+        cors_origins=_origins(st.get("cors_origins", [])))
+
+
+def _origins(v) -> Tuple[str, ...]:
+    if not isinstance(v, list) or not all(isinstance(o, str) for o in v):
+        raise ConfigError("[direct.storage] cors_origins must be a list of origins")
+    out = tuple(o.rstrip("/") for o in v)
+    for o in out:
+        if not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d+)?", o):
+            raise ConfigError(f"[direct.storage] cors_origins: {o!r} is not an origin "
+                              "(scheme://host[:port], no path, no wildcard)")
+    return out
 
 
 def parse(data: dict) -> DirectConfig:

@@ -105,11 +105,12 @@ class S3Client:
         return [_find(b, "Name") for b in root.iter(NS + "Bucket")]
 
     # -- contents ---------------------------------------------------------
-    def objects(self, region: str, bucket: str) -> Iterator[Tuple[str, int, str]]:
-        """(key, size, storage class) of every object."""
+    def objects(self, region: str, bucket: str, prefix: str = "") -> Iterator[Tuple[str, int, str]]:
+        """(key, size, storage class) of every object (under `prefix`)."""
         token = None
         while True:
             q = "list-type=2&max-keys=1000" + (
+                "&prefix=" + quote(prefix, safe="") if prefix else "") + (
                 "&continuation-token=" + quote(token, safe="") if token else "")
             root = ET.fromstring(self.call("GET", region, bucket, query=q).content)
             for c in _all(root, "Contents"):
@@ -118,6 +119,28 @@ class S3Client:
             if (_find(root, "IsTruncated") or "false") != "true":
                 return
             token = _find(root, "NextContinuationToken")
+
+    def page(self, region: str, bucket: str, prefix: str = "", token: Optional[str] = None,
+             max_keys: int = 200) -> dict:
+        """One page of a folder view: {folders, objects, next_token}. Folders are the common
+        prefixes under `prefix` (split at "/"); objects carry key, size, modified, class."""
+        q = f"list-type=2&delimiter=%2F&max-keys={int(max_keys)}" + (
+            "&prefix=" + quote(prefix, safe="") if prefix else "") + (
+            "&continuation-token=" + quote(token, safe="") if token else "")
+        root = ET.fromstring(self.call("GET", region, bucket, query=q).content)
+        return {"folders": [_find(c, "Prefix") for c in _all(root, "CommonPrefixes")],
+                "objects": [{"key": _find(c, "Key"), "size": int(_find(c, "Size") or 0),
+                             "modified": _find(c, "LastModified"),
+                             "storage_class": _find(c, "StorageClass") or "STANDARD"}
+                            for c in _all(root, "Contents")],
+                "next_token": _find(root, "NextContinuationToken")
+                if (_find(root, "IsTruncated") or "false") == "true" else None}
+
+    def delete_keys(self, region: str, bucket: str, keys: List[str]) -> None:
+        """Delete up to 1000 objects in one request."""
+        items = "".join(f"<Object><Key>{_xml(k)}</Key></Object>" for k in keys)
+        self.call("POST", region, bucket, query="delete",
+                  body=f"<Delete><Quiet>true</Quiet>{items}</Delete>".encode())
 
     def uploads(self, region: str, bucket: str) -> Iterator[Tuple[str, str]]:
         """(key, upload id) of every unfinished multipart upload."""
@@ -163,9 +186,7 @@ class S3Client:
             batch = [k for k, _s, _c in self._first_page(region, bucket)]
             if not batch:
                 return n
-            items = "".join(f"<Object><Key>{_xml(k)}</Key></Object>" for k in batch)
-            self.call("POST", region, bucket, query="delete",
-                      body=f"<Delete><Quiet>true</Quiet>{items}</Delete>".encode())
+            self.delete_keys(region, bucket, batch)
             n += len(batch)
 
     def _first_page(self, region: str, bucket: str):

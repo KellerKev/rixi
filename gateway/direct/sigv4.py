@@ -347,3 +347,23 @@ def sign(method: str, host: str, raw_path: str, raw_query: str, headers: Dict[st
     out["authorization"] = (f"{ALGORITHM} Credential={access_key}/{scope}, "
                             f"SignedHeaders={';'.join(signed)}, Signature={sig}")
     return out
+
+
+def presign(method: str, host: str, raw_path: str, raw_query: str, access_key: str, secret: str,
+            region: str, expires: int, now: Optional[float] = None) -> str:
+    """The query string of a presigned URL (sigv4, only the host signed, payload unsigned).
+
+    `raw_path` must be what the client will send, already percent-encoded: it is signed as is.
+    The result already contains `raw_query`'s parameters."""
+    if not 1 <= expires <= MAX_PRESIGN:
+        raise ValueError("expires must be 1 second to 7 days")
+    amz_date = amz_now(now)
+    scope = f"{amz_date[:8]}/{region}/s3/aws4_request"
+    pairs = query_pairs(raw_query) + [
+        ("X-Amz-Algorithm", ALGORITHM), ("X-Amz-Credential", f"{access_key}/{scope}"),
+        ("X-Amz-Date", amz_date), ("X-Amz-Expires", str(int(expires))),
+        ("X-Amz-SignedHeaders", "host")]
+    creq = canonical_request(method, raw_path, pairs, {"host": host}, ["host"], UNSIGNED)
+    sts = "\n".join([ALGORITHM, amz_date, scope, _sha(creq)])
+    sig = _hmac_hex(signing_key(secret, amz_date[:8], region), sts)
+    return canonical_query(pairs) + "&X-Amz-Signature=" + sig
