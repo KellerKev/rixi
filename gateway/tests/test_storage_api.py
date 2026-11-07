@@ -80,9 +80,10 @@ def _api(storage=None, **extra):
     tc = SyncClient(asgi(build_app(svc, JwtVerifier(public_key_pem=pub,
                                                     audience="rixi-gateway"))))
 
-    def h(sub, tenant=None):
+    def h(sub, tenant=None, roles=()):
         import jwt
-        claims = {"sub": sub, "roles": [], "exp": int(time.time()) + 600, "aud": "rixi-gateway"}
+        claims = {"sub": sub, "roles": list(roles), "exp": int(time.time()) + 600,
+                  "aud": "rixi-gateway"}
         if tenant:
             claims["tenant"] = tenant
         return {"Authorization": f"Bearer {jwt.encode(claims, priv, 'RS256')}"}
@@ -176,6 +177,15 @@ def test_share_links_open_until_they_expire_run_out_or_are_revoked():
     assert tc.get(f"/s/{'x' * 32}").status_code == 404
     assert tc.get("/s/<script>").status_code == 404
 
+    # found by its token: by its owner, or by an operator (who sees whose it is)
+    q = f"/api/shares?token={token}"
+    assert [s["id"] for s in tc.get(q, headers=h("alice", "t-a")).json()["shares"]] == [sh["id"]]
+    assert tc.get(q, headers=h("bob", "t-b")).json()["shares"] == []
+    op = h("op", roles=["admin"])
+    found = tc.get(q, headers=op).json()["shares"]
+    assert [(s["id"], s["tenant"]) for s in found] == [(sh["id"], "t-a")]
+    assert tc.get("/api/shares?token=nope", headers=op).json()["shares"] == []
+
     # revoked, by its owner only
     sh2 = tc.post(url, json={"key": "out/report.pdf", "hours": 1},
                   headers=h("alice", "t-a")).json()
@@ -200,6 +210,18 @@ def test_share_links_open_until_they_expire_run_out_or_are_revoked():
                   headers=h("alice", "t-a")).json()
     del stub.buckets[real]["objects"]["out/report.pdf"]
     assert tc.get(f"/s/{sh4['url'].rsplit('/', 1)[1]}").status_code == 410
+
+
+def test_storage_info_names_the_endpoint_regions_and_prices():
+    tc, svc, stub, h = _api(storage={**STORAGE, "share_url": "https://files.example.test/s"})
+    r = tc.get("/api/storage", headers=h("alice", "t-a"))
+    assert r.status_code == 200
+    info = r.json()
+    assert info["endpoint_url"] == svc.cfg.storage.endpoint_url
+    assert info["regions"] == list(svc.cfg.storage.regions)
+    assert info["eur_per_gb_egress"] == svc.cfg.storage.eur_per_gb_egress
+    assert info["shares"] is True and info["share_max_hours"] == 168
+    assert tc.get("/api/storage").status_code == 401
 
 
 def test_share_links_need_a_share_url():

@@ -14,7 +14,8 @@
     POST   /api/buckets/<id>/presign      {op, key, upload_id?, part?, inline?} — a URL for the browser
     POST   /api/buckets/<id>/delete-objects   {keys?, prefixes?}
     POST   /api/buckets/<id>/shares       {key, hours, filename?, max_downloads?} — a share link
-    GET    /api/shares?bucket= · DELETE /api/shares/<id>   share links · revoke one
+    GET    /api/shares?bucket=&token= · DELETE /api/shares/<id>   share links · revoke one
+    GET    /api/storage                   endpoint, regions and cost prices of the storage
     GET    /s/<token>                     public: opens a share link (a short-lived download)
     GET    /api/storage/boxes             boxes that wrote objects with their own key
     GET    /api/boxes/<id>/objects?before=   what that box wrote, newest first
@@ -355,8 +356,14 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
     @app.route("/api/shares")
     @app.use(ctxd.caller)
     async def shares(ctx):
+        q = ombott_ng.request.query
         return {"shares": await _call(_storage().list_shares, ctx.caller,
-                                      ombott_ng.request.query.get("bucket") or None)}
+                                      q.get("bucket") or None, q.get("token") or None)}
+
+    @app.route("/api/storage")
+    @app.use(ctxd.caller)
+    async def storage_info(ctx):
+        return _storage().info()
 
     @app.route("/api/shares/<share_id>", method="DELETE")
     @app.use(ctxd.caller)

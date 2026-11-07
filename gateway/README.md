@@ -118,8 +118,10 @@ and `Host` unchanged and turn request buffering off):
   (`hours` ≤ 168). Each opening counts a download and redirects to a 5-minute URL, so a link
   stops within minutes of `DELETE /api/shares/<id>`, its expiry, its download limit, or the file
   or bucket going away. Only a hash of the token is looked up; the token is kept encrypted, so
-  `GET /api/shares[?bucket=]` can show the link again. Downloads through links are counted and
-  billed like any other.
+  `GET /api/shares[?bucket=]` can show the link again. `GET /api/shares?token=` finds the link a
+  token opens — for an admin, in any tenant, with its `tenant`, to act on an abuse report.
+  Downloads through links are counted and billed like any other.
+- `GET /api/storage` returns the endpoint, regions and cost prices, e.g. for a pricing page.
 - **What boxes wrote.** The proxy records each object a box writes with its own key (uploads,
   multipart, copies), and forgets it when it is deleted through the proxy or the console API.
   `GET /api/storage/boxes` lists the boxes that wrote something; `GET /api/boxes/<id>/objects

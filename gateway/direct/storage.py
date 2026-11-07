@@ -112,6 +112,14 @@ class StorageService:
                                "template": "storage", "provider": "s3", "instance_type": "",
                                "zone": "", "eur_per_hour": 0.0, "ttl_s": 0})
 
+    def info(self) -> dict:
+        """What the storage offers: where, in which regions, at what (cost) price."""
+        return {"endpoint_url": self.st.endpoint_url, "regions": list(self.st.regions),
+                "eur_per_gb_hour": self.st.eur_per_gb_hour,
+                "eur_per_gb_hour_onezone": self.st.eur_per_gb_hour_onezone,
+                "eur_per_gb_egress": self.st.eur_per_gb_egress,
+                "shares": bool(self.st.share_url), "share_max_hours": SHARE_MAX_HOURS}
+
     def tenant_bytes(self, tenant: str) -> float:
         return sum(b.estimated_bytes() for b in self.store.list_buckets(tenant, live_only=True))
 
@@ -435,7 +443,8 @@ class StorageService:
                  "used up" if sh.max_downloads is not None and sh.downloads >= sh.max_downloads
                  else "active")
         token = self.fernet.decrypt(sh.token_enc.encode()).decode()
-        return {"id": sh.id, "bucket_id": sh.bucket_id, "bucket": b.name if b else None,
+        return {"id": sh.id, "tenant": sh.tenant, "bucket_id": sh.bucket_id,
+                "bucket": b.name if b else None,
                 "key": sh.key, "filename": sh.filename, "created_at": sh.created_at,
                 "expires_at": sh.expires_at, "revoked_at": sh.revoked_at,
                 "max_downloads": sh.max_downloads, "downloads": sh.downloads,
@@ -483,9 +492,17 @@ class StorageService:
                    hours=hours, max_downloads=max_downloads)
         return self._share_view(sh, {b.id: b})
 
-    def list_shares(self, caller: Caller, bucket_id: Optional[str] = None) -> List[dict]:
-        """Live links and those that ended in the last week."""
+    def list_shares(self, caller: Caller, bucket_id: Optional[str] = None,
+                    token: Optional[str] = None) -> List[dict]:
+        """Live links and those that ended in the last week; with `token`, the one link it opens
+        (whenever it ended), e.g. for an operator answering an abuse report."""
         tenant = None if caller.admin and not caller.tenant else self._tenant(caller)
+        if token is not None:
+            sh = self.store.find_share(hashlib.sha256(token.encode()).hexdigest()) \
+                if isinstance(token, str) and _TOKEN.match(token) else None
+            if sh is None or (tenant is not None and sh.tenant != tenant):
+                return []
+            return [self._share_view(sh)]
         if bucket_id is not None:
             self._visible(caller, self.store.get_bucket(bucket_id))
         rows = self.store.list_shares(tenant, bucket_id,
