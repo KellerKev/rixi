@@ -142,6 +142,31 @@ def test_previews_are_inline_only_for_types_that_cannot_run_script():
     assert r.status_code == 400
 
 
+def test_a_bucket_is_made_public_and_given_web_origins_through_the_api():
+    tc, svc, stub, h = _api(storage={**STORAGE, "public_buckets": True, "public_cap_gb": 20})
+    b = tc.post("/api/buckets", json={"name": "site"}, headers=h("alice", "t-a")).json()
+    assert b["public_read"] is False and b["public_url"] is None and b["cors_origins"] == []
+    url = f"/api/buckets/{b['id']}"
+    r = tc.patch(url, json={"public": True}, headers=h("alice", "t-a"))
+    assert r.status_code == 200, r.text
+    assert r.json()["public_url"] == f"https://s3.example.test/{b['id']}"
+    assert r.json()["public_cap_gb"] == 20
+    r = tc.patch(url, json={"public_cap_gb": 5, "cors_origins": ["https://app.example.org"]},
+                 headers=h("alice", "t-a"))
+    assert r.json()["public_cap_gb"] == 5 and r.json()["public_read"] is True
+    assert r.json()["cors_origins"] == ["https://app.example.org"]
+    assert tc.patch(url, json={"public": True}, headers=h("bob", "t-b")).status_code == 404
+    assert tc.patch(url, json={"colour": "red"}, headers=h("alice", "t-a")).status_code == 400
+    # an abuse report: the operator stops it, and the tenant cannot turn it back on
+    assert tc.patch(url, json={"public_blocked": True},
+                    headers=h("alice", "t-a")).status_code == 404
+    r = tc.patch(url, json={"public_blocked": True}, headers=h("op", roles=["admin"]))
+    assert r.json()["public_blocked"] is True and r.json()["public_read"] is False
+    assert tc.patch(url, json={"public": True}, headers=h("alice", "t-a")).status_code == 403
+    info = tc.get("/api/storage", headers=h("alice", "t-a")).json()
+    assert info["public_buckets"] is True and info["public_max_cap_gb"] == 1000
+
+
 def test_share_links_open_until_they_expire_run_out_or_are_revoked():
     tc, svc, stub, h = _api(storage={**STORAGE, "share_url": "https://files.example.test/s/"})
     b = tc.post("/api/buckets", json={"name": "files"}, headers=h("alice", "t-a")).json()

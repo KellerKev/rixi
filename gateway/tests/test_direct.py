@@ -721,6 +721,36 @@ def test_an_upgrade_adds_columns_the_live_table_is_missing():
     assert store2.list()[0].id == "old1"
 
 
+def test_an_upgrade_adds_bucket_columns_and_counts_public_downloads_per_month():
+    import sqlite3
+    from gateway.direct.store import Bucket
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "old.db")
+    url = f"sqlite:///{path}"
+    store = Store(url)
+    store.insert_bucket(Bucket(id="b1", tenant="t-a", owner="u1", name="old", region="fr-par",
+                               real_name="rixi-b1", created_at=1.0))
+    store.close()
+    con = sqlite3.connect(path)
+    for col in ("public_read", "public_blocked", "public_cap_gb", "public_month", "public_bytes",
+                "cors"):
+        con.execute(f"ALTER TABLE rixi_bucket DROP COLUMN {col}")
+    con.commit()
+    con.close()
+
+    store2 = Store(url)
+    b = store2.get_bucket("b1")
+    assert b.public_read == 0 and b.cors_origins() == [] and b.public_bytes_in("2026-11") == 0
+    store2.add_public_traffic("b1", 100, "2026-11")
+    store2.add_public_traffic("b1", 50, "2026-11")
+    assert store2.get_bucket("b1").public_bytes_in("2026-11") == 150
+    store2.add_public_traffic("b1", 7, "2026-12")              # a new month starts again
+    b = store2.get_bucket("b1")
+    assert b.public_bytes_in("2026-12") == 7 and b.public_bytes_in("2026-11") == 0
+    store2.update_bucket("b1", cors='["https://a.example"]')
+    assert store2.cors_origins() == {"https://a.example"}
+
+
 # ── governed model calls ────────────────────────────────────────────────
 
 def test_a_box_gets_a_model_gateway_and_token_but_the_store_keeps_neither():

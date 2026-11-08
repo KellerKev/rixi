@@ -114,6 +114,11 @@ class StorageConfig:
     abort_multipart_days: int = 7          # unfinished uploads are dropped after this long
     cors_origins: Tuple[str, ...] = ()     # web pages that may call the proxy (a browser console)
     share_url: str = ""                    # where the gateway's GET /s/<token> is reached; "" = no links
+    # Public buckets: anyone may download (never list) a public bucket's files, with no key, at
+    # <endpoint_url>/<bucket id>/<key>. Off unless the operator turns it on.
+    public_buckets: bool = False
+    public_cap_gb: float = 50.0            # default monthly limit on public downloads, per bucket
+    public_max_cap_gb: float = 1000.0      # the most a tenant may set it to
 
 
 @dataclass(frozen=True)
@@ -213,7 +218,17 @@ def _storage(st: dict, allowed: Optional[Tuple[str, ...]]) -> Optional[StorageCo
         scan_interval=_duration(st.get("scan_interval", "1h")),
         abort_multipart_days=int(st.get("abort_multipart_days", 7)),
         cors_origins=_origins(st.get("cors_origins", [])),
-        share_url=_share_url(st.get("share_url", ""), bool(st.get("allow_http"))))
+        share_url=_share_url(st.get("share_url", ""), bool(st.get("allow_http"))),
+        public_buckets=bool(st.get("public_buckets", False)),
+        public_cap_gb=_gb(st, "public_cap_gb", 50.0),
+        public_max_cap_gb=_gb(st, "public_max_cap_gb", 1000.0))
+
+
+def _gb(st: dict, name: str, default: float) -> float:
+    v = st.get(name, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        raise ConfigError(f"[direct.storage] {name} must be a positive number of GB")
+    return float(v)
 
 
 def _share_url(v, allow_http: bool) -> str:

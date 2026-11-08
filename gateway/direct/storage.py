@@ -48,6 +48,11 @@ SHARE_MAX_HOURS = 7 * 24
 SHARE_URL_EXPIRES = 5 * 60
 MAX_SHARES = 1000                           # live links per tenant
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+# Web pages a tenant lets call a bucket from the browser: https, or http on the tenant's own
+# machine while developing. No paths, no wildcards.
+_ORIGIN = re.compile(r"^(https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+"
+                     r"|http://(localhost|127\.0\.0\.1))(:\d{1,5})?$")
+MAX_ORIGINS = 10
 # What a browser may show inline, by extension, always with this content type: nothing that runs
 # script when opened (no HTML, no SVG), whatever the uploader claimed.
 INLINE_TYPES = {
@@ -118,7 +123,14 @@ class StorageService:
                 "eur_per_gb_hour": self.st.eur_per_gb_hour,
                 "eur_per_gb_hour_onezone": self.st.eur_per_gb_hour_onezone,
                 "eur_per_gb_egress": self.st.eur_per_gb_egress,
-                "shares": bool(self.st.share_url), "share_max_hours": SHARE_MAX_HOURS}
+                "shares": bool(self.st.share_url), "share_max_hours": SHARE_MAX_HOURS,
+                "public_buckets": self.st.public_buckets,
+                "public_cap_gb": self.st.public_cap_gb,
+                "public_max_cap_gb": self.st.public_max_cap_gb, "max_cors_origins": MAX_ORIGINS}
+
+    def public_url(self, b: Bucket) -> str:
+        """Where anyone downloads a public bucket's files: <this>/<key>."""
+        return f"{self.st.endpoint_url}/{b.id}"
 
     def tenant_bytes(self, tenant: str) -> float:
         return sum(b.estimated_bytes() for b in self.store.list_buckets(tenant, live_only=True))
@@ -198,6 +210,74 @@ class StorageService:
         self.store.update_bucket(b.id, expire_days=days)
         self.audit("bucket.expiry", bucket=b.id, tenant=b.tenant, sub=caller.sub,
                    expire_days=days)
+        return self.store.get_bucket(b.id)
+
+    def set_public(self, caller: Caller, bucket_id: str, public: bool,
+                   cap_gb=None) -> Bucket:
+        """Let anyone download the bucket's files with no key (never list them), or stop that.
+        Downloads count as the tenant's traffic, up to `cap_gb` a month."""
+        b = self._visible(caller, self.store.get_bucket(bucket_id))
+        if b.state != "ready":
+            raise Denied(f"bucket {b.name} is {b.state}", 409)
+        if not isinstance(public, bool):
+            raise Denied("public must be true or false", 400)
+        changes: dict = {}
+        if cap_gb is not None:
+            if isinstance(cap_gb, bool) or not isinstance(cap_gb, (int, float)) or \
+                    not 0 < cap_gb <= self.st.public_max_cap_gb:
+                raise Denied(f"the monthly limit must be more than 0 and at most "
+                             f"{self.st.public_max_cap_gb:g} GB", 400)
+            changes["public_cap_gb"] = float(cap_gb)
+        if public:
+            if not self.st.public_buckets:
+                raise Denied("public buckets are not offered here", 403)
+            if b.public_blocked and not caller.admin:
+                raise Denied("public access to this bucket was stopped by the operator", 403)
+            allow, reason = self.may_write(b.tenant, caller.sub)
+            if not allow:
+                raise Denied(reason or "this account cannot publish files now", 402)
+            if not b.public_cap_gb and "public_cap_gb" not in changes:
+                changes["public_cap_gb"] = self.st.public_cap_gb
+        changes["public_read"] = 1 if public else 0
+        self.store.update_bucket(b.id, **changes)
+        if bool(b.public_read) != public:
+            self.audit("bucket.public" if public else "bucket.private", bucket=b.id,
+                       tenant=b.tenant, sub=caller.sub, cap_gb=changes.get("public_cap_gb"))
+        return self.store.get_bucket(b.id)
+
+    def block_public(self, caller: Caller, bucket_id: str, blocked: bool) -> Bucket:
+        """The operator stops a bucket being public (e.g. after an abuse report), so the tenant
+        cannot turn it back on — or lifts that."""
+        if not caller.admin:
+            raise NotFound()
+        b = self._visible(caller, self.store.get_bucket(bucket_id))
+        if not isinstance(blocked, bool):
+            raise Denied("public_blocked must be true or false", 400)
+        changes = {"public_blocked": 1 if blocked else 0}
+        if blocked:
+            changes["public_read"] = 0
+        self.store.update_bucket(b.id, **changes)
+        self.audit("bucket.public_blocked" if blocked else "bucket.public_unblocked",
+                   bucket=b.id, tenant=b.tenant, sub=caller.sub)
+        return self.store.get_bucket(b.id)
+
+    def set_cors(self, caller: Caller, bucket_id: str, origins) -> Bucket:
+        """Web pages (origins) whose scripts may call the bucket — signed, with a key or a
+        presigned URL; this lets a browser read the answers, it grants no access."""
+        b = self._visible(caller, self.store.get_bucket(bucket_id))
+        if b.state != "ready":
+            raise Denied(f"bucket {b.name} is {b.state}", 409)
+        if not isinstance(origins, list) or not all(isinstance(o, str) for o in origins):
+            raise Denied("cors_origins must be a list of origins", 400)
+        clean = list(dict.fromkeys(o.strip().rstrip("/").lower() for o in origins))
+        if len(clean) > MAX_ORIGINS:
+            raise Denied(f"at most {MAX_ORIGINS} origins", 400)
+        for o in clean:
+            if not _ORIGIN.match(o):
+                raise Denied(f"{o!r} is not an origin: https://host[:port] (http only for "
+                             "localhost), no path, no wildcard", 400)
+        self.store.update_bucket(b.id, cors=json.dumps(clean) if clean else None)
+        self.audit("bucket.cors", bucket=b.id, tenant=b.tenant, sub=caller.sub, origins=clean)
         return self.store.get_bucket(b.id)
 
     def delete_bucket(self, caller: Caller, bucket_id: str, force: bool = False) -> Bucket:

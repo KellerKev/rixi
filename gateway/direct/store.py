@@ -134,6 +134,11 @@ class Volume:
 BUCKET_LIVE = ("ready", "deleting")
 
 
+def month(t: Optional[float] = None) -> str:
+    """The calendar month (UTC) public downloads are counted in."""
+    return time.strftime("%Y-%m", time.gmtime(time.time() if t is None else t))
+
+
 @dataclass
 class Bucket:
     """An S3 bucket of a tenant: a real bucket under the operator's account (`real_name`),
@@ -167,10 +172,23 @@ class Bucket:
     requests: int = 0
     purge: int = 0                          # being deleted with everything in it
     error: Optional[str] = None
+    # anyone may download its files with no key (see s3proxy); the operator can stop that
+    public_read: int = 0
+    public_blocked: int = 0                 # stopped by the operator: the tenant cannot turn it on
+    public_cap_gb: float = 0.0              # monthly limit on public downloads
+    public_month: Optional[str] = None      # "YYYY-MM" that public_bytes counts
+    public_bytes: float = 0.0
+    cors: Optional[str] = None              # JSON list of web origins that may call it signed
 
     @property
     def live(self) -> bool:
         return self.state in BUCKET_LIVE
+
+    def cors_origins(self) -> List[str]:
+        return json.loads(self.cors) if self.cors else []
+
+    def public_bytes_in(self, month: str) -> float:
+        return (self.public_bytes or 0.0) if self.public_month == month else 0.0
 
     def estimated_bytes(self) -> float:
         """What it holds now, as far as we know: the last measurement plus uploads since."""
@@ -179,7 +197,11 @@ class Bucket:
 
     def public(self) -> dict:
         d = {f.name: getattr(self, f.name) for f in fields(self) if f.name not in (
-            "real_name", "ingress_at_scan")}
+            "real_name", "ingress_at_scan", "cors", "public_month", "public_bytes")}
+        d["public_read"] = bool(self.public_read)
+        d["public_blocked"] = bool(self.public_blocked)
+        d["cors_origins"] = self.cors_origins()
+        d["public_gb_this_month"] = round(self.public_bytes_in(month()) / 1e9, 6)
         d["live"] = self.live
         d["size_gb"] = round((self.bytes_std + self.bytes_onezone) / 1e9, 6)
         d["egress_gb"] = round(self.egress_bytes / 1e9, 6)
@@ -249,8 +271,10 @@ class BoxObject:
 _BFIELDS = [f.name for f in fields(Bucket)]
 _BDOUBLE = {"created_at", "deleted_at", "eur_per_gb_hour", "eur_per_gb_hour_onezone",
             "eur_per_gb_egress", "bytes_std", "bytes_onezone", "scanned_at", "gbh_std",
-            "gbh_onezone", "egress_bytes", "ingress_bytes", "ingress_at_scan"}
-_BINT = {"expire_days", "objects", "requests", "purge"}
+            "gbh_onezone", "egress_bytes", "ingress_bytes", "ingress_at_scan", "public_cap_gb",
+            "public_bytes"}
+_BINT = {"expire_days", "objects", "requests", "purge", "public_read", "public_blocked"}
+_BTEXT = {"cors"}
 _KFIELDS = [f.name for f in fields(S3Key)]
 _KDOUBLE = {"created_at", "revoked_at", "last_used_at"}
 _SHFIELDS = [f.name for f in fields(Share)]
@@ -318,7 +342,7 @@ class Store:
             Field(n, "string", length=512 if n == "error" else 255) for n in _VFIELDS])
         self.db.define_table("rixi_bucket", *[
             Field("bucket_id", "string", length=32, unique=True, notnull=True) if n == "id" else
-            _plain_field(n, _BDOUBLE, _BINT) for n in _BFIELDS])
+            _plain_field(n, _BDOUBLE, _BINT, _BTEXT) for n in _BFIELDS])
         self.db.define_table("rixi_s3_key", *[
             Field("access_key", "string", length=32, unique=True, notnull=True)
             if n == "access_key" else _plain_field(n, _KDOUBLE, {"write"}, {"secret_enc", "buckets"})
@@ -359,24 +383,37 @@ class Store:
         would otherwise query a column the live table has never had — and on Postgres the
         first such query poisons the whole transaction.
         """
-        have = self._db_columns("rixi_box")
-        if not have:
-            return                      # table was just created with every column
-        for name in _FIELDS:
-            col = _col(name)
-            if col in have:
-                continue
-            kind = ("DOUBLE PRECISION" if name in _DOUBLE else
+        def box_kind(name):
+            return ("DOUBLE PRECISION" if name in _DOUBLE else
                     "INTEGER DEFAULT 0" if name in _INT else
                     "TEXT" if name in _TEXT else "VARCHAR(255)")
-            try:
-                self.db.executesql(f"ALTER TABLE rixi_box ADD COLUMN {col} {kind}")
-                self.db.commit()
-                log.info("added column rixi_box.%s", col)
-            except Exception:
-                self.db.rollback()
-                log.exception("could not add column rixi_box.%s", col)
-                raise
+
+        def bucket_kind(name):
+            return ("DOUBLE PRECISION" + ("" if name.endswith("_at") else " DEFAULT 0")
+                    if name in _BDOUBLE else
+                    "INTEGER" + ("" if name == "expire_days" else " DEFAULT 0")
+                    if name in _BINT else
+                    "TEXT" if name in _BTEXT else
+                    "VARCHAR(512)" if name == "error" else "VARCHAR(255)")
+
+        for table, names, kind in (("rixi_box", [_col(n) for n in _FIELDS], box_kind),
+                                   ("rixi_bucket", [n for n in _BFIELDS if n != "id"],
+                                    bucket_kind)):
+            have = self._db_columns(table)
+            if not have:
+                continue                # table was just created with every column
+            for col in names:
+                if col in have:
+                    continue
+                try:
+                    self.db.executesql(f"ALTER TABLE {table} ADD COLUMN {col} "
+                                       f"{kind('id' if col == 'box_id' else col)}")
+                    self.db.commit()
+                    log.info("added column %s.%s", table, col)
+                except Exception:
+                    self.db.rollback()
+                    log.exception("could not add column %s.%s", table, col)
+                    raise
 
     def _box(self, row) -> Box:
         return Box(**{n: row[_col(n)] for n in _FIELDS})
@@ -503,6 +540,25 @@ class Store:
             "requests = COALESCE(requests, 0) + :r WHERE bucket_id = :b",
             {"e": float(egress), "i": float(ingress), "r": int(requests), "b": bucket_id})
         self.db.commit()
+
+    def add_public_traffic(self, bucket_id: str, nbytes: float, in_month: str) -> None:
+        """Public downloads this month; the count starts again when the month changes."""
+        self.db.executesql(
+            "UPDATE rixi_bucket SET public_bytes = CASE WHEN public_month = :m "
+            "THEN COALESCE(public_bytes, 0) + :e ELSE :e END, public_month = :m "
+            "WHERE bucket_id = :b", {"e": float(nbytes), "m": in_month, "b": bucket_id})
+        self.db.commit()
+
+    def cors_origins(self) -> set:
+        """Every origin some live bucket lets call it (for answering browsers' preflights)."""
+        t = self.db.rixi_bucket
+        rows = self.db((t.cors != None) & t.state.belongs(list(BUCKET_LIVE))  # noqa: E711
+                       ).select(t.cors)
+        self.db.commit()
+        out = set()
+        for r in rows:
+            out.update(json.loads(r.cors or "[]"))
+        return out
 
     def get_bucket(self, bucket_id: str) -> Optional[Bucket]:
         row = self.db(self.db.rixi_bucket.bucket_id == bucket_id).select().first()

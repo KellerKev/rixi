@@ -10,6 +10,7 @@
     POST   /api/boxes/<id>/stop · /start   power a ready box off (disk kept) · back on
     POST   /api/volumes · GET · DELETE /api/volumes/<id>   persistent volumes
     POST   /api/buckets · GET · GET|PATCH|DELETE /api/buckets/<id>   S3 buckets (?force=1 empties)
+           PATCH {expire_days?, public?, public_cap_gb?, cors_origins?, public_blocked? (admin)}
     GET    /api/buckets/<id>/objects?prefix=&token=   one folder of a bucket (the console)
     POST   /api/buckets/<id>/presign      {op, key, upload_id?, part?, inline?} — a URL for the browser
     POST   /api/buckets/<id>/delete-objects   {keys?, prefixes?}
@@ -282,6 +283,9 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
             raise json_error(404, "this gateway offers no storage")
         return svc.storage
 
+    def _bview(b) -> dict:
+        return {**b.public(), "public_url": _storage().public_url(b) if b.public_read else None}
+
     @app.route("/api/buckets", method="POST")
     @app.use(ctxd.caller)
     async def create_bucket(ctx):
@@ -290,7 +294,7 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         b = await _call(_storage().create_bucket, ctx.caller, _str(body, "name", required=True),
                         _str(body, "region"), days)
         ombott_ng.response.status = 201
-        return b.public()
+        return _bview(b)
 
     @app.route("/api/buckets")
     @app.use(ctxd.caller)
@@ -298,28 +302,40 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
         st = _storage()
         rows = await _call(st.list_buckets, ctx.caller,
                            ombott_ng.request.query.get("tenant") or None)
-        return {"buckets": [b.public() for b in rows], "endpoint_url": st.st.endpoint_url,
+        return {"buckets": [_bview(b) for b in rows], "endpoint_url": st.st.endpoint_url,
                 "regions": list(st.st.regions)}
 
     @app.route("/api/buckets/<bucket_id>")
     @app.use(ctxd.caller)
     async def bucket(ctx, bucket_id):
-        return (await _call(_storage().get_bucket, ctx.caller, bucket_id)).public()
+        return _bview(await _call(_storage().get_bucket, ctx.caller, bucket_id))
 
     @app.route("/api/buckets/<bucket_id>", method="PATCH")
     @app.use(ctxd.caller)
     async def patch_bucket(ctx, bucket_id):
         body = _body()
-        if "expire_days" not in body:
-            raise json_error(400, "only expire_days can be changed")
-        return (await _call(_storage().set_expiry, ctx.caller, bucket_id,
-                            body["expire_days"])).public()
+        st = _storage()
+        known = {"expire_days", "public", "public_cap_gb", "cors_origins", "public_blocked"}
+        if not body or set(body) - known:
+            raise json_error(400, "can change: " + ", ".join(sorted(known)))
+        b = None
+        if "public_blocked" in body:
+            b = await _call(st.block_public, ctx.caller, bucket_id, body["public_blocked"])
+        if "expire_days" in body:
+            b = await _call(st.set_expiry, ctx.caller, bucket_id, body["expire_days"])
+        if "cors_origins" in body:
+            b = await _call(st.set_cors, ctx.caller, bucket_id, body["cors_origins"])
+        if "public" in body or "public_cap_gb" in body:
+            cur = b or await _call(st.get_bucket, ctx.caller, bucket_id)
+            b = await _call(st.set_public, ctx.caller, bucket_id,
+                            body.get("public", bool(cur.public_read)), body.get("public_cap_gb"))
+        return _bview(b)
 
     @app.route("/api/buckets/<bucket_id>", method="DELETE")
     @app.use(ctxd.caller)
     async def delete_bucket(ctx, bucket_id):
         force = ombott_ng.request.query.get("force", "") in ("1", "true", "yes")
-        return (await _call(_storage().delete_bucket, ctx.caller, bucket_id, force)).public()
+        return _bview(await _call(_storage().delete_bucket, ctx.caller, bucket_id, force))
 
     @app.route("/api/buckets/<bucket_id>/objects")
     @app.use(ctxd.caller)

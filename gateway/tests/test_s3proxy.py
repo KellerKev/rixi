@@ -6,6 +6,7 @@ settings, and every body form a client may send arrives intact — or not at all
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import hashlib
 import io
@@ -100,7 +101,8 @@ def env(tmp_path_factory):
                     "upstream": f"http://127.0.0.1:{up_port}", "regions": ["fr-par", "nl-ams"],
                     "access_key": OP_KEY, "secret_key": OP_SECRET,
                     "key_secret": Fernet.generate_key().decode(),
-                    "cors_origins": [CONSOLE], "share_url": "https://files.example.com/s"}},
+                    "cors_origins": [CONSOLE], "share_url": "https://files.example.com/s",
+                    "public_buckets": True}},
         "template": {"cpu": {"provider": "dummy", "type": "x", "zones": ["fr-par-1"]}}})
     e = Env()
     e.fake = FakeS3(OP_KEY, OP_SECRET)
@@ -657,3 +659,150 @@ def test_only_the_console_origin_gets_cors(env):
     r = _do(env, env.storage.presign(A, b.id, "get", "f"),
             headers={"origin": "https://evil.example.com"})
     assert r.status_code == 200 and "access-control-allow-origin" not in r.headers
+
+
+# -- public buckets ---------------------------------------------------------
+ADMIN = Caller(sub="op", tenant=None, admin=True)
+APP = "https://app.example.org"
+
+
+def _public_bucket(env, name, files):
+    b = env.storage.create_bucket(A, name)
+    for key, body in files.items():
+        assert _do(env, env.storage.presign(A, b.id, "put", key), body).status_code == 200
+    return b
+
+
+def test_a_public_bucket_serves_files_to_anyone_and_nothing_else(env):
+    b = _public_bucket(env, "pub", {"pic.png": b"\x89PNG", "site/index.html": b"<script>x</script>",
+                                    "notes.txt": b"0123456789"})
+    url = f"{env.endpoint}/{b.id}"
+    assert httpx.get(url + "/pic.png", verify=False).status_code == 403     # still private
+    env.storage.set_public(A, b.id, True)
+    env.proxy._by_id.clear()
+
+    r = httpx.get(url + "/pic.png", verify=False, headers={"origin": "https://anyone.example"})
+    assert r.status_code == 200 and r.content == b"\x89PNG"
+    assert r.headers["content-type"] == "image/png"
+    assert r.headers["content-disposition"] == "inline"
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert "sandbox" in r.headers["content-security-policy"]
+    assert r.headers["access-control-allow-origin"] == "*"
+    assert not any(h.startswith("x-amz-meta") for h in r.headers)
+
+    # a page that would run script is only ever a download
+    r = httpx.get(url + "/site/index.html", verify=False)
+    assert r.headers["content-type"] == "application/octet-stream"
+    assert r.headers["content-disposition"].startswith("attachment;")
+
+    r = httpx.get(url + "/notes.txt", verify=False, headers={"range": "bytes=2-4"})
+    assert r.status_code == 206 and r.content == b"234"
+    assert httpx.head(url + "/notes.txt", verify=False).status_code == 200
+
+    # no listing, no query, no writes, and never under the tenant's own bucket name
+    assert httpx.get(url + "/", verify=False).status_code == 403
+    assert httpx.get(url + "/pic.png?acl", verify=False).status_code == 403
+    assert httpx.put(url + "/new.txt", content=b"x", verify=False).status_code == 403
+    assert httpx.delete(url + "/pic.png", verify=False).status_code == 403
+    assert httpx.get(f"{env.endpoint}/pub/pic.png", verify=False).status_code == 403
+
+    missing = httpx.get(url + "/nope.png", verify=False)
+    assert missing.status_code == 404 and b"NoSuchKey" in missing.content
+    assert b.real_name.encode() not in missing.content
+
+    env.storage.set_public(A, b.id, False)
+    env.proxy._by_id.clear()
+    assert httpx.get(url + "/pic.png", verify=False).status_code == 403
+
+
+def test_public_downloads_stop_at_the_monthly_limit_and_when_the_account_cannot_pay(env):
+    b = _public_bucket(env, "pub-cap", {"f.bin": b"x" * 1000})
+    env.storage.set_public(A, b.id, True, cap_gb=1500 / 1e9)
+    env.proxy._by_id.clear()
+    url = f"{env.endpoint}/{b.id}/f.bin"
+    assert httpx.get(url, verify=False).status_code == 200
+    assert httpx.get(url, verify=False).status_code == 200      # 2000 bytes: over now
+    r = httpx.get(url, verify=False)
+    assert r.status_code == 403 and b"limit" in r.content
+    asyncio.run(env.proxy.flush())
+    assert env.store.get_bucket(b.id).public_bytes == 2000.0
+
+    b2 = _public_bucket(env, "pub-pay", {"f.bin": b"x"})
+    env.storage.set_public(A, b2.id, True)
+    env.allow["t-a"] = False
+    try:
+        env.proxy._writes.clear()
+        assert httpx.get(f"{env.endpoint}/{b2.id}/f.bin", verify=False).status_code == 403
+        with pytest.raises(Denied) as d:
+            env.storage.set_public(A, b2.id, True)
+        assert d.value.status == 402
+    finally:
+        env.allow["t-a"] = True
+        env.proxy._writes.clear()
+
+
+def test_the_operator_can_stop_a_public_bucket_for_good(env):
+    b = _public_bucket(env, "pub-abuse", {"f.png": b"x"})
+    env.storage.set_public(A, b.id, True)
+    with pytest.raises(NotFound):
+        env.storage.block_public(A, b.id, True)                  # tenants cannot
+    env.storage.block_public(ADMIN, b.id, True)
+    env.proxy._by_id.clear()
+    assert httpx.get(f"{env.endpoint}/{b.id}/f.png", verify=False).status_code == 403
+    with pytest.raises(Denied) as d:
+        env.storage.set_public(A, b.id, True)
+    assert d.value.status == 403
+    assert env.storage.set_public(A, b.id, False).public_read == 0  # making it private still works
+    env.storage.block_public(ADMIN, b.id, False)
+    assert env.storage.set_public(A, b.id, True).public_read == 1
+
+
+def test_a_public_bucket_needs_the_operator_to_offer_them(env):
+    import dataclasses
+    cfg = dataclasses.replace(env.cfg, storage=dataclasses.replace(env.cfg.storage,
+                                                                   public_buckets=False))
+    off = StorageService(cfg, env.store, client=env.storage.client)
+    b = env.storage.create_bucket(A, "pub-off")
+    with pytest.raises(Denied) as d:
+        off.set_public(A, b.id, True)
+    assert d.value.status == 403
+    with pytest.raises(Denied):
+        env.storage.set_public(A, b.id, True, cap_gb=10 ** 6)     # over public_max_cap_gb
+
+
+def test_a_tenants_web_origins_may_read_signed_answers_from_that_bucket_only(env):
+    b = env.storage.create_bucket(A, "app-cors")
+    other = env.storage.create_bucket(A, "app-other")
+    for bad in (["http://app.example.org"], ["https://*.example.org"], ["https://a.example/x"],
+                ["app.example.org"], [f"https://h{i}.example.org" for i in range(11)]):
+        with pytest.raises(Denied):
+            env.storage.set_cors(A, b.id, bad)
+    got = env.storage.set_cors(A, b.id, [APP + "/", "http://localhost:5173"])
+    assert got.cors_origins() == [APP, "http://localhost:5173"]
+    env.proxy._origins = (-1e9, set())
+
+    pre = {"origin": APP, "access-control-request-method": "PUT",
+           "access-control-request-headers": "content-type"}
+    r = httpx.options(env.endpoint + "/app-cors/f", headers=pre, verify=False)
+    assert r.status_code == 204 and r.headers["access-control-allow-origin"] == APP
+    r = _do(env, env.storage.presign(A, b.id, "put", "f"), b"1", headers={"origin": APP})
+    assert r.status_code == 200 and r.headers["access-control-allow-origin"] == APP
+    r = _do(env, env.storage.presign(A, other.id, "put", "f"), b"1", headers={"origin": APP})
+    assert r.status_code == 200 and "access-control-allow-origin" not in r.headers
+    # without a signature the origin gets nothing
+    assert httpx.get(env.endpoint + "/app-cors/f", headers={"origin": APP},
+                     verify=False).status_code == 403
+    env.storage.set_cors(A, b.id, [])
+    assert env.store.get_bucket(b.id).cors is None
+
+
+def test_any_page_may_ask_to_read_a_public_file_but_not_to_write(env):
+    bid = "0123456789ab"
+    pre = {"origin": "https://anyone.example", "access-control-request-method": "GET",
+           "access-control-request-headers": "range"}
+    r = httpx.options(f"{env.endpoint}/{bid}/f.png", headers=pre, verify=False)
+    assert r.status_code == 204 and r.headers["access-control-allow-origin"] == "*"
+    assert r.headers["access-control-allow-methods"] == "GET, HEAD"
+    r = httpx.options(f"{env.endpoint}/{bid}/f.png", verify=False,
+                      headers={**pre, "access-control-request-method": "PUT"})
+    assert r.status_code == 403

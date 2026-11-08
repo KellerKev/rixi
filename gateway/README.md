@@ -121,6 +121,21 @@ and `Host` unchanged and turn request buffering off):
   `GET /api/shares[?bucket=]` can show the link again. `GET /api/shares?token=` finds the link a
   token opens — for an admin, in any tenant, with its `tenant`, to act on an abuse report.
   Downloads through links are counted and billed like any other.
+- **Public buckets** (`public_buckets = true`; off by default). `PATCH /api/buckets/<id>
+  {public: true, public_cap_gb?}` lets anyone download the bucket's files with no key, at
+  `<endpoint_url>/<bucket id>/<key>` (`public_url` in the bucket's view). GET and HEAD only, no
+  listing and no query string; ranges and conditional requests work. Every file is served with
+  the type its extension implies when that type cannot run script (as `inline`), anything else —
+  HTML and SVG included — as a download, always with `nosniff`, a sandboxing CSP and
+  `Access-Control-Allow-Origin: *`. Downloads are billed to the tenant like any other, stop at
+  `public_cap_gb` a calendar month (default `public_cap_gb`, at most `public_max_cap_gb`), and stop
+  while the authorizer refuses `storage.write` — so a public bucket goes quiet when its tenant's
+  credit runs out or the account is suspended. An admin's `{public_blocked: true}` makes it
+  private and keeps the tenant from turning it on again (an abuse report); `false` lifts that.
+- **A tenant's own web apps.** `PATCH /api/buckets/<id> {cors_origins: [...]}` (at most 10;
+  `https://host[:port]`, or `http://localhost` / `127.0.0.1` while developing) lets pages on those
+  origins read the proxy's answers for that bucket. It grants no access: each request is still
+  signed — best by presigned URLs the app's backend makes with a key, never a key in the page.
 - `GET /api/storage` returns the endpoint, regions and cost prices, e.g. for a pricing page.
 - **What boxes wrote.** The proxy records each object a box writes with its own key (uploads,
   multipart, copies), and forgets it when it is deleted through the proxy or the console API.
@@ -129,7 +144,8 @@ and `Host` unchanged and turn request buffering off):
   not tracked, so a listed object may be gone.
 
 `POST /api/buckets {name, region?, expire_days?}` · `GET /api/buckets` · `PATCH /api/buckets/<id>
-{expire_days}` · `DELETE /api/buckets/<id>[?force=1]` (force empties it first).
+{expire_days?, public?, public_cap_gb?, cors_origins?, public_blocked? (admin)}` ·
+`DELETE /api/buckets/<id>[?force=1]` (force empties it first).
 
 ## Resource catalog — declare compute in TOML (no OpenTofu required)
 

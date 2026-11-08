@@ -11,7 +11,8 @@ Speaks S3 (path-style, and virtual-hosted under the endpoint's own name). Each r
      tenant is under its storage limit;
   3. is checked against a list of operations — objects, multipart uploads, listings, tagging.
      Bucket policies, ACLs other than private, CORS, website, object lock, replication and
-     notification are refused, so no key can make data public or move it elsewhere;
+     notification are refused, so no key can make data public or move it elsewhere (a tenant
+     makes a bucket public, or lets web origins call it, through the gateway's API instead);
   4. is sent on to the tenant's real bucket, re-signed with the operator's key. Bodies stream
      through; a signed body hash is checked here (holding back the last piece, so a mismatch
      never completes upstream) and signed chunks are checked chunk by chunk.
@@ -19,6 +20,12 @@ Speaks S3 (path-style, and virtual-hosted under the endpoint's own name). Each r
 Listings, multipart results and errors name the real bucket; those (small) responses are
 rewritten to the tenant's name. Object bodies are never inspected. Downloaded bytes are
 counted per bucket and flushed to the store, where billing reads them.
+
+The one unsigned request is a public download: GET or HEAD of `/<bucket id>/<key>` of a bucket
+its tenant made public — no listing, no query. It is served only while the tenant's account may
+add data (so it stops when the balance runs out) and the bucket is under its monthly limit, and
+always as a file that cannot run in the browser: a type from INLINE_TYPES by extension, anything
+else as a download, with nosniff and a sandboxing CSP.
 """
 from __future__ import annotations
 
@@ -33,14 +40,14 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
 from . import sigv4
 from .service import Caller, Denied, NotFound
-from .storage import StorageService, valid_bucket_name
-from .store import LIVE_STATES, BoxObject, Bucket, S3Key
+from .storage import INLINE_TYPES, StorageService, valid_bucket_name
+from .store import LIVE_STATES, BoxObject, Bucket, S3Key, month
 
 log = logging.getLogger("rixi.direct.s3proxy")
 
@@ -63,6 +70,12 @@ _PASS = {"content-type", "content-md5", "content-encoding", "content-disposition
 _HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
         "proxy-authenticate", "proxy-authorization", "server"}
 _STORAGE_CLASSES = ("STANDARD", "ONEZONE_IA")
+_PUBLIC_PATH = re.compile(r"^/([0-9a-f]{12})/(.+)$")
+# What a public download passes on: to the bucket, and back to the browser.
+_PUBLIC_IN = ("range", "if-match", "if-none-match", "if-modified-since", "if-unmodified-since")
+_PUBLIC_OUT = {"content-length", "content-range", "accept-ranges", "etag", "last-modified",
+               "cache-control", "expires", "content-encoding"}
+_PUBLIC_CODES = {304: None, 404: "NoSuchKey", 412: "PreconditionFailed", 416: "InvalidRange"}
 
 _LIST_Q = {"list-type", "prefix", "delimiter", "marker", "max-keys", "encoding-type",
            "continuation-token", "start-after", "fetch-owner", "x-id", "allow-unordered",
@@ -171,6 +184,9 @@ class Proxy:
         self._writes: Dict[str, Tuple[float, bool, str]] = {}
         self._buckets: Dict[Tuple[str, str], Tuple[float, Optional[Bucket]]] = {}
         self._tenant_bytes: Dict[str, Tuple[float, float]] = {}
+        self._by_id: Dict[str, Tuple[float, Optional[Bucket]]] = {}
+        self._origins: Tuple[float, set] = (-1e9, set())
+        self._public: Dict[str, float] = {}         # public downloads since the last flush
         self._traffic: Dict[str, List[float]] = {}
         self._key_seen: Dict[str, float] = {}       # access key → when it last signed a request
         # objects written with a box's key, and objects deleted, since the last flush
@@ -222,6 +238,23 @@ class Proxy:
         self._buckets[(tenant, name)] = (now, b)
         return b
 
+    async def _bucket_by_id(self, bucket_id: str) -> Optional[Bucket]:
+        now = time.monotonic()
+        hit = self._by_id.get(bucket_id)
+        if hit and now - hit[0] < CACHE_S:
+            return hit[1]
+        b = await asyncio.to_thread(self.store.get_bucket, bucket_id)
+        if len(self._by_id) > 10000:
+            self._by_id.clear()
+        self._by_id[bucket_id] = (now, b)
+        return b
+
+    async def _bucket_origins(self) -> set:
+        now = time.monotonic()
+        if now - self._origins[0] >= CACHE_S:
+            self._origins = (now, await asyncio.to_thread(self.store.cors_origins))
+        return self._origins[1]
+
     async def _used(self, tenant: str) -> float:
         now = time.monotonic()
         hit = self._tenant_bytes.get(tenant)
@@ -258,6 +291,14 @@ class Proxy:
                 await asyncio.to_thread(self.store.forget_box_objects, bid, keys)
         except Exception:
             log.exception("could not record objects written by boxes")
+        public, self._public = self._public, {}
+        m = month(self.clock())
+        for bid, n in public.items():
+            try:
+                await asyncio.to_thread(self.store.add_public_traffic, bid, n, m)
+            except Exception:
+                log.exception("could not record public downloads for bucket %s", bid)
+                self._public[bid] = self._public.get(bid, 0.0) + n
         traffic, self._traffic = self._traffic, {}
         for bid, (e, i, r) in traffic.items():
             try:
@@ -299,12 +340,18 @@ class Proxy:
         receive = _tracking(receive, unread)
         path = scope.get("path", "")
         origin = hdrs.get(b"origin", b"").decode("latin-1")
-        if origin and origin in self.st.cors_origins:
-            if scope["method"] == "OPTIONS" and hdrs.get(b"access-control-request-method"):
+        # who may read the answer: the console always; a tenant's own web origins once the
+        # bucket is known (handle() sets it); anyone, for a public download
+        cors = {"origin": origin if origin and origin in self.st.cors_origins else None}
+        if origin and scope["method"] == "OPTIONS" and hdrs.get(b"access-control-request-method"):
+            if cors["origin"] or origin in await self._bucket_origins():
                 return await self._preflight(send, origin, hdrs, rid)
-            send = _with_cors(send, origin)
+            if self.st.public_buckets and _PUBLIC_PATH.match(path) and \
+                    hdrs.get(b"access-control-request-method") in (b"GET", b"HEAD"):
+                return await self._preflight(send, "*", hdrs, rid, "GET, HEAD")
+        send = _with_cors(send, cors)
         try:
-            await self.handle(scope, receive, send, rid)
+            await self.handle(scope, receive, send, rid, cors)
         except S3Error as e:
             await self._send_error(send, e.status, e.code, e.message, path, rid, unread["open"])
         except sigv4.SigError as e:
@@ -317,14 +364,15 @@ class Proxy:
             await self._send_error(send, 500, "InternalError", "We encountered an internal error. "
                                    "Please try again.", path, rid, unread["open"])
 
-    async def _preflight(self, send, origin: str, hdrs: Dict[bytes, bytes], rid: str) -> None:
-        """A browser asking whether the console's page may send this request. The answer
-        allows nothing by itself: the request that follows must still be signed."""
+    async def _preflight(self, send, origin: str, hdrs: Dict[bytes, bytes], rid: str,
+                         methods: str = "GET, HEAD, PUT, POST, DELETE") -> None:
+        """A browser asking whether a page may send this request. The answer allows nothing by
+        itself: the request that follows must still be signed, or be a public download."""
         asked = hdrs.get(b"access-control-request-headers", b"").decode("latin-1")
         allow = ",".join(h for h in (x.strip().lower() for x in asked.split(","))
                          if re.fullmatch(r"[a-z0-9-]{1,64}", h))
         headers = [("access-control-allow-origin", origin),
-                   ("access-control-allow-methods", "GET, HEAD, PUT, POST, DELETE"),
+                   ("access-control-allow-methods", methods),
                    ("access-control-max-age", "600"), ("vary", "Origin")]
         if allow:
             headers.append(("access-control-allow-headers", allow))
@@ -348,7 +396,7 @@ class Proxy:
         await send({"type": "http.response.start", "status": status, "headers": h})
         await send({"type": "http.response.body", "body": body})
 
-    async def handle(self, scope, receive, send, rid: str) -> None:
+    async def handle(self, scope, receive, send, rid: str, cors: Optional[dict] = None) -> None:
         method = scope["method"]
         raw_path = (scope.get("raw_path") or scope["path"].encode()).decode("latin-1")
         raw_query = scope.get("query_string", b"").decode("latin-1")
@@ -377,6 +425,9 @@ class Proxy:
 
         signed = sigv4.parse(raw_query, headers)
         if signed is None:
+            if method in ("GET", "HEAD") and not raw_query and prefix_raw and \
+                    self.st.public_buckets:
+                return await self._public_get(send, method, raw_path, headers, rid, cors)
             raise S3Error(403, "AccessDenied", "Anonymous access is not allowed")
         key, secret = await self._key(signed.access_key)
         if key is None or key.revoked_at is not None:
@@ -416,6 +467,9 @@ class Proxy:
                                                          bucket.id not in allowed):
             raise S3Error(404, "NoSuchBucket", "The specified bucket does not exist")
 
+        origin = headers.get("origin", "")
+        if cors is not None and origin and origin in bucket.cors_origins():
+            cors["origin"] = origin
         if op.name == "DeleteBucket":
             return await self._delete_bucket(send, key, caller, bucket, rid)
         if op.name == "GetBucketLocation":
@@ -495,6 +549,76 @@ class Proxy:
             self._count(bucket.id, requests=1)
         if 200 <= resp.status_code < 300 and has_key:
             self._note(op, key, bucket, unquote(key_raw), headers, copy_src)
+
+    async def _public_get(self, send, method: str, raw_path: str, headers: Dict[str, str],
+                          rid: str, cors: Optional[dict]) -> None:
+        """A download, with no key, from a bucket its tenant made public."""
+        if cors is not None:
+            cors["origin"] = "*"                # any page may read a public file, or its error
+        m = _PUBLIC_PATH.match(raw_path)
+        b = await self._bucket_by_id(m.group(1)) if m else None
+        if b is None or b.state != "ready" or not b.public_read or b.public_blocked:
+            raise S3Error(403, "AccessDenied", "Anonymous access is not allowed")
+        allow, _ = await self._may_write(b.tenant, b.owner)
+        if not allow:
+            raise S3Error(403, "AccessDenied", "This file is not available right now")
+        cap = (b.public_cap_gb or self.st.public_cap_gb) * 1e9
+        if b.public_bytes_in(month(self.clock())) + self._public.get(b.id, 0.0) >= cap:
+            raise S3Error(403, "AccessDenied",
+                          "This bucket has reached its download limit for this month")
+        key_raw = m.group(2)
+        name = unquote(key_raw).rsplit("/", 1)[-1]
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        ctype = INLINE_TYPES.get(ext)
+        disposition = "inline" if ctype else "attachment; filename*=UTF-8''" + quote(name, safe="")
+        fwd = {h: headers[h] for h in _PUBLIC_IN if h in headers}
+        path = f"/{b.real_name}/{key_raw}"
+        endpoint = self.storage.client.endpoint(b.region)
+        signed_headers = sigv4.sign(method, urlparse(endpoint).netloc, path, "", fwd,
+                                    self.st.access_key, self.st.secret_key, b.region,
+                                    payload_hash=sigv4.EMPTY_SHA256)
+        req = self.http.build_request(method, httpx.URL(endpoint, raw_path=path.encode("latin-1")),
+                                      headers=signed_headers)
+        try:
+            resp = await self.http.send(req, stream=True)
+        except httpx.HTTPError as exc:
+            log.warning("upstream public %s %s: %s", method, b.id, exc)
+            raise S3Error(502, "ServiceUnavailable", "Storage is not reachable; try again")
+        try:
+            out = [("cross-origin-resource-policy", "cross-origin"),
+                   ("x-content-type-options", "nosniff"),
+                   ("content-security-policy", "default-src 'none'; img-src 'self'; "
+                    "media-src 'self'; style-src 'unsafe-inline'; sandbox"),
+                   ("x-amz-request-id", rid)]
+            st = resp.status_code
+            if st >= 300 and st != 304:
+                await resp.aread()
+                code = _PUBLIC_CODES.get(st) or ("ServiceUnavailable" if st >= 500
+                                                 else "AccessDenied")
+                msg = {"NoSuchKey": "The specified key does not exist.",
+                       "PreconditionFailed": "At least one of the preconditions failed.",
+                       "InvalidRange": "The requested range is not satisfiable",
+                       "ServiceUnavailable": "Storage is not reachable; try again"}.get(
+                    code, "Access denied")
+                body = error_body(code, msg, raw_path, rid) if method == "GET" else b""
+                status = {"AccessDenied": 403, "ServiceUnavailable": 502}.get(code, st)
+                await self._send(send, status, body,
+                                 out[1:-1] + [("content-type", "application/xml")], rid)
+                return
+            out += [(k, v) for k, v in resp.headers.items() if k.lower() in _PUBLIC_OUT]
+            if st != 304:
+                out += [("content-type", ctype or "application/octet-stream"),
+                        ("content-disposition", disposition)]
+            await send({"type": "http.response.start", "status": st,
+                        "headers": [(k.encode("latin-1"), v.encode("latin-1")) for k, v in out]})
+            async for chunk in resp.aiter_raw():
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                self._count(b.id, egress=len(chunk))
+                self._public[b.id] = self._public.get(b.id, 0.0) + len(chunk)
+            await send({"type": "http.response.body", "body": b""})
+        finally:
+            await resp.aclose()
+            self._count(b.id, requests=1)
 
     def _note(self, op: Op, key: S3Key, bucket: Bucket, obj: str, headers: Dict[str, str],
               copied: Optional[str]) -> None:
@@ -721,12 +845,13 @@ class Proxy:
 _EXPOSE = b"ETag, Content-Length, Content-Range, Content-Type, Last-Modified, x-amz-request-id"
 
 
-def _with_cors(send, origin: str):
-    """`send`, with the CORS headers that let the console's page read the response."""
+def _with_cors(send, cors: dict):
+    """`send`, adding the CORS headers that let a page read the response, when `cors` names an
+    origin by the time the response starts."""
     async def wrapped(msg):
-        if msg["type"] == "http.response.start":
+        if msg["type"] == "http.response.start" and cors.get("origin"):
             msg = {**msg, "headers": list(msg.get("headers") or []) + [
-                (b"access-control-allow-origin", origin.encode("latin-1")),
+                (b"access-control-allow-origin", cors["origin"].encode("latin-1")),
                 (b"access-control-expose-headers", _EXPOSE), (b"vary", b"Origin")]}
         await send(msg)
     return wrapped
