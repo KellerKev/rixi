@@ -673,53 +673,82 @@ def _public_bucket(env, name, files):
     return b
 
 
-def test_a_public_bucket_serves_files_to_anyone_and_nothing_else(env):
+def _reader(env, **kw):
+    """Another account, reading with a key of its own."""
+    k, secret = key_for(env, B, "reader", **kw)
+    return client(env, k, secret)
+
+
+def _signed_url(s3, bucket, key, method="get_object"):
+    return s3.generate_presigned_url(method, Params={"Bucket": bucket, "Key": key}, ExpiresIn=300)
+
+
+def test_a_public_bucket_serves_files_to_other_accounts_keys_and_nothing_else(env):
     b = _public_bucket(env, "pub", {"pic.png": b"\x89PNG", "site/index.html": b"<script>x</script>",
                                     "notes.txt": b"0123456789"})
-    url = f"{env.endpoint}/{b.id}"
-    assert httpx.get(url + "/pic.png", verify=False).status_code == 403     # still private
+    s3b = _reader(env)
+    with pytest.raises(ClientError) as e:
+        s3b.get_object(Bucket=b.id, Key="pic.png")                     # still private
+    assert code(e) == "NoSuchBucket"
     env.storage.set_public(A, b.id, True)
     env.proxy._by_id.clear()
 
-    r = httpx.get(url + "/pic.png", verify=False, headers={"origin": "https://anyone.example"})
+    assert s3b.get_object(Bucket=b.id, Key="pic.png")["Body"].read() == b"\x89PNG"
+    r = httpx.get(_signed_url(s3b, b.id, "pic.png"), verify=False,
+                  headers={"origin": "https://anyone.example"})
     assert r.status_code == 200 and r.content == b"\x89PNG"
     assert r.headers["content-type"] == "image/png"
     assert r.headers["content-disposition"] == "inline"
     assert r.headers["x-content-type-options"] == "nosniff"
     assert "sandbox" in r.headers["content-security-policy"]
-    assert r.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-origin" not in r.headers
     assert not any(h.startswith("x-amz-meta") for h in r.headers)
 
+    # never without a key, however the address is written
+    url = f"{env.endpoint}/{b.id}"
+    for anon in (httpx.get(url + "/pic.png", verify=False), httpx.head(url + "/pic.png", verify=False),
+                 httpx.get(url + "/", verify=False)):
+        assert anon.status_code == 403
+    assert b"\x89PNG" not in httpx.get(url + "/pic.png", verify=False).content
+
     # a page that would run script is only ever a download
-    r = httpx.get(url + "/site/index.html", verify=False)
+    r = httpx.get(_signed_url(s3b, b.id, "site/index.html"), verify=False)
     assert r.headers["content-type"] == "application/octet-stream"
     assert r.headers["content-disposition"].startswith("attachment;")
 
-    r = httpx.get(url + "/notes.txt", verify=False, headers={"range": "bytes=2-4"})
-    assert r.status_code == 206 and r.content == b"234"
-    assert httpx.head(url + "/notes.txt", verify=False).status_code == 200
+    r = s3b.get_object(Bucket=b.id, Key="notes.txt", Range="bytes=2-4")
+    assert r["Body"].read() == b"234"
+    assert s3b.head_object(Bucket=b.id, Key="notes.txt")["ContentLength"] == 10
 
-    # no listing, no query, no writes, and never under the tenant's own bucket name
-    assert httpx.get(url + "/", verify=False).status_code == 403
-    assert httpx.get(url + "/pic.png?acl", verify=False).status_code == 403
-    assert httpx.put(url + "/new.txt", content=b"x", verify=False).status_code == 403
-    assert httpx.delete(url + "/pic.png", verify=False).status_code == 403
-    assert httpx.get(f"{env.endpoint}/pub/pic.png", verify=False).status_code == 403
+    # no listing, no writes, no response overrides, never under the tenant's own name
+    for call in (lambda: s3b.list_objects_v2(Bucket=b.id),
+                 lambda: s3b.put_object(Bucket=b.id, Key="new.txt", Body=b"x"),
+                 lambda: s3b.delete_object(Bucket=b.id, Key="pic.png"),
+                 lambda: s3b.get_object(Bucket=b.id, Key="pic.png", ResponseContentType="text/html"),
+                 lambda: s3b.get_object(Bucket="pub", Key="pic.png")):
+        with pytest.raises(ClientError):
+            call()
+    env.storage.create_bucket(B, "bobs-own")
+    with pytest.raises(ClientError) as e:                              # a limited key cannot
+        _reader(env, buckets=["bobs-own"]).get_object(Bucket=b.id, Key="pic.png")
+    assert code(e) == "NoSuchBucket"
 
-    missing = httpx.get(url + "/nope.png", verify=False)
-    assert missing.status_code == 404 and b"NoSuchKey" in missing.content
-    assert b.real_name.encode() not in missing.content
+    with pytest.raises(ClientError) as e:
+        s3b.get_object(Bucket=b.id, Key="nope.png")
+    assert code(e) == "NoSuchKey" and b.real_name not in str(e.value.response)
 
     env.storage.set_public(A, b.id, False)
     env.proxy._by_id.clear()
-    assert httpx.get(url + "/pic.png", verify=False).status_code == 403
+    with pytest.raises(ClientError):
+        s3b.get_object(Bucket=b.id, Key="pic.png")
 
 
 def test_public_downloads_stop_at_the_monthly_limit_and_when_the_account_cannot_pay(env):
     b = _public_bucket(env, "pub-cap", {"f.bin": b"x" * 1000})
     env.storage.set_public(A, b.id, True, cap_gb=1500 / 1e9)
     env.proxy._by_id.clear()
-    url = f"{env.endpoint}/{b.id}/f.bin"
+    s3b = _reader(env)
+    url = _signed_url(s3b, b.id, "f.bin")
     assert httpx.get(url, verify=False).status_code == 200
     assert httpx.get(url, verify=False).status_code == 200      # 2000 bytes: over now
     r = httpx.get(url, verify=False)
@@ -732,7 +761,7 @@ def test_public_downloads_stop_at_the_monthly_limit_and_when_the_account_cannot_
     env.allow["t-a"] = False
     try:
         env.proxy._writes.clear()
-        assert httpx.get(f"{env.endpoint}/{b2.id}/f.bin", verify=False).status_code == 403
+        assert httpx.get(_signed_url(s3b, b2.id, "f.bin"), verify=False).status_code == 403
         with pytest.raises(Denied) as d:
             env.storage.set_public(A, b2.id, True)
         assert d.value.status == 402
@@ -748,7 +777,8 @@ def test_the_operator_can_stop_a_public_bucket_for_good(env):
         env.storage.block_public(A, b.id, True)                  # tenants cannot
     env.storage.block_public(ADMIN, b.id, True)
     env.proxy._by_id.clear()
-    assert httpx.get(f"{env.endpoint}/{b.id}/f.png", verify=False).status_code == 403
+    with pytest.raises(ClientError):
+        _reader(env).get_object(Bucket=b.id, Key="f.png")
     with pytest.raises(Denied) as d:
         env.storage.set_public(A, b.id, True)
     assert d.value.status == 403
@@ -796,13 +826,10 @@ def test_a_tenants_web_origins_may_read_signed_answers_from_that_bucket_only(env
     assert env.store.get_bucket(b.id).cors is None
 
 
-def test_any_page_may_ask_to_read_a_public_file_but_not_to_write(env):
-    bid = "0123456789ab"
+def test_no_page_may_ask_to_read_a_public_file_without_a_key(env):
+    b = _public_bucket(env, "pub-pre", {"f.png": b"x"})
+    env.storage.set_public(A, b.id, True)
     pre = {"origin": "https://anyone.example", "access-control-request-method": "GET",
            "access-control-request-headers": "range"}
-    r = httpx.options(f"{env.endpoint}/{bid}/f.png", headers=pre, verify=False)
-    assert r.status_code == 204 and r.headers["access-control-allow-origin"] == "*"
-    assert r.headers["access-control-allow-methods"] == "GET, HEAD"
-    r = httpx.options(f"{env.endpoint}/{bid}/f.png", verify=False,
-                      headers={**pre, "access-control-request-method": "PUT"})
-    assert r.status_code == 403
+    r = httpx.options(f"{env.endpoint}/{b.id}/f.png", headers=pre, verify=False)
+    assert r.status_code == 403 and "access-control-allow-origin" not in r.headers

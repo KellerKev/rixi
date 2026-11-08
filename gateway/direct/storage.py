@@ -129,7 +129,7 @@ class StorageService:
                 "public_max_cap_gb": self.st.public_max_cap_gb, "max_cors_origins": MAX_ORIGINS}
 
     def public_url(self, b: Bucket) -> str:
-        """Where anyone downloads a public bucket's files: <this>/<key>."""
+        """Where other accounts read a public bucket's files, with their own keys: <this>/<key>."""
         return f"{self.st.endpoint_url}/{b.id}"
 
     def tenant_bytes(self, tenant: str) -> float:

@@ -21,11 +21,12 @@ Listings, multipart results and errors name the real bucket; those (small) respo
 rewritten to the tenant's name. Object bodies are never inspected. Downloaded bytes are
 counted per bucket and flushed to the store, where billing reads them.
 
-The one unsigned request is a public download: GET or HEAD of `/<bucket id>/<key>` of a bucket
-its tenant made public — no listing, no query. It is served only while the tenant's account may
-add data (so it stops when the balance runs out) and the bucket is under its monthly limit, and
-always as a file that cannot run in the browser: a type from INLINE_TYPES by extension, anything
-else as a download, with nosniff and a sandboxing CSP.
+Nothing is served unsigned. A bucket its tenant made public can also be read by other accounts:
+GET or HEAD of `/<bucket id>/<key>`, signed with any of their keys that is not limited to certain
+buckets — no listing, no query. It is served only while the bucket's account may add data (so it
+stops when the balance runs out) and the bucket is under its monthly limit, billed to that
+account, and always as a file that cannot run in the browser: a type from INLINE_TYPES by
+extension, anything else as a download, with nosniff and a sandboxing CSP.
 """
 from __future__ import annotations
 
@@ -70,8 +71,8 @@ _PASS = {"content-type", "content-md5", "content-encoding", "content-disposition
 _HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
         "proxy-authenticate", "proxy-authorization", "server"}
 _STORAGE_CLASSES = ("STANDARD", "ONEZONE_IA")
-_PUBLIC_PATH = re.compile(r"^/([0-9a-f]{12})/(.+)$")
-# What a public download passes on: to the bucket, and back to the browser.
+_BUCKET_ID = re.compile(r"[0-9a-f]{12}")
+# What a download from another account's public bucket passes on: to the bucket, and back to the browser.
 _PUBLIC_IN = ("range", "if-match", "if-none-match", "if-modified-since", "if-unmodified-since")
 _PUBLIC_OUT = {"content-length", "content-range", "accept-ranges", "etag", "last-modified",
                "cache-control", "expires", "content-encoding"}
@@ -341,14 +342,11 @@ class Proxy:
         path = scope.get("path", "")
         origin = hdrs.get(b"origin", b"").decode("latin-1")
         # who may read the answer: the console always; a tenant's own web origins once the
-        # bucket is known (handle() sets it); anyone, for a public download
+        # bucket is known (handle() sets it)
         cors = {"origin": origin if origin and origin in self.st.cors_origins else None}
         if origin and scope["method"] == "OPTIONS" and hdrs.get(b"access-control-request-method"):
             if cors["origin"] or origin in await self._bucket_origins():
                 return await self._preflight(send, origin, hdrs, rid)
-            if self.st.public_buckets and _PUBLIC_PATH.match(path) and \
-                    hdrs.get(b"access-control-request-method") in (b"GET", b"HEAD"):
-                return await self._preflight(send, "*", hdrs, rid, "GET, HEAD")
         send = _with_cors(send, cors)
         try:
             await self.handle(scope, receive, send, rid, cors)
@@ -367,7 +365,7 @@ class Proxy:
     async def _preflight(self, send, origin: str, hdrs: Dict[bytes, bytes], rid: str,
                          methods: str = "GET, HEAD, PUT, POST, DELETE") -> None:
         """A browser asking whether a page may send this request. The answer allows nothing by
-        itself: the request that follows must still be signed, or be a public download."""
+        itself: the request that follows must still be signed."""
         asked = hdrs.get(b"access-control-request-headers", b"").decode("latin-1")
         allow = ",".join(h for h in (x.strip().lower() for x in asked.split(","))
                          if re.fullmatch(r"[a-z0-9-]{1,64}", h))
@@ -425,9 +423,7 @@ class Proxy:
 
         signed = sigv4.parse(raw_query, headers)
         if signed is None:
-            if method in ("GET", "HEAD") and not raw_query and prefix_raw and \
-                    self.st.public_buckets:
-                return await self._public_get(send, method, raw_path, headers, rid, cors)
+            # even a public bucket is read with a key: there are no anonymous downloads
             raise S3Error(403, "AccessDenied", "Anonymous access is not allowed")
         key, secret = await self._key(signed.access_key)
         if key is None or key.revoked_at is not None:
@@ -463,6 +459,10 @@ class Proxy:
 
         bucket = await self._bucket(key.tenant, bucket_name)
         allowed = key.bucket_ids()
+        if bucket is None and op.name in ("GetObject", "HeadObject") and allowed is None and \
+                not set(q) - {"x-id"} and self.st.public_buckets and _BUCKET_ID.fullmatch(bucket_name):
+            # another account's public bucket, named by its id: any key may read from it
+            return await self._public_get(send, method, bucket_name, key_raw, headers, rid, cors)
         if bucket is None or bucket.state != "ready" or (allowed is not None and
                                                          bucket.id not in allowed):
             raise S3Error(404, "NoSuchBucket", "The specified bucket does not exist")
@@ -550,15 +550,17 @@ class Proxy:
         if 200 <= resp.status_code < 300 and has_key:
             self._note(op, key, bucket, unquote(key_raw), headers, copy_src)
 
-    async def _public_get(self, send, method: str, raw_path: str, headers: Dict[str, str],
-                          rid: str, cors: Optional[dict]) -> None:
-        """A download, with no key, from a bucket its tenant made public."""
-        if cors is not None:
-            cors["origin"] = "*"                # any page may read a public file, or its error
-        m = _PUBLIC_PATH.match(raw_path)
-        b = await self._bucket_by_id(m.group(1)) if m else None
+    async def _public_get(self, send, method: str, bucket_id: str, key_raw: str,
+                          headers: Dict[str, str], rid: str, cors: Optional[dict]) -> None:
+        """A signed download from another account's bucket that its tenant made public. The
+        bucket's tenant pays for it, up to the monthly limit they set."""
+        raw_path = f"/{bucket_id}/{key_raw}"
+        b = await self._bucket_by_id(bucket_id)
         if b is None or b.state != "ready" or not b.public_read or b.public_blocked:
-            raise S3Error(403, "AccessDenied", "Anonymous access is not allowed")
+            raise S3Error(404, "NoSuchBucket", "The specified bucket does not exist")
+        origin = headers.get("origin", "")
+        if cors is not None and origin and origin in b.cors_origins():
+            cors["origin"] = origin
         allow, _ = await self._may_write(b.tenant, b.owner)
         if not allow:
             raise S3Error(403, "AccessDenied", "This file is not available right now")
@@ -566,7 +568,6 @@ class Proxy:
         if b.public_bytes_in(month(self.clock())) + self._public.get(b.id, 0.0) >= cap:
             raise S3Error(403, "AccessDenied",
                           "This bucket has reached its download limit for this month")
-        key_raw = m.group(2)
         name = unquote(key_raw).rsplit("/", 1)[-1]
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         ctype = INLINE_TYPES.get(ext)

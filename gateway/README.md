@@ -122,16 +122,18 @@ and `Host` unchanged and turn request buffering off):
   token opens — for an admin, in any tenant, with its `tenant`, to act on an abuse report.
   Downloads through links are counted and billed like any other.
 - **Public buckets** (`public_buckets = true`; off by default). `PATCH /api/buckets/<id>
-  {public: true, public_cap_gb?}` lets anyone download the bucket's files with no key, at
-  `<endpoint_url>/<bucket id>/<key>` (`public_url` in the bucket's view). GET and HEAD only, no
-  listing and no query string; ranges and conditional requests work. Every file is served with
-  the type its extension implies when that type cannot run script (as `inline`), anything else —
-  HTML and SVG included — as a download, always with `nosniff`, a sandboxing CSP and
-  `Access-Control-Allow-Origin: *`. Downloads are billed to the tenant like any other, stop at
-  `public_cap_gb` a calendar month (default `public_cap_gb`, at most `public_max_cap_gb`), and stop
-  while the authorizer refuses `storage.write` — so a public bucket goes quiet when its tenant's
-  credit runs out or the account is suspended. An admin's `{public_blocked: true}` makes it
-  private and keeps the tenant from turning it on again (an abuse report); `false` lifts that.
+  {public: true, public_cap_gb?}` lets other accounts read the bucket's files at
+  `<endpoint_url>/<bucket id>/<key>` (`public_url` in the bucket's view). Nothing is ever served
+  without a key: each request is signed with one of the reader's own keys (headers or a presigned
+  URL), and a key limited to certain buckets cannot use it. GET and HEAD only, no listing and no
+  query string; ranges and conditional requests work. Every file is served with the type its
+  extension implies when that type cannot run script (as `inline`), anything else — HTML and SVG
+  included — as a download, always with `nosniff` and a sandboxing CSP. Downloads are billed to
+  the bucket's tenant like any other, stop at `public_cap_gb` a calendar month (default
+  `public_cap_gb`, at most `public_max_cap_gb`), and stop while the authorizer refuses
+  `storage.write` — so a public bucket goes quiet when its tenant's credit runs out or the account
+  is suspended. An admin's `{public_blocked: true}` makes it private and keeps the tenant from
+  turning it on again (an abuse report); `false` lifts that.
 - **A tenant's own web apps.** `PATCH /api/buckets/<id> {cors_origins: [...]}` (at most 10;
   `https://host[:port]`, or `http://localhost` / `127.0.0.1` while developing) lets pages on those
   origins read the proxy's answers for that bucket. It grants no access: each request is still

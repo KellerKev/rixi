@@ -69,6 +69,6 @@ root_volume_gb = 100
 # scan_interval = "1h"
 # cors_origins = ["https://files.example.com"]       # a browser console that signs through the API
 # share_url    = "https://files.example.com/s"       # share links; route /s/ there to the gateway
-# public_buckets = false                             # let tenants make a bucket publicly downloadable
+# public_buckets = false                             # let tenants make a bucket readable by other accounts' keys
 # public_cap_gb = 50                                 # default monthly limit on public downloads (GB)
 # public_max_cap_gb = 1000                           # the most a tenant may raise it to
