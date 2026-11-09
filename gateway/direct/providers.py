@@ -35,6 +35,10 @@ class ProviderError(Exception):
     pass
 
 
+class OutOfStock(ProviderError):
+    """The cloud has none of this instance type free in that zone right now."""
+
+
 @dataclass
 class BoxSpec:
     box_id: str
@@ -70,8 +74,9 @@ class DummyProvider:
     name = "dummy"
     supports_firewall = True
 
-    def __init__(self, fail_create: bool = False):
+    def __init__(self, fail_create: bool = False, out_of_stock=()):
         self.fail_create = fail_create
+        self.out_of_stock = set(out_of_stock)       # zones that have nothing free
         self.servers: Dict[str, dict] = {}
         self._n = 0
         self._lock = threading.Lock()      # boxes are created from a worker pool
@@ -87,6 +92,12 @@ class DummyProvider:
         if self.fail_create:
             raise ProviderError("dummy: create failed")
         sid = f"srv-{n}"
+        if spec.zone in self.out_of_stock:
+            # like Scaleway: the server exists, powering it on is what fails
+            self.servers[sid] = {"zone": spec.zone, "tags": box_tags(spec.box_id, spec.tenant),
+                                 "user_data": spec.user_data, "type": spec.instance_type,
+                                 "state": "stopped", "volumes": []}
+            raise OutOfStock(f"dummy: {spec.instance_type} is out of stock in {spec.zone}")
         for vid in spec.volumes:
             vol = self.volumes.get(vid)
             if vol is None or vol["zone"] != spec.zone or vol["server"]:
@@ -170,7 +181,9 @@ class ScalewayProvider:
     def _call(self, method: str, path: str, ok=(200, 201, 202, 204), **kw):
         r = self.s.request(method, self.API + path, timeout=30, **kw)
         if r.status_code not in ok:
-            raise ProviderError(f"scaleway {method} {path} → {r.status_code}: {r.text[:300]}")
+            msg = f"scaleway {method} {path} → {r.status_code}: {r.text[:300]}"
+            raise (OutOfStock if r.status_code == 412 and "out_of_stock" in r.text
+                   else ProviderError)(msg)
         return r.json() if r.content and r.headers.get("content-type", "").startswith(
             "application/json") else {}
 

@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from gateway.direct.providers import (  # noqa: E402
-    BoxSpec, ProviderError, ScalewayDns, ScalewayProvider)
+    BoxSpec, OutOfStock, ProviderError, ScalewayDns, ScalewayProvider)
 
 
 class Resp:
@@ -77,6 +77,30 @@ def test_create_orders_ip_then_dns_then_server_and_tags_everything():
     ip_body = next(kw["json"] for m, path, kw in s.calls if path == f"{Z}/ips")
     assert "rixi-box=abc" in ip_body["tags"]          # a leftover IP is findable too
     assert ("POST", f"{Z}/servers/srv-1/action") in methods
+
+
+def test_a_poweron_refused_for_lack_of_stock_is_out_of_stock():
+    routes = {
+        ("GET", "/marketplace/v2/local-images"): Resp(200, {"local_images": [
+            {"id": "img-l4", "compatible_commercial_types": ["L4-1-24G"]}]}),
+        ("GET", f"{Z}/security_groups"): Resp(200, {"security_groups": [
+            {"id": "sg-1", "name": "rixi-direct"}]}),
+        ("POST", f"{Z}/ips"): Resp(201, {"ip": {"id": "ip-1", "address": "51.0.0.7"}}),
+        ("POST", f"{Z}/servers/"): Resp(412, {"type": "out_of_stock",
+                                              "message": "resource is out of stock",
+                                              "resource": "L4-1-24G"}),
+        ("POST", f"{Z}/servers"): Resp(201, {"server": {"id": "srv-1"}}),
+        ("PATCH", f"{Z}/servers/srv-1/user_data/cloud-init"): Resp(204),
+    }
+    p, _ = _provider(routes)
+    with pytest.raises(OutOfStock):
+        p.create(BoxSpec("abc", "t-1", "L4-1-24G", "fr-par-2", "ubuntu_noble_gpu_os_12", "x"),
+                 on_ip=lambda ip: None)
+    routes[("POST", f"{Z}/servers/")] = Resp(412, {"type": "precondition_failed"})
+    with pytest.raises(ProviderError) as e:
+        p.create(BoxSpec("abc", "t-1", "L4-1-24G", "fr-par-2", "ubuntu_noble_gpu_os_12", "x"),
+                 on_ip=lambda ip: None)
+    assert not isinstance(e.value, OutOfStock)
 
 
 def test_security_group_created_once_with_https_in_and_smtp_out_blocked():

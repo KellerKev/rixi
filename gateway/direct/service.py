@@ -32,7 +32,7 @@ from rixi import policy as netpolicy
 from .. import offerings
 from . import cloudinit
 from .config import DirectConfig, Template
-from .providers import BoxSpec
+from .providers import BoxSpec, OutOfStock
 from .store import ENDED_STATES, LIVE_STATES, Box, Store, Volume
 
 log = logging.getLogger("rixi.direct")
@@ -202,6 +202,9 @@ class DirectService:
         if on_idle not in ("release", "stop"):
             raise Denied("on_idle must be release or stop", 400)
         vols = self._claimable_volumes(caller, volumes or [])
+        # A box nobody tied to a zone may move to the template's next zone when the first has
+        # none free; one asked for a zone, or carrying a volume (which lives in one), may not.
+        pinned = bool(zone or vols)
         if vols and not zone:
             zone = vols[0].zone                       # a volume lives in one zone: go to it
         zone = zone or t.zones[0]
@@ -312,12 +315,17 @@ class DirectService:
         self.audit("box.claimed", box=box_id, tenant=tenant, sub=caller.sub, template=t.name,
                    zone=zone, eur_per_hour=rate)
         self._begin(box_id)
-        self._pool.submit(self._provision, box, t, user_data)
+        fallback = [] if pinned else [
+            z for z in t.zones if z != zone and (self.cfg.allowed_regions is None
+                                                 or z in self.cfg.allowed_regions)]
+        self._pool.submit(self._provision, box, t, user_data, fallback)
         if serve:
             box.endpoint_key = serve["key"]      # returned once; never stored
         return box
 
-    def _provision(self, box: Box, t: Template, user_data: str) -> None:
+    def _provision(self, box: Box, t: Template, user_data: str,
+                   fallback: Optional[List[str]] = None) -> None:
+        zones = [box.zone] + list(fallback or [])
         try:
             provider = self.providers[box.provider]
 
@@ -335,12 +343,25 @@ class DirectService:
                                hostname=box.hostname)
 
             vols = [self.store.get_volume(v) for v in box.volume_ids()]
-            created = provider.create(BoxSpec(
-                box_id=box.id, tenant=box.tenant, instance_type=box.instance_type,
-                zone=box.zone, image=t.image, user_data=user_data,
-                root_volume_gb=t.root_volume_gb or (self.cfg.root_disk_gb if vols else None),
-                dedicated_firewall=bool(box.policy),
-                volumes=[v.provider_id for v in vols if v is not None]), on_ip)
+            for i, zone in enumerate(zones):
+                try:
+                    created = provider.create(BoxSpec(
+                        box_id=box.id, tenant=box.tenant, instance_type=box.instance_type,
+                        zone=zone, image=t.image, user_data=user_data,
+                        root_volume_gb=t.root_volume_gb or (self.cfg.root_disk_gb if vols else None),
+                        dedicated_firewall=bool(box.policy),
+                        volumes=[v.provider_id for v in vols if v is not None]), on_ip)
+                    break
+                except OutOfStock:
+                    if i == len(zones) - 1:
+                        raise
+                    # clear what the attempt left (a server that never powered on, its IP)
+                    # before trying the next zone, so nothing is held twice
+                    provider.destroy(box.id, zone)
+                    box.zone = zones[i + 1]
+                    self.store.update(box.id, zone=box.zone)
+                    self.audit("box.zone_fallback", box=box.id, tenant=box.tenant,
+                               instance_type=box.instance_type, from_zone=zone, to_zone=box.zone)
             if created.firewall_id:
                 self.store.update(box.id, firewall_id=created.firewall_id)
             if self.store.transition(box.id, ("provisioning",), state="booting",
@@ -351,8 +372,11 @@ class DirectService:
         except Exception as exc:
             log.exception("provisioning %s failed", box.id)
             self.store.update(box.id, error=str(exc)[:500])
+            # out_of_stock is its own reason: the client can say "try again later or pick
+            # another size" instead of reporting a fault
             self.store.transition(box.id, ("provisioning",), state="releasing",
-                                  end_reason="provision_failed")
+                                  end_reason=("out_of_stock" if isinstance(exc, OutOfStock)
+                                              else "provision_failed"))
             self.audit("box.provision_failed", box=box.id, tenant=box.tenant, error=str(exc)[:200])
         # Released while we were creating it (or the create failed): hand the in-flight claim
         # straight to the destroy job, so the reaper never sees the box idle in between.
@@ -398,7 +422,7 @@ class DirectService:
                 self.store.transition_volume(vid, ("attached",), state="available", box_id=None)
             if self.storage is not None:
                 self.storage.revoke_box_keys(box.id)
-            final = "failed" if box.end_reason == "provision_failed" else "gone"
+            final = "failed" if box.end_reason in ("provision_failed", "out_of_stock") else "gone"
             if self.store.transition(box.id, ("releasing",), state=final, ended_at=self.clock()):
                 self.audit("box.gone", box=box.id, tenant=box.tenant, reason=box.end_reason,
                            minutes=round((self.clock() - box.created_at) / 60, 2))

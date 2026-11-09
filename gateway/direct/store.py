@@ -82,6 +82,8 @@ class Box:
         return (self.stopped_total or 0.0) + current
 
     def running_seconds(self, now: float) -> float:
+        if self.state == "failed":          # it never came up: nothing ran, nothing to pay
+            return 0.0
         return max(0.0, self.billed_until(now) - self.created_at - self.stopped_seconds(now))
 
     def volume_ids(self) -> List[str]:

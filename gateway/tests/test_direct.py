@@ -1037,3 +1037,39 @@ def test_a_claim_can_say_what_it_needs_instead_of_a_template():
     with pytest.raises(Denied, match="name a template"):
         svc.claim(A, None)
     assert {t["name"]: t.get("gpu_ram_gb") for t in svc.templates()}["l40s"] == 48
+
+
+# ── capacity ────────────────────────────────────────────────────────────
+
+def test_out_of_stock_moves_an_unpinned_box_to_the_next_zone():
+    svc = _svc(provider=DummyProvider(out_of_stock={"fr-par-2"}))
+    box = svc.claim(A, "cpu")                       # cpu runs in fr-par-2, then pl-waw-2
+    _settle(svc)
+    cur = svc.store.get(box.id)
+    assert cur.state == "booting" and cur.zone == "pl-waw-2"
+    servers = svc.providers["dummy"].servers.values()
+    assert [s["zone"] for s in servers] == ["pl-waw-2"]     # the fr-par-2 attempt is gone
+    assert any(e == "box.zone_fallback" and a["to_zone"] == "pl-waw-2" for e, a in svc.events)
+
+
+def test_out_of_stock_everywhere_ends_out_of_stock_and_leaves_nothing():
+    svc = _svc(provider=DummyProvider(out_of_stock={"fr-par-2", "pl-waw-2"}))
+    box = svc.claim(A, "cpu")
+    _settle(svc)
+    _settle(svc)
+    cur = svc.store.get(box.id)
+    assert cur.state == "failed" and cur.end_reason == "out_of_stock"
+    assert not svc.providers["dummy"].servers
+    svc.clock.t += 600
+    [u] = svc.usage(ADMIN, since=0)
+    assert u["minutes"] == 0                        # a box that never came up costs nothing
+
+
+def test_a_box_asked_for_a_zone_stays_there_when_it_is_out_of_stock():
+    svc = _svc(provider=DummyProvider(out_of_stock={"fr-par-2"}))
+    box = svc.claim(A, "cpu", zone="fr-par-2")
+    _settle(svc)
+    _settle(svc)
+    cur = svc.store.get(box.id)
+    assert cur.end_reason == "out_of_stock" and cur.zone == "fr-par-2"
+    assert not svc.providers["dummy"].servers
