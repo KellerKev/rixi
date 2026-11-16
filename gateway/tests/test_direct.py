@@ -921,6 +921,34 @@ def test_stop_and_start_keep_the_box_and_bill_compute_only_while_it_runs():
     assert cur.expires_at == pytest.approx(cur.created_at + 3600 + 3 * 3600)
 
 
+def test_a_box_that_cannot_start_for_lack_of_stock_stays_stopped_and_starts_later():
+    # the cloud has no such machine free at that moment: the box, its disk and its place in
+    # the account are kept, and the caller is told why (clients look for out_of_stock)
+    from gateway.direct.providers import OutOfStock
+    svc = _svc()
+    box = svc.claim(A, "cpu", on_idle="stop")
+    _make_ready(svc, box)
+    svc.stop_box(A, box.id)
+    _settle(svc)
+    prov = svc.providers["dummy"]
+    real = prov.start
+
+    def full(box_id, zone):
+        raise OutOfStock('POST /servers/x/action → 412: {"type": "out_of_stock", '
+                         '"message": "resource is out of stock"}')
+    prov.start = full
+    with pytest.raises(Denied) as d:
+        svc.start_box(A, box.id)
+    assert d.value.status == 502 and "out_of_stock" in str(d.value)
+    cur = svc.store.get(box.id)
+    assert cur.state == "stopped" and cur.stopped_at and "out_of_stock" in cur.error
+    assert [b.id for b in svc.list(A) if b.state == "stopped"] == [box.id]
+    prov.start = real                                          # stock is back
+    svc.start_box(A, box.id)
+    assert svc.store.get(box.id).state == "starting"
+    assert svc.heartbeat(box.id, _secret_of(svc, box.id), 0, True)["state"] == "ready"
+
+
 def test_only_ready_boxes_stop_and_only_stopped_boxes_start():
     svc = _svc()
     box = svc.claim(A, "cpu")
