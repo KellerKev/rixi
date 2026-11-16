@@ -136,3 +136,35 @@ def test_as_root_the_process_arguments_and_the_hand_over_name_the_user(tmp_path,
         str(tmp_path / "pkg")} - {str(tmp_path / "pkg") + "/"}
     assert not any(p.startswith("/etc") for p, _, _ in order)
     assert all((uid, gid) == (me.uid, me.gid) for _, uid, gid in order)
+
+
+def test_a_command_becomes_the_workload_user_on_any_event_loop(monkeypatch):
+    """uvloop — what the server runs on in production — refuses the arguments that would give
+    a child process another user, so a command started through the loop becomes that user
+    itself. (Found on the first real box: files and tasks worked, `exec` returned nothing.)"""
+    import asyncio
+    me = rixi_server.Workload(getpass.getuser())
+    monkeypatch.setattr(rixi_server, "workload", me)
+    argv = rixi_server._workload_argv(["sh", "-c", "id -u; echo ran"])
+    assert argv[0] == sys.executable and argv[-3:] == ["sh", "-c", "id -u; echo ran"]
+    assert argv[4:7] == [str(me.uid), str(me.gid), ",".join(str(g) for g in me.groups)]
+
+    async def run(args):
+        p = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
+                                                 stderr=asyncio.subprocess.PIPE,
+                                                 start_new_session=True)
+        out, err = await p.communicate()
+        return p.returncode, out.decode(), err.decode()
+    loops = [asyncio.run]
+    try:
+        import uvloop
+        loops.append(uvloop.run)
+    except ImportError:
+        pass
+    for runner in loops:
+        rc, out, _ = runner(run(argv))
+        assert rc == 0 and out.split() == [str(me.uid), "ran"], runner
+        rc, _, err = runner(run(rixi_server._workload_argv(["no-such-command-here"])))
+        assert rc == 127 and "no-such-command-here" in err, runner
+    monkeypatch.setattr(rixi_server, "workload", None)
+    assert rixi_server._workload_argv(["id"]) == ["id"]            # without the mode: untouched

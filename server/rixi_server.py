@@ -903,6 +903,32 @@ def _workload_popen() -> dict:
     return workload.popen() if workload is not None else {}
 
 
+# For a command started through the event loop: the loop decides which arguments a child
+# process may be given, and uvloop (what uvicorn runs on when it is installed) takes none that
+# change its user. So the command is started through this one-liner, which becomes the workload
+# user itself and then turns into the command — the same on every loop.
+_BECOME = (
+    "import os, sys\n"
+    "uid, gid, groups = int(sys.argv[1]), int(sys.argv[2]), [int(g) for g in sys.argv[3].split(',') if g]\n"
+    "if os.geteuid() == 0:\n"
+    "    os.setgroups(groups)\n"
+    "os.setgid(gid)\n"
+    "os.setuid(uid)\n"
+    "try:\n"
+    "    os.execvp(sys.argv[4], sys.argv[4:])\n"
+    "except OSError as exc:\n"
+    "    sys.stderr.write('%s: %s\\n' % (sys.argv[4], exc.strerror or exc))\n"
+    "    sys.exit(127)\n")
+
+
+def _workload_argv(argv: list) -> list:
+    """The command as the workload user, for a child the event loop starts."""
+    if workload is None:
+        return list(argv)
+    return [sys.executable, "-I", "-c", _BECOME, str(workload.uid), str(workload.gid),
+            ",".join(str(g) for g in workload.groups), *argv]
+
+
 # The file API, as the workload user. One short-lived process per call, running as that user:
 # what it may reach is then decided by the kernel, not by a path check the user could race.
 _FS_HELPER = r"""
@@ -3124,10 +3150,10 @@ async def _exec_stream(argv, cwd, env, timeout, stdin):
     started = time.time()
     try:
         proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=str(cwd), env=_workload_env(env),
+            *_workload_argv(argv), cwd=str(cwd), env=_workload_env(env),
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True, **_workload_popen())
+            start_new_session=True)
     except (FileNotFoundError, PermissionError) as exc:
         yield send_frame((json.dumps({"exit_code": 127, "status": "failed",
                                       "error": str(exc)}) + "\n").encode())
