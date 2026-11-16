@@ -57,8 +57,11 @@ class Gateway:
                  admin_host: str = "127.0.0.1", admin_port: int = 0, kdf_salt: str = "",
                  node_secret: str | None = None, allow_dummy: bool | None = None,
                  tls_cert: str | None = None, tls_key: str | None = None,
-                 require_node_tokens: bool = False):
+                 require_node_tokens: bool = False, require_client_jwt: bool = False):
         self.secret = secret
+        # A gateway others can reach knows its clients by their JWT, whatever the policy file
+        # says (see `exposure`); on loopback, for trying things out, the tunnel secret is enough.
+        self.require_client_jwt = require_client_jwt
         # Every box must prove a registration token — the ones attached by hand as well (the
         # operator gets a node's token with --print-node-token and gives it to that box).
         self.require_node_tokens = require_node_tokens
@@ -266,7 +269,8 @@ class Gateway:
             token = reply.get("token")
             if self.verifier is not None and token:
                 identity = await self.verifier.verify(token) or ANON
-            if self.policy.glob.require_jwt and identity.anon and not self.policy.is_admin(identity):
+            if (self.policy.glob.require_jwt or self.require_client_jwt) and identity.anon \
+                    and not self.policy.is_admin(identity):
                 await self._audit(audit_mod.AUTH_DENIED, identity.label, "connect",
                                   decision="deny", reason="jwt required", attrs={"node_id": node_id})
                 return
@@ -791,7 +795,8 @@ class Gateway:
                                            ping_interval=20, ping_timeout=20, ssl=tls)
         print(f"🛰️  rixi gateway on {'wss' if tls else 'ws'}://{self.ws_host}:{self.ws_port}",
               flush=True)
-        if tls is None and self.ws_host not in ("127.0.0.1", "localhost", "::1"):
+        if tls is None and self.ws_host not in ("127.0.0.1", "localhost", "::1") \
+                and not (self.public_ws_url or "").startswith("wss://"):
             print("⚠️  no TLS on a public address: boxes and clients all hold the tunnel secret, "
                   "so any of them on the way can read the others' traffic (and clients' JWTs). "
                   "Pass --tls-cert/--tls-key, or put the gateway behind a TLS proxy and set "
@@ -847,9 +852,37 @@ class Gateway:
         return await actions.dispatch(name, args, self)
 
 
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def exposure(host: str, *, dev: bool, has_jwt: bool, has_tls: bool,
+             public_ws_url: str | None) -> tuple[bool, list[str]]:
+    """What a gateway needs before it listens on `host`: (clients must present a JWT, what is
+    missing). On loopback nothing is asked: start it, try it. On an address others can reach,
+    every party holds the same tunnel secret, so that secret says "one of us" and no more —
+    clients are told apart by their JWT, and TLS keeps what crosses the network from the others.
+    `dev` waives both, knowingly."""
+    if host in _LOOPBACK or dev:
+        return False, []
+    missing = []
+    if not has_jwt:
+        missing.append("a key to verify client JWTs (--jwt-public-key or --jwt-jwks-url)")
+    if not has_tls and not (public_ws_url or "").startswith("wss://"):
+        missing.append("TLS (--tls-cert/--tls-key, or a TLS proxy in front and "
+                       "--public-ws-url wss://…)")
+    return True, missing
+
+
 def main():
     ap = argparse.ArgumentParser(description="rixi gateway (brokered reverse-tunnel rendezvous)")
-    ap.add_argument("--ws-bind", default="0.0.0.0:7100", help="address servers/clients dial into")
+    ap.add_argument("--ws-bind", default="127.0.0.1:7100",
+                    help="address servers/clients dial into (default: this machine only; an "
+                         "address others can reach needs client JWTs and TLS, or --dev)")
+    ap.add_argument("--dev", action="store_true",
+                    default=os.getenv("RIXI_GATEWAY_DEV", "").lower() in ("1", "true", "yes"),
+                    help="development: listen on any address without client JWTs or TLS. "
+                         "Everyone who holds the tunnel secret is then the same client, and "
+                         "can read the others' traffic on the way — not for anything that matters")
     ap.add_argument("--public-ws-url", default=os.getenv("RIXI_GATEWAY_PUBLIC_URL"),
                     help="ws:// URL provisioned boxes dial back (must be reachable from them; "
                          "e.g. ws://host.docker.internal:7100 for k8s pods). Defaults to --ws-bind.")
@@ -919,13 +952,24 @@ def main():
         ah, _, ap_ = args.admin_bind.rpartition(":")
         admin_host, admin_port = ah or "127.0.0.1", int(ap_)
 
-    gw = Gateway(args.secret, host or "0.0.0.0", int(port), config_path=args.config, kdf_salt=args.kdf_salt,
+    host = host or "127.0.0.1"
+    require_jwt, missing = exposure(host, dev=args.dev, has_jwt=verifier is not None,
+                                    has_tls=bool(args.tls_cert and args.tls_key),
+                                    public_ws_url=args.public_ws_url)
+    if missing:
+        ap.error(f"refusing to listen on {host}: it needs " + " and ".join(missing) +
+                 ". Listen on 127.0.0.1 to try things out, or pass --dev to do without (anyone "
+                 "holding the tunnel secret is then the same client).")
+    if args.dev and host not in _LOOPBACK:
+        print(f"⚠️  --dev on {host}: no client JWTs and no TLS are required. Everyone who holds "
+              f"the tunnel secret is the same client. Not for anything that matters.", flush=True)
+    gw = Gateway(args.secret, host, int(port), config_path=args.config, kdf_salt=args.kdf_salt,
                  public_ws_url=args.public_ws_url,
                  verifier=verifier, auditor=auditor, admin_host=admin_host, admin_port=admin_port,
                  node_secret=args.node_secret,
                  allow_dummy=True if args.allow_dummy_provider else None,
                  tls_cert=args.tls_cert, tls_key=args.tls_key,
-                 require_node_tokens=args.require_node_tokens)
+                 require_node_tokens=args.require_node_tokens, require_client_jwt=require_jwt)
     try:
         asyncio.run(gw.serve())
     except KeyboardInterrupt:

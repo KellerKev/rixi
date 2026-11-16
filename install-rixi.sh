@@ -315,15 +315,46 @@ log() { printf '\033[36m  [remote]\033[0m %s\n' "$*" >&2; }
 PIXI="$HOME/.pixi/bin/pixi"
 if ! [ -x "$PIXI" ] && command -v pixi >/dev/null 2>&1; then PIXI="$(command -v pixi)"; fi
 if ! [ -x "$PIXI" ]; then
+  # pixi, pinned: the release archive itself, checked against the hash recorded here — not an
+  # installer script fetched and run on the day of the install.
+  PIXI_VERSION="${PIXI_VERSION:-v0.70.1}"
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64|Linux-amd64)   pixi_arch=x86_64-unknown-linux-musl
+                                pixi_sum=09692fb29be000cde10ad3fbf61edb1d147cfb6ad539d365a573408615b774d1 ;;
+    Linux-aarch64|Linux-arm64)  pixi_arch=aarch64-unknown-linux-musl
+                                pixi_sum=304c81982b14780230ca9fed6e9796ddc268c41a8883a27219595d57871ccd2c ;;
+    Darwin-arm64|Darwin-aarch64) pixi_arch=aarch64-apple-darwin
+                                pixi_sum=5017670ee1116c7a7ae5923b68174e9ff35baad6146341d5507f8a5ead130646 ;;
+    Darwin-x86_64)              pixi_arch=x86_64-apple-darwin
+                                pixi_sum=be9cc317a38a3ff3aa13d628c7078ebb6935fc3505a3f942f8b4d10ea9b3b92c ;;
+    *) echo "pixi: unsupported target $(uname -s) $(uname -m)" >&2; exit 1 ;;
+  esac
+  # another release has another hash: say which
+  [ "$PIXI_VERSION" = "v0.70.1" ] || pixi_sum="${PIXI_SHA256:?set PIXI_SHA256 to the hash of pixi $PIXI_VERSION for this target}"
+  pixi_url="https://github.com/prefix-dev/pixi/releases/download/$PIXI_VERSION/pixi-$pixi_arch.tar.gz"
+  pixi_tmp="$(mktemp -d)"
   if command -v curl >/dev/null 2>&1; then
-    log "Installing Pixi via curl…"
-    curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.70.1 bash >/dev/null
+    log "Installing Pixi $PIXI_VERSION via curl…"
+    curl -fsSL --retry 3 -o "$pixi_tmp/pixi.tar.gz" "$pixi_url"
   elif command -v wget >/dev/null 2>&1; then
-    log "Installing Pixi via wget…"
-    wget -qO- https://pixi.sh/install.sh | PIXI_VERSION=v0.70.1 bash >/dev/null
+    log "Installing Pixi $PIXI_VERSION via wget…"
+    wget -q -O "$pixi_tmp/pixi.tar.gz" "$pixi_url"
   else
     echo "no curl/wget and pixi was not pre-staged — cannot install pixi" >&2; exit 1
   fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    pixi_got="$(sha256sum "$pixi_tmp/pixi.tar.gz" | cut -d' ' -f1)"
+  else
+    pixi_got="$(shasum -a 256 "$pixi_tmp/pixi.tar.gz" | cut -d' ' -f1)"
+  fi
+  if [ "$pixi_got" != "$pixi_sum" ]; then
+    echo "pixi: the download does not match its recorded hash — not installing it" >&2
+    rm -rf "$pixi_tmp"; exit 1
+  fi
+  mkdir -p "$HOME/.pixi/bin"
+  tar -xzf "$pixi_tmp/pixi.tar.gz" -C "$HOME/.pixi/bin" pixi
+  chmod 755 "$HOME/.pixi/bin/pixi"
+  rm -rf "$pixi_tmp"
   PIXI="$HOME/.pixi/bin/pixi"
 fi
 [ -x "$PIXI" ] || { echo "pixi install failed" >&2; exit 1; }

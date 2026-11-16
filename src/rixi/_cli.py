@@ -188,6 +188,9 @@ def main(argv=None) -> int:
                     help="with --storage: only these buckets; repeatable")
     up.add_argument("--storage-read-only", action="store_true",
                     help="with --storage: the box may read but not change them")
+    up.add_argument("--unprivileged", action="store_true",
+                    help="hosted: what you run on the box is an ordinary user's, not root's "
+                         "(no system packages; a revoked token is then really out)")
     up.add_argument("--on-idle", choices=["release", "stop"],
                     help="eutonomous: when idle, shut down (default) or stop and keep the disk")
     need = up.add_argument_group("eutonomous: say what you need instead of --size "
@@ -401,7 +404,7 @@ def _cloud(args) -> int:
                 require={k: v for k, v in (("vcpu", args.vcpu), ("ram_gb", args.ram),
                                            ("gpu", args.gpu), ("gpu_ram_gb", args.gpu_ram))
                          if v is not None} or None,
-                on_idle=args.on_idle,
+                on_idle=args.on_idle, unprivileged=args.unprivileged,
                 storage=({"buckets": args.storage_bucket or None,
                           "write": not args.storage_read_only}
                          if args.storage or args.storage_bucket else None),

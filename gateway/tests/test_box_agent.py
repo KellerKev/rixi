@@ -71,3 +71,17 @@ def test_resolvers_skip_the_local_stub_and_fall_back(tmp_path):
     assert agent.resolvers((str(tmp_path / "missing"), str(upstream), str(stub))) == \
         ["51.159.47.28", "51.159.47.26"]
     assert agent.resolvers((str(stub),)) == []          # only a stub: nothing to keep open
+
+
+def test_a_box_with_a_policy_is_opened_only_when_the_gateway_calls_it_ready(tmp_path):
+    ready = tmp_path / "ready"
+    env = {"RIXI_HOLD": "1", "RIXI_READY_FILE": str(ready)}
+    for state in ("provisioning", "booting", None):
+        assert agent.open_when_ready(env, {"state": state} if state else {}) is False
+        assert not ready.exists()
+    assert agent.open_when_ready(env, {"state": "ready"}) is True and ready.exists()
+    assert agent.open_when_ready(env, {"state": "booting"}) is True      # stays open
+    # a box without a policy was never shut
+    other = tmp_path / "other"
+    assert agent.open_when_ready({"RIXI_READY_FILE": str(other)}, {"state": "booting"}) is True
+    assert not other.exists()

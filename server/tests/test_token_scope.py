@@ -155,3 +155,24 @@ def test_health_reports_task_count_without_auth():
     from fastapi.testclient import TestClient
     body = TestClient(rixi_server.app).get("/health").json()
     assert body["active_tasks"] == len(rixi_server.running_tasks)
+
+
+def test_a_revocation_list_nobody_confirms_is_not_trusted_for_ever(signer, tmp_path, monkeypatch):
+    """The box's agent rewrites or touches the list on every heartbeat. If that stops — the
+    gateway cannot be reached, or the agent is gone — a revocation could no longer arrive, so
+    with --revocation-max-age no token is taken until the list is confirmed again."""
+    import os
+    revoked = tmp_path / "revoked"
+    revoked.write_text("")
+    rixi_server.setup_token_scope("box-a", [], False, str(revoked))
+    monkeypatch.setattr(rixi_server.auth_settings, "revocation_max_age", 600.0)
+    assert _valid(signer(aud="box-a", exp=_exp(), jti="t1"))
+    old = time.time() - 3600
+    os.utime(revoked, (old, old))
+    assert not _valid(signer(aud="box-a", exp=_exp(), jti="t2"))
+    os.utime(revoked)                                   # a heartbeat came through
+    assert _valid(signer(aud="box-a", exp=_exp(), jti="t3"))
+    revoked.unlink()                                    # no list at all: nothing to trust
+    assert not _valid(signer(aud="box-a", exp=_exp(), jti="t4"))
+    monkeypatch.setattr(rixi_server.auth_settings, "revocation_max_age", None)
+    assert _valid(signer(aud="box-a", exp=_exp(), jti="t5"))        # without the limit: as before

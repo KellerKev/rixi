@@ -355,3 +355,25 @@ def test_the_command_line_client_negotiates_and_seals_its_uploads(server, monkey
     assert all(rixi_transport.is_local_secret(n) for n in (
         "aes.key", "rotation.secret", "pixi_remote_config.toml", "rixi_headers.json", "tls.pem"))
     assert not rixi_transport.is_local_secret("main.py")
+
+
+# ── a box with a network policy stays shut until the policy is in force ──────
+
+def test_a_held_server_answers_health_and_nothing_else_until_it_is_opened(server, token, tmp_path,
+                                                                          monkeypatch):
+    ready = tmp_path / "ready"
+    monkeypatch.setattr(rixi_server, "hold_path", str(ready))
+    monkeypatch.setattr(rixi_server, "_hold_lifted", False)
+    assert server.get("/health").status_code == 200              # the box's own TLS self-check
+    for method, path in (("GET", "/tasks"), ("POST", "/exec"), ("PUT", "/files?path=x"),
+                         ("POST", "/upload")):
+        r = server.request(method, path, headers=token, content=b"{}")
+        assert r.status_code == 503 and "network policy" in r.json()["detail"], path
+    with pytest.raises(WebSocketDisconnect) as closed:
+        with server.websocket_connect("/pty", headers=token):
+            pass
+    assert closed.value.code == 4503
+    ready.write_text("")                                         # the agent opens the box
+    assert server.get("/tasks", headers=token).status_code == 200
+    ready.unlink()                                               # opened once, open for good
+    assert server.get("/tasks", headers=token).status_code == 200

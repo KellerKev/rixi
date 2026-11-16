@@ -16,7 +16,11 @@ and given a dedicated local TCP port that reverse-proxies to it.
 
 ```bash
 # gateway (reachable host)
-RIXI_GATEWAY_SECRET=… pixi run serve -- --ws-bind 0.0.0.0:7100
+RIXI_GATEWAY_SECRET=… pixi run serve                       # on this machine: nothing else to set up
+# for boxes and clients elsewhere: client JWTs and TLS (or --dev to do without, knowingly)
+RIXI_GATEWAY_SECRET=… pixi run serve -- --ws-bind 0.0.0.0:7100 \
+    --jwt-jwks-url https://idp.example/jwks.json --jwt-audience rixi-gateway \
+    --tls-cert cert.pem --tls-key key.pem
 
 # each firewalled rixi server (uses the public core's tunnel CLI, unchanged):
 rixi-tunnel connect --to ws://GATEWAY:7100 --target 127.0.0.1:9000 --node-id gpu-1 --secret …

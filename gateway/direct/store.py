@@ -57,6 +57,7 @@ class Box:
     serve_model: Optional[str] = None
     model_ready: int = 0                    # the model has finished downloading
     requests_total: int = 0
+    unprivileged: int = 0               # 1: the tenant's code runs as an ordinary user on the box
     last_request: Optional[float] = None
     # Network policy: enforced by the box's own cloud firewall once the box is ready.
     policy: Optional[str] = None            # JSON; None = the open default
@@ -303,7 +304,7 @@ _FIELDS = [f.name for f in fields(Box)]
 _DOUBLE = {"eur_per_hour", "created_at", "expires_at", "idle_timeout", "ready_at", "ended_at",
            "last_heartbeat", "last_busy", "last_request", "stopped_at", "stopped_total",
            "stopped_eur_per_hour"}
-_INT = {"active_tasks", "model_ready", "requests_total", "policy_applied"}
+_INT = {"active_tasks", "model_ready", "requests_total", "policy_applied", "unprivileged"}
 _TEXT = {"policy", "resolvers", "volumes"}
 
 

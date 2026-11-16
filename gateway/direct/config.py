@@ -147,6 +147,11 @@ class DirectConfig:
     # DNS servers a policed box may reach. Unset, the box says which it uses (a box is its
     # tenant's machine, so that is the tenant's word); set, only these are opened.
     resolvers: Tuple[str, ...] = ()
+    # A box whose workloads are unprivileged refuses every token when its revocation list has
+    # not been confirmed by a heartbeat for this long (seconds; unset: no limit). It ties such
+    # a box's API to the gateway being reachable, which is the price of a revocation that
+    # cannot be outlasted.
+    revocation_max_age: Optional[float] = None
     heartbeat_timeout: float = 10 * 60
     boot_timeout: float = 25 * 60
     reap_interval: float = 30.0
@@ -344,6 +349,8 @@ def parse(data: dict) -> DirectConfig:
         dns_publish_timeout=_duration(d.get("dns_publish_timeout", "3m")),
         control_plane=tuple(d.get("control_plane") or ()),
         resolvers=_addresses(d.get("resolvers"), "resolvers"),
+        revocation_max_age=_duration(d["revocation_max_age"]) if d.get("revocation_max_age")
+        else None,
         heartbeat_timeout=_duration(d.get("heartbeat_timeout", "10m")),
         boot_timeout=_duration(d.get("boot_timeout", "25m")),
         reap_interval=_duration(d.get("reap_interval", "30s")),

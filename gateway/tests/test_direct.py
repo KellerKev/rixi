@@ -1195,3 +1195,80 @@ def test_a_failed_statement_does_not_poison_the_connection():
         svc.store.db.rollback = real
     assert calls == [1]
     assert svc.store.list() == []
+
+
+def test_a_policed_box_is_told_to_keep_its_api_shut_until_it_is_ready():
+    svc = _svc(control_plane=["203.0.113.10"])
+    held = svc.claim(A, "cpu", policy=BLOCK)
+    plain = svc.claim(B, "cpu")
+    _settle(svc)
+
+    def env_of(box_id):
+        for srv in svc.providers["dummy"].servers.values():
+            if f"rixi-box={box_id}" in srv["tags"]:
+                return srv["user_data"]
+    assert "RIXI_HOLD=1" in env_of(held.id) and "RIXI_HOLD" not in env_of(plain.id)
+    # the bootstrap starts the server held, and only for such a box
+    script = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "box", "bootstrap-direct.sh")).read()
+    assert '--hold-until /etc/rixi/ready' in script and '"${RIXI_HOLD:-}" = "1"' in script
+
+
+# ── a box whose workloads are not root ───────────────────────────────────
+
+def _user_data(svc, box_id):
+    for srv in svc.providers["dummy"].servers.values():
+        if f"rixi-box={box_id}" in srv["tags"]:
+            return srv["user_data"]
+
+
+def test_a_box_can_run_what_the_tenant_starts_as_an_ordinary_user():
+    svc = _svc(revocation_max_age="15m")
+    locked = svc.claim(A, "cpu", unprivileged=True)
+    plain = svc.claim(B, "cpu")
+    _settle(svc)
+    ud = _user_data(svc, locked.id)
+    assert "RIXI_RUN_AS=rixi" in ud and "RIXI_REVOCATION_MAX_AGE=900" in ud
+    assert "RIXI_RUN_AS" not in _user_data(svc, plain.id)
+    assert svc.store.get(locked.id).unprivileged == 1 and svc.store.get(plain.id).unprivileged == 0
+    assert locked.public()["unprivileged"] == 1
+    # the login user of an SSH key can become root: such a box takes none
+    with pytest.raises(Denied, match="SSH key"):
+        svc.claim(A, "cpu", unprivileged=True,
+                  ssh_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtest me@host")
+    with pytest.raises(Denied, match="true or false"):
+        svc.claim(A, "cpu", unprivileged="yes")
+    for bad in ("root", "Rixi User", "a;b"):
+        with pytest.raises(ValueError):
+            cloudinit.render(svc.cfg, box_id="b", tenant="t-a", hostname="b.run.example.test",
+                             box_secret="s", run_as=bad)
+    # the bootstrap makes the user, hands it the workspace and starts the server with it
+    script = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "box", "bootstrap-direct.sh")).read()
+    for line in ('useradd --create-home --shell /bin/bash "$RIXI_RUN_AS"',
+                 'chown "$RIXI_RUN_AS:" /workspace', 'RUN_ARGS=" --run-as $RIXI_RUN_AS"',
+                 "--revocation-max-age $RIXI_REVOCATION_MAX_AGE", "chmod 700 /etc/rixi"):
+        assert line in script, line
+
+
+def test_unprivileged_is_refused_when_the_boxes_release_would_ignore_it():
+    from gateway.direct.service import _ref_at_least
+    old = _svc(rixi_ref="v0.17.0")
+    with pytest.raises(Denied, match="cannot run workloads unprivileged"):
+        old.claim(A, "cpu", unprivileged=True)
+    assert old.store.list() == []
+    old.claim(A, "cpu")                                         # an ordinary box: as ever
+    _settle(old)
+    assert _ref_at_least("v0.17.1", (0, 17, 1)) and _ref_at_least("v1.0.0", (0, 17, 1))
+    assert not _ref_at_least("v0.16.9", (0, 17, 1))
+    assert _ref_at_least("main", (0, 17, 1)) and _ref_at_least("3f2a9c1", (0, 17, 1))
+
+
+def test_api_takes_unprivileged(gw=None):
+    tc, svc, h = _api()
+    r = tc.post("/api/boxes", json={"template": "cpu", "unprivileged": True},
+                headers=h("alice", "t-a"))
+    assert r.status_code == 202 and r.json()["unprivileged"] == 1
+    assert tc.post("/api/boxes", json={"template": "cpu", "unprivileged": "yes"},
+                   headers=h("alice", "t-a")).status_code == 400
+    _settle(svc)

@@ -171,7 +171,7 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
        instance_type: Optional[str] = None, region: Optional[str] = None,
        policy: Optional[netpolicy.NetworkPolicy] = None, ttl_hours: Optional[float] = None,
        model_access=None, volumes: Optional[list] = None, on_idle: Optional[str] = None,
-       require: Optional[dict] = None, storage=None,
+       require: Optional[dict] = None, storage=None, unprivileged: bool = False,
        make_default: bool = True, wait_timeout: float = 900.0, echo: Echo = print,
        _api: Optional[Api] = None, _sleep=time.sleep) -> Profile:
     api = _api or Api(creds.get("api_key"), creds.get("api_url"))
@@ -192,6 +192,10 @@ def up(*, name: str, size: str, creds: Dict[str, Optional[str]], store: ProfileS
         body["volumes"] = list(volumes)       # mounted at /workspace/data/<name>
     if on_idle:
         body["on_idle"] = on_idle             # "stop": keep the disk instead of shutting down
+    if unprivileged:
+        # what runs on the box is an ordinary user's, not root's: no system packages, and the
+        # box's own controls (revoked tokens, its credentials) are out of its reach
+        body["unprivileged"] = True
     if storage:
         # S3 on the box (AWS_* variables), with a key that dies with it: True for all your
         # buckets, or {"buckets": [names], "write": bool}

@@ -269,9 +269,45 @@ if [ -n "${RIXI_S3_ACCESS_KEY:-}" ]; then
   } >> /etc/rixi/workload.env
 fi
 if [ -s /etc/rixi/workload.env ]; then
-  echo 'set -a; . /etc/rixi/workload.env; set +a' > /etc/profile.d/rixi-llm.sh
+  # (readable by root only: a workload user gets these from the server's environment instead)
+  echo '[ -r /etc/rixi/workload.env ] && { set -a; . /etc/rixi/workload.env; set +a; }' \
+    > /etc/profile.d/rixi-llm.sh
 fi
 chmod 600 /etc/rixi/workload.env
+
+# A box with a network policy answers nothing but /health until the policy is in force: the
+# agent (root) creates /etc/rixi/ready when the gateway calls the box ready. Until then outbound
+# is still open for the install, and nothing of the tenant's can run here.
+# RIXI_RUN_AS: what callers start, and every file they touch, belongs to that user — not to
+# root. The server, this box's agent and /etc/rixi (which tokens are revoked, the box's own
+# credentials) stay root's, so nothing a caller runs can change or read them. No SSH key is put
+# on such a box (the gateway refuses one: the login user can become root).
+RUN_ARGS=""
+if [ -n "${RIXI_RUN_AS:-}" ]; then
+  id "$RIXI_RUN_AS" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$RIXI_RUN_AS"
+  # root's pixi sits in a home the user cannot enter: one for everybody
+  install -m 755 "$PIXI" /usr/local/bin/pixi
+  mkdir -p /workspace
+  chown "$RIXI_RUN_AS:" /workspace
+  if [ -d /workspace/data ]; then
+    chown "$RIXI_RUN_AS:" /workspace/data
+    for mount in /workspace/data/*/; do
+      [ -d "$mount" ] && chown "$RIXI_RUN_AS:" "$mount"     # the top of each volume
+    done
+  fi
+  chmod 700 /etc/rixi
+  RUN_ARGS=" --run-as $RIXI_RUN_AS"
+  if [ -n "${RIXI_REVOCATION_MAX_AGE:-}" ]; then
+    RUN_ARGS="$RUN_ARGS --revocation-max-age $RIXI_REVOCATION_MAX_AGE"
+  fi
+  log "workloads run as $RIXI_RUN_AS"
+fi
+
+HOLD_ARGS=""
+if [ "${RIXI_HOLD:-}" = "1" ]; then
+  rm -f /etc/rixi/ready
+  HOLD_ARGS=" --hold-until /etc/rixi/ready"
+fi
 
 cat > /etc/systemd/system/rixi-server.service <<UNIT
 [Unit]
@@ -285,7 +321,7 @@ Environment=PATH=$HOME/.pixi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/b
 Environment=HOME=$HOME
 EnvironmentFile=-/etc/rixi/workload.env
 EnvironmentFile=-/etc/rixi/preview.env
-ExecStart=$PY rixi_server.py --host 127.0.0.1 --port 9000 --jwks-url $RIXI_JWKS_URL --audience box-$RIXI_BOX_ID --required-claim tenant=$RIXI_TENANT --revoked-jti-file /etc/rixi/revoked_jti
+ExecStart=$PY rixi_server.py --host 127.0.0.1 --port 9000 --jwks-url $RIXI_JWKS_URL --audience box-$RIXI_BOX_ID --required-claim tenant=$RIXI_TENANT --revoked-jti-file /etc/rixi/revoked_jti$HOLD_ARGS$RUN_ARGS
 Restart=always
 RestartSec=3
 [Install]

@@ -28,6 +28,10 @@ admin_role     = "admin"                                     # role that sees ev
 # DNS servers a box with a network policy may reach. Unset, each box reports its own, which is
 # its tenant's word; set it when the policy is one the tenant must not be able to widen.
 # resolvers    = ["51.159.47.28", "51.159.47.26"]
+# For boxes claimed with unprivileged workloads: refuse every token once the box's revocation
+# list has gone this long without a heartbeat confirming it (ties such a box to the gateway
+# being reachable; unset = no limit).
+# revocation_max_age = "15m"
 # Optional: ask a billing service before every claim; it must answer {"allow": true}.
 # authorizer_url   = "http://127.0.0.1:8030/internal/authorize"
 # authorizer_token = "${env:RIXI_AUTHORIZER_TOKEN}"

@@ -481,3 +481,64 @@ def test_boxes_attached_by_hand_can_be_made_to_prove_themselves_too():
     a = Gateway("-", "127.0.0.1", 0, node_secret="s1").node_token("my-workstation")
     assert a == Gateway("x", "127.0.0.1", 0, node_secret="s1").node_token("my-workstation")
     assert a != Gateway("-", "127.0.0.1", 0, node_secret="s2").node_token("my-workstation")
+
+
+# ── easy to start on this machine, not open by accident on a network ──────────
+
+def test_what_a_gateway_needs_before_it_listens_where_others_can_reach_it():
+    from gateway.server import exposure
+    # this machine only: start it, try it — no JWT, no certificate
+    assert exposure("127.0.0.1", dev=False, has_jwt=False, has_tls=False, public_ws_url=None) == (False, [])
+    assert exposure("localhost", dev=False, has_jwt=False, has_tls=False, public_ws_url=None) == (False, [])
+    # an address others can reach: clients are known by their JWT, and the wire is TLS
+    need, missing = exposure("0.0.0.0", dev=False, has_jwt=False, has_tls=False, public_ws_url=None)
+    assert need and len(missing) == 2 and "JWT" in missing[0] and "TLS" in missing[1]
+    need, missing = exposure("0.0.0.0", dev=False, has_jwt=True, has_tls=False, public_ws_url=None)
+    assert need and len(missing) == 1 and "TLS" in missing[0]
+    assert exposure("0.0.0.0", dev=False, has_jwt=True, has_tls=True, public_ws_url=None) == (True, [])
+    assert exposure("0.0.0.0", dev=False, has_jwt=True, has_tls=False,
+                    public_ws_url="wss://gw.example.com") == (True, [])       # TLS ends at a proxy
+    assert exposure("0.0.0.0", dev=False, has_jwt=True, has_tls=False,
+                    public_ws_url="ws://gw.example.com")[1]
+    # --dev: said out loud, nothing is asked
+    assert exposure("0.0.0.0", dev=True, has_jwt=False, has_tls=False, public_ws_url=None) == (False, [])
+
+
+def test_a_gateway_others_can_reach_takes_no_client_without_a_jwt():
+    async def run():
+        async with _Gw() as t:
+            await t.client("dev-client")                      # as started on loopback: fine
+            assert await _wait(lambda: t.gw.registry.get("dev-client") is not None)
+            t.gw.require_client_jwt = True                    # as started on a public address
+            anon = GatewayClient(t.url, SECRET, "anon")
+            await anon.connect()
+            t.clients.append(anon)
+            await asyncio.sleep(0.3)
+            assert t.gw.registry.get("anon") is None
+            await t.agent("a-box")                            # boxes are not clients: unaffected
+            assert await _wait(lambda: t.gw.registry.get("a-box") is not None)
+    asyncio.run(run())
+
+
+def test_the_command_line_refuses_a_public_address_without_jwt_and_tls(monkeypatch, capsys):
+    from gateway import server as server_mod
+    monkeypatch.setattr(sys, "argv", ["gateway", "--secret", "s", "--ws-bind", "0.0.0.0:7100",
+                                      "--config", "/nonexistent.toml"])
+    monkeypatch.delenv("RIXI_GATEWAY_DEV", raising=False)
+    for var in ("RIXI_JWT_PUBLIC_KEY", "RIXI_JWT_JWKS_URL", "RIXI_GATEWAY_TLS_CERT",
+                "RIXI_GATEWAY_TLS_KEY", "RIXI_GATEWAY_PUBLIC_URL"):
+        monkeypatch.delenv(var, raising=False)
+    with pytest.raises(SystemExit):
+        server_mod.main()
+    err = capsys.readouterr().err
+    assert "refusing to listen on 0.0.0.0" in err and "--dev" in err
+    # --dev, or loopback, get as far as serving
+    served = []
+    monkeypatch.setattr(server_mod.Gateway, "serve", lambda self: served.append(
+        (self.ws_host, self.require_client_jwt)) or asyncio.sleep(0))
+    monkeypatch.setattr(sys, "argv", ["gateway", "--secret", "s", "--ws-bind", "0.0.0.0:7100",
+                                      "--dev", "--config", "/nonexistent.toml"])
+    server_mod.main()
+    monkeypatch.setattr(sys, "argv", ["gateway", "--secret", "s", "--config", "/nonexistent.toml"])
+    server_mod.main()
+    assert served == [("0.0.0.0", False), ("127.0.0.1", False)]

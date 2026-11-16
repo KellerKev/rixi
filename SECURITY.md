@@ -51,13 +51,29 @@ deployment:
   a handshake. Use a long random one (`rixi up` generates 32 random bytes).
 - Brokered gateway: every box and client holds the tunnel secret, so it
   authenticates membership, not identity. Boxes the gateway provisions prove a
-  per-box registration token; clients are told apart by their JWT (set
-  `require_jwt` in the policy) — without JWTs, a client is only as distinct as
-  the connection it holds. Give the gateway a certificate
+  per-box registration token; clients are told apart by their JWT. On this
+  machine (`--ws-bind 127.0.0.1`, the default) nothing more is asked, so it is
+  easy to try. On an address others can reach the gateway does not start
+  without a key to verify client JWTs and TLS — or `--dev`, which waives both
+  and says so: every holder of the tunnel secret is then the same client. Give the gateway a certificate
   (`--tls-cert/--tls-key`, or a TLS proxy and `--public-ws-url wss://…`) when
   the network between is not yours; the tunnel and the SMCP server take the
   same flags. The `dummy` provider runs boxes as processes on the
   gateway's own host and is off unless the gateway listens on loopback.
+- Direct-mode boxes run what the tenant starts as root by default (a throwaway
+  machine of their own). Two things follow. A token that was used on such a
+  box cannot be taken back by revoking it — whoever had root may have left
+  something behind — so the answer to a leaked, used token is a new box.
+  And nothing on the box can be kept from the tenant. A box claimed with
+  `unprivileged: true` (`rixi up --unprivileged`) runs the tenant's code as an
+  ordinary user instead: the server, the box's agent and `/etc/rixi` stay
+  root's, a revoked token is out, and with `revocation_max_age` set a box
+  whose revocation list is no longer being confirmed takes no token at all.
+  Such a box takes no SSH key and its code cannot install system packages.
+- A box with a network policy installs itself with outbound traffic open; the
+  policy goes onto its cloud firewall just before it is called ready. Until
+  then its server answers only `/health`, and it has no SSH: nothing of the
+  tenant's runs before the policy is in force.
 - The inference proxy forwards to its backend with its own token: give it an
   API key or JWT (`authentication` in its config) before it listens anywhere
   but loopback.

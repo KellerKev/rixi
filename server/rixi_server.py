@@ -263,6 +263,10 @@ class AuthSettings:
         self.single_use: bool = False
         self._used_jti: Dict[str, float] = {}
         self.revoked_jti_path: Optional[str] = None
+        # --revocation-max-age: the revocation list must have been confirmed this recently
+        # (the box's agent rewrites or touches it on every heartbeat), or no token is taken.
+        # Without it a list that stopped being updated would be trusted for ever.
+        self.revocation_max_age: Optional[float] = None
         self._revoked_jti: set[str] = set()
         self._revoked_mtime: Optional[float] = None
 
@@ -292,6 +296,23 @@ pending_handshake: Optional[dict] = None
 HANDSHAKE_TTL = 60.0
 HANDSHAKE_BODY_MAX = 16 * 1024
 bind_host: Optional[str] = None              # what the server listens on (set in main)
+# --hold-until PATH: until that file exists the server answers /health (and Caddy's preview
+# gates) and nothing else. A box with a network policy installs itself with the internet open;
+# the policy is applied to its firewall just before it is called ready, and only then does
+# whoever looks after the box (its agent, as root) create the file. Nothing of the tenant's can
+# run on the box before that, whatever tokens exist.
+hold_path: Optional[str] = None
+_hold_lifted = False
+
+
+def _held() -> bool:
+    global _hold_lifted
+    if hold_path is None or _hold_lifted:
+        return False
+    if os.path.exists(hold_path):
+        _hold_lifted = True             # opened once, open for good: no stat per request
+        return False
+    return True
 
 
 def _hs_proof(step: bytes, *parts: bytes) -> bytes:
@@ -412,6 +433,14 @@ def _decode(token: str, key: Any) -> dict:
             raise jwt.InvalidTokenError("token has no jti but revocation is enabled")
         if jti in _revoked_jtis():
             raise jwt.InvalidTokenError("token has been revoked")
+        if auth_settings.revocation_max_age is not None:
+            try:
+                age = time.time() - os.stat(auth_settings.revoked_jti_path).st_mtime
+            except OSError:
+                age = float("inf")
+            if age > auth_settings.revocation_max_age:
+                raise jwt.InvalidTokenError("the revocation list has not been confirmed "
+                                            "recently; no token is taken until it is")
     if auth_settings.single_use:
         jti, exp = payload.get("jti"), payload.get("exp")
         if not jti or not exp:
@@ -796,6 +825,174 @@ def _get_folder_size(folder_path: str) -> int:
         print(f"⚠️ Error calculating folder size: {e}")
     return total_size
 
+# ─────────────────────────── Who the workload runs as ───────────────────────
+# --run-as USER: everything a caller starts — tasks, commands, the terminal — and every file
+# the file API touches belongs to that user, not to the server. On a box where the server is
+# root and looks after things the tenant must not be able to change (which tokens are revoked,
+# the box's own credentials, its agent), this is what keeps them out of the tenant's reach.
+#
+# Two rules follow from it and are kept throughout: root never writes into a directory the
+# workload user controls (a planted symlink would aim the write anywhere), and a directory is
+# handed to the user exactly once, before the user has had any access to it.
+
+class Workload:
+    def __init__(self, name: str):
+        import pwd
+        try:
+            pw = pwd.getpwnam(name)
+        except KeyError:
+            raise SystemExit(f"ERROR: --run-as: there is no user {name!r} on this machine")
+        self.name, self.uid, self.gid, self.home = name, pw.pw_uid, pw.pw_gid, pw.pw_dir
+        self.groups = os.getgrouplist(name, pw.pw_gid)
+        if self.uid == 0:
+            raise SystemExit("ERROR: --run-as root would change nothing; name another user")
+        # the server must be able to become that user: root can; anyone can stay themselves
+        self.switch = os.geteuid() == 0
+        if not self.switch and os.geteuid() != self.uid:
+            raise SystemExit(f"ERROR: --run-as {name} needs the server to run as root")
+
+    def popen(self) -> dict:
+        """Arguments that make a new process the workload user's."""
+        if not self.switch:
+            return {}
+        return {"user": self.uid, "group": self.gid, "extra_groups": self.groups}
+
+    def env(self, env: dict) -> dict:
+        """The environment a workload gets: the user's own HOME, and nothing that is the
+        server's alone."""
+        out = {k: v for k, v in env.items() if k not in _SERVER_ONLY_ENV}
+        out.update({"HOME": self.home, "USER": self.name, "LOGNAME": self.name})
+        return out
+
+    def hand_over(self, path: str) -> None:
+        """Give a directory the server just made (and the user has never been inside) to the
+        user: its contents first, the directory itself last."""
+        if not self.switch:
+            return
+        for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+            for name in dirnames + filenames:
+                os.lchown(os.path.join(dirpath, name), self.uid, self.gid)
+        os.lchown(path, self.uid, self.gid)
+
+
+workload: Optional[Workload] = None
+_SERVER_ONLY_ENV = {"RIXI_PREVIEW_GATE", "RIXI_KEY_SECRET", "RIXI_AES_KEY"}
+# Where task directories and their start scripts live when workloads have a user of their own:
+# both under a directory only root can change, so a task directory cannot be swapped for a link
+# and a start script cannot be edited by the task it starts.
+LOCKED_BASE = os.environ.get("RIXI_LOCKED_BASE", "/var/lib/rixi")
+
+
+def _locked_dir(name: str, mode: int) -> str:
+    d = os.path.join(LOCKED_BASE, name)
+    os.makedirs(d, mode=mode, exist_ok=True)
+    return d
+
+
+def _new_task_dir() -> str:
+    if workload is None:
+        return tempfile.mkdtemp()
+    return tempfile.mkdtemp(dir=_locked_dir("tasks", 0o711))
+
+
+def _workload_env(env: dict) -> dict:
+    return workload.env(env) if workload is not None else env
+
+
+def _workload_popen() -> dict:
+    return workload.popen() if workload is not None else {}
+
+
+# The file API, as the workload user. One short-lived process per call, running as that user:
+# what it may reach is then decided by the kernel, not by a path check the user could race.
+_FS_HELPER = r"""
+import json, os, pathlib, shutil, sys, tempfile
+op, root, rel, limit = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+def fail(status, detail):
+    sys.stderr.write(json.dumps({"status": status, "detail": detail})); sys.exit(3)
+try:
+    root.mkdir(parents=True, exist_ok=True)
+    root = root.resolve()
+    cand = pathlib.Path(rel)
+    target = (cand if cand.is_absolute() else root / cand).resolve()
+except OSError as exc:
+    fail(503, "workspace unavailable: %s" % exc)
+if target != root and root not in target.parents:
+    fail(400, "path is outside the workspace")
+out = sys.stdout.buffer
+try:
+    if op == "write":
+        if target == root: fail(400, "path names the workspace itself")
+        data = sys.stdin.buffer.read()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".rixi-upload-")
+        try:
+            with os.fdopen(fd, "wb") as fh: fh.write(data)
+            os.replace(tmp, target)
+        except Exception:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+        out.write(json.dumps({"path": str(target.relative_to(root)), "bytes": len(data)}).encode())
+    elif op == "read":
+        if not target.is_file(): fail(404, "no such file")
+        size = target.stat().st_size
+        if size > limit: fail(413, "file is %d bytes; limit %d" % (size, limit))
+        with open(target, "rb") as fh: shutil.copyfileobj(fh, out)
+    elif op == "list":
+        if not target.is_dir(): fail(404, "no such directory")
+        entries = []
+        for child in sorted(target.iterdir(), key=lambda c: c.name):
+            try: st = child.lstat()
+            except OSError: continue
+            kind = "dir" if child.is_dir() and not child.is_symlink() else (
+                "link" if child.is_symlink() else "file")
+            entries.append({"name": child.name, "path": str(child.relative_to(root)),
+                            "type": kind, "size": st.st_size, "mtime": st.st_mtime})
+        out.write(json.dumps({"path": str(target.relative_to(root)) or ".",
+                              "entries": entries}).encode())
+    elif op == "delete":
+        if target == root: fail(400, "refusing to delete the workspace")
+        if target.is_dir() and not target.is_symlink(): shutil.rmtree(target)
+        elif target.exists() or target.is_symlink(): target.unlink()
+        else: fail(404, "no such file")
+        out.write(json.dumps({"deleted": str(target.relative_to(root))}).encode())
+    elif op == "mkdir":
+        target.mkdir(parents=True, exist_ok=True)
+        out.write(str(target).encode())
+    else:
+        fail(400, "unknown operation")
+except PermissionError as exc:
+    fail(403, "not permitted: %s" % exc)
+except OSError as exc:
+    fail(400, str(exc))
+"""
+
+
+def _workload_fs_sync(op: str, rel: str, data: bytes = b"") -> bytes:
+    if not isinstance(rel, str) or "\x00" in rel:
+        raise HTTPException(status_code=400, detail="path must be a string")
+    try:
+        done = subprocess.run(
+            [sys.executable, "-I", "-c", _FS_HELPER, op, WORKSPACE_ROOT, rel, str(FILE_MAX_BYTES)],
+            input=data, capture_output=True, timeout=300, cwd="/",
+            env=workload.env({"PATH": os.environ.get("PATH", "/usr/bin:/bin")}),
+            **workload.popen())
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="the file operation took too long")
+    if done.returncode == 0:
+        return done.stdout
+    try:
+        err = json.loads(done.stderr.decode() or "{}")
+        raise HTTPException(status_code=int(err["status"]), detail=str(err["detail"]))
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(status_code=500, detail="the file operation failed")
+
+
+async def _workload_fs(op: str, rel: str, data: bytes = b"") -> bytes:
+    return await asyncio.to_thread(_workload_fs_sync, op, rel, data)
+
+
 # ─────────────────────────── Shared task-run helpers ───────────────────────
 def _write_task_wrapper(work_dir: str, task: str, script_name: str) -> str:
     """Write the bash wrapper script that runs `pixi run <task>` with full output capture."""
@@ -812,6 +1009,15 @@ export PIXI_LOG_LEVEL=info
 stdbuf -oL -eL pixi run --verbose {shlex.quote(task)} 2>&1 | tee {shlex.quote(task_log_file)}
 exit ${{PIPESTATUS[0]}}
 '''
+    if workload is not None:
+        # not inside the task's directory: root does not write where the task's user can
+        # plant a link, and a task does not get to edit the script that starts it
+        fd, script_path = tempfile.mkstemp(dir=_locked_dir("wrappers", 0o755),
+                                           prefix="task-", suffix="-" + script_name)
+        with os.fdopen(fd, "w") as f:
+            f.write(script_content)
+        os.chmod(script_path, 0o755)
+        return script_path
     script_path = os.path.join(work_dir, script_name)
     with open(script_path, 'w') as f:
         f.write(script_content)
@@ -836,7 +1042,8 @@ def _spawn_task_process(script_path: str, work_dir: str, is_offline: bool) -> su
         text=True,
         bufsize=0,  # Unbuffered to catch output immediately
         preexec_fn=os.setsid,
-        env=env,
+        env=_workload_env(env),
+        **_workload_popen(),
     )
 
 def _make_reader(tid: Optional[str], get_info, proxy_label: str = ""):
@@ -936,7 +1143,7 @@ async def extract_and_run(pkg: str, task: str, tid: str, keep: bool = True) -> A
 
 
 async def _extract_and_run(pkg: str, task: str, tid: str) -> AsyncGenerator[bytes, None]:
-    tmp = tempfile.mkdtemp()
+    tmp = _new_task_dir()
     if tid:
         with running_tasks_lock:
             running_tasks[tid] = {
@@ -1040,6 +1247,10 @@ async def _extract_and_run(pkg: str, task: str, tid: str) -> AsyncGenerator[byte
     # ULTIMATE FIX: Use script to capture ALL command output including shell setup
     # This wrapper script captures even the initial pixi command output AND the program output
     script_path = await asyncio.to_thread(_write_task_wrapper, tmp, task, "run_wrapper.sh")
+    if workload is not None:
+        # unpacked by the server; from here on it is the workload user's (handed over once,
+        # before that user has been inside it)
+        await asyncio.to_thread(workload.hand_over, tmp)
 
     # Enhanced process startup with offline mode logging
     if is_offline:
@@ -1122,7 +1333,9 @@ async def _extract_and_run(pkg: str, task: str, tid: str) -> AsyncGenerator[byte
     print(f"🏁 Task {status} ({deployment_type} deployment)")
     
     # NEW: Capture and log the complete task output from the log file
-    if info and tid:
+    if info and tid and workload is None:
+        # (with a workload user the directory is theirs: root does not read a file there that
+        # could by now be a link to anything; the output was captured from the pipe already)
         temp_dir = info.get("temp_dir")
         if temp_dir:
             task_log_file = os.path.join(temp_dir, "task_output.log")
@@ -1601,7 +1814,10 @@ class _Guard:
         path = scope["path"]
         refusal = None
         status = 403
-        if not auth_settings.enabled:
+        if path not in _NO_TOKEN_PATHS and _held():
+            refusal, status = ("this box is still being closed down to its network policy; "
+                               "it takes requests once that is in force"), 503
+        elif not auth_settings.enabled:
             refusal = _browser_refusal(headers)
         elif scope["type"] == "http" and path not in _NO_TOKEN_PATHS:
             # the token first: a caller without one never gets a byte of body read or spooled
@@ -1620,7 +1836,7 @@ class _Guard:
         if refusal is None:
             return await self.inner(scope, receive, send)
         if scope["type"] == "websocket":
-            return await send({"type": "websocket.close", "code": 4403})
+            return await send({"type": "websocket.close", "code": 4503 if status == 503 else 4403})
         body = json.dumps({"detail": refusal}).encode()
         await send({"type": "http.response.start", "status": status, "headers": [
             (b"content-type", b"application/json"),
@@ -2515,7 +2731,7 @@ async def redeploy_task(
     print(f"🔄 Redeploying task {tid}: {old_deployment_type} → {new_deployment_type}")
 
     # new temp dir for code
-    new_dir = tempfile.mkdtemp()
+    new_dir = _new_task_dir()
     tar_path = os.path.join(new_dir, "pkg.tar")
     shutil.move(temp_tar.name, tar_path)
 
@@ -2539,6 +2755,8 @@ async def redeploy_task(
 
     # start new process with enhanced offline support
     script_path = await asyncio.to_thread(_write_task_wrapper, new_dir, task_name, "redeploy_wrapper.sh")
+    if workload is not None:
+        await asyncio.to_thread(workload.hand_over, new_dir)
 
     proc = _spawn_task_process(script_path, new_dir, new_is_offline)
     with running_tasks_lock:
@@ -2825,8 +3043,11 @@ async def exec_command(request: Request, auth: bool = Depends(verify_authenticat
         argv = list(cmd)
     else:
         raise HTTPException(status_code=400, detail="cmd must be a non-empty string or list")
-    cwd = _workspace_path(data.get("cwd") or ".")
-    cwd.mkdir(parents=True, exist_ok=True)
+    if workload is not None:
+        cwd = pathlib.Path((await _workload_fs("mkdir", data.get("cwd") or ".")).decode())
+    else:
+        cwd = _workspace_path(data.get("cwd") or ".")
+        cwd.mkdir(parents=True, exist_ok=True)
     extra_env = data.get("env") or {}
     if not isinstance(extra_env, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in extra_env.items()):
@@ -2879,9 +3100,9 @@ def _start_exec_process(tid: str, info: dict) -> None:
     """(Re)start a background command; its stdout and stderr land in the task's output."""
     spec = info["exec"]
     proc = subprocess.Popen(
-        spec["argv"], cwd=spec["cwd"], env={**os.environ, **spec["env"]},
+        spec["argv"], cwd=spec["cwd"], env=_workload_env({**os.environ, **spec["env"]}),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE,
-        text=True, bufsize=1, start_new_session=True)
+        text=True, bufsize=1, start_new_session=True, **_workload_popen())
     with running_tasks_lock:
         info.update({"process": proc, "status": "running", "started_at": time.time(),
                      "exit_code": None, "output_lines": deque(maxlen=OUTPUT_LINES_MAX),
@@ -2903,10 +3124,10 @@ async def _exec_stream(argv, cwd, env, timeout, stdin):
     started = time.time()
     try:
         proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=str(cwd), env=env,
+            *argv, cwd=str(cwd), env=_workload_env(env),
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True)
+            start_new_session=True, **_workload_popen())
     except (FileNotFoundError, PermissionError) as exc:
         yield send_frame((json.dumps({"exit_code": 127, "status": "failed",
                                       "error": str(exc)}) + "\n").encode())
@@ -2971,6 +3192,9 @@ async def _exec_stream(argv, cwd, env, timeout, stdin):
 @app.put("/files")
 async def put_file(request: Request, path: str, auth: bool = Depends(verify_authentication)):
     """Write a file (parents created). Atomic: readers never see a half-written file."""
+    if workload is not None:
+        data = await _body_bytes(request, FILE_MAX_BYTES)
+        return Response(await _workload_fs("write", path, data), media_type="application/json")
     target = _workspace_path(path)
     if target == _workspace_root():
         raise HTTPException(status_code=400, detail="path names the workspace itself")
@@ -2990,6 +3214,8 @@ async def put_file(request: Request, path: str, auth: bool = Depends(verify_auth
 
 @app.get("/files")
 async def get_file(path: str, auth: bool = Depends(verify_authentication)):
+    if workload is not None:
+        return _sealed_response(await _workload_fs("read", path), "application/octet-stream")
     target = _workspace_path(path)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="no such file")
@@ -3001,6 +3227,8 @@ async def get_file(path: str, auth: bool = Depends(verify_authentication)):
 
 @app.get("/files/list")
 async def list_files(path: str = ".", auth: bool = Depends(verify_authentication)):
+    if workload is not None:
+        return _sealed_response(await _workload_fs("list", path), "application/json")
     target = _workspace_path(path)
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="no such directory")
@@ -3021,6 +3249,8 @@ async def list_files(path: str = ".", auth: bool = Depends(verify_authentication
 
 @app.delete("/files")
 async def delete_file(path: str, auth: bool = Depends(verify_authentication)):
+    if workload is not None:
+        return Response(await _workload_fs("delete", path), media_type="application/json")
     target = _workspace_path(path)
     if target == _workspace_root():
         raise HTTPException(status_code=400, detail="refusing to delete the workspace")
@@ -3089,16 +3319,22 @@ async def pty_session(ws: WebSocket):
     try:
         cols = int(ws.query_params.get("cols") or 120)
         rows = int(ws.query_params.get("rows") or 32)
-        cwd = _workspace_path(ws.query_params.get("cwd") or ".")
+        if workload is not None:
+            cwd = pathlib.Path((await _workload_fs(
+                "mkdir", ws.query_params.get("cwd") or ".")).decode())
+        else:
+            cwd = _workspace_path(ws.query_params.get("cwd") or ".")
+            cwd.mkdir(parents=True, exist_ok=True)
     except (ValueError, HTTPException):
         await ws.close(code=4400)
         return
-    cwd.mkdir(parents=True, exist_ok=True)
     master, slave = _pty.openpty()
     _set_winsize(master, cols, rows)
-    env = {**os.environ, "TERM": "xterm-256color", "HOME": os.environ.get("HOME", "/root")}
+    env = _workload_env({**os.environ, "TERM": "xterm-256color",
+                         "HOME": os.environ.get("HOME", "/root")})
     proc = subprocess.Popen(["/bin/bash", "-l"], stdin=slave, stdout=slave, stderr=slave,
-                            cwd=str(cwd), env=env, start_new_session=True, close_fds=True)
+                            cwd=str(cwd), env=env, start_new_session=True, close_fds=True,
+                            **_workload_popen())
     os.close(slave)
     os.set_blocking(master, False)
     loop = asyncio.get_running_loop()
@@ -3294,6 +3530,16 @@ if __name__ == "__main__":
                     help="Require a JWT claim to equal VALUE (repeatable), e.g. tenant=42")
     p.add_argument("--require-exp", action="store_true",
                     help="Refuse tokens without an 'exp' claim")
+    p.add_argument("--revocation-max-age", type=float, metavar="SECONDS",
+                    help="With --revoked-jti-file: refuse every token when the file has not "
+                         "been rewritten or touched for this long (default: no limit)")
+    p.add_argument("--run-as", metavar="USER", default=os.environ.get("RIXI_RUN_AS") or None,
+                    help="Run everything callers start (tasks, commands, the terminal) and do "
+                         "all file access as USER, not as the server's own user. With the "
+                         "server as root, callers then cannot touch what the server guards")
+    p.add_argument("--hold-until", metavar="PATH",
+                    help="Answer only /health until PATH exists (a box with a network policy "
+                         "is opened by its agent once the policy is in force)")
     p.add_argument("--single-use-tokens", action="store_true",
                     help="Accept each token once (by its jti; needs jti and exp). For clients "
                          "that sign a fresh token per request: one seen on the wire cannot be "
@@ -3355,7 +3601,25 @@ if __name__ == "__main__":
 
     max_upload_bytes = args.max_upload_mb * 1024 * 1024
     bind_host = args.host
+    hold_path = args.hold_until
+    if args.revocation_max_age is not None:
+        if not args.revoked_jti_file:
+            raise SystemExit("ERROR: --revocation-max-age needs --revoked-jti-file")
+        auth_settings.revocation_max_age = args.revocation_max_age
     WORKSPACE_ROOT = args.workspace
+    if args.run_as:
+        workload = Workload(args.run_as)
+        os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+        if workload.switch:
+            # the workspace is the user's; only its top is changed here (what is inside was
+            # put there by the user, or by a volume's own filesystem)
+            os.chown(WORKSPACE_ROOT, workload.uid, workload.gid)
+            shutil.rmtree(os.path.join(LOCKED_BASE, "wrappers"), ignore_errors=True)
+            _locked_dir("tasks", 0o711)
+            _locked_dir("wrappers", 0o755)
+        print(f"👤 Workloads run as {workload.name} (uid {workload.uid}), not as the server")
+    if hold_path and not os.path.exists(hold_path):
+        print(f"⏸️  Holding: only /health answers until {hold_path} exists")
     PREVIEW_DOMAIN = args.preview_domain
     SERVER_PORT = args.port
 

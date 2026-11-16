@@ -66,6 +66,17 @@ def _hash(secret: str) -> str:
     return hashlib.sha256(secret.encode()).hexdigest()
 
 
+WORKLOAD_USER = "rixi"      # who the tenant's code is on a box with unprivileged workloads
+UNPRIVILEGED_SINCE = (0, 17, 1)     # the first box release that knows RIXI_RUN_AS
+
+
+def _ref_at_least(ref: str, version: tuple) -> bool:
+    """Whether the release boxes install is at least `version`. A ref that is not a release
+    tag (a branch, a commit) is the operator's own choice and is taken to be new enough."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", ref or "")
+    return m is None or tuple(int(x) for x in m.groups()) >= version
+
+
 class DirectService:
     def __init__(self, cfg: DirectConfig, store: Store, providers: Dict[str, object], dns,
                  authorize: Optional[Callable[[dict], tuple]] = None, audit=None,
@@ -192,7 +203,10 @@ class DirectService:
               policy: Optional[dict] = None, llm: Optional[dict] = None,
               volumes: Optional[List[str]] = None, on_idle: str = "release",
               require: Optional[dict] = None, among: Optional[List[str]] = None,
-              storage: Optional[dict] = None) -> Box:
+              storage: Optional[dict] = None, unprivileged: bool = False) -> Box:
+        """`unprivileged`: what the tenant runs on the box is an ordinary user's, not root's.
+        The tenant gives up installing system packages; in return a revoked token is really
+        out, and the box's own credentials and controls are out of its workloads' reach."""
         tenant = caller.tenant
         if not tenant or not _TENANT.match(tenant):
             raise Denied("token carries no usable tenant claim", 403)
@@ -231,6 +245,16 @@ class DirectService:
             raise Denied("idle_timeout must be a number of seconds, or null for none", 400)
         if ssh_key and not cloudinit.valid_ssh_key(ssh_key):
             raise Denied("ssh_key is not an OpenSSH public key", 400)
+        if not isinstance(unprivileged, bool):
+            raise Denied("unprivileged must be true or false", 400)
+        if unprivileged and not _ref_at_least(self.cfg.rixi_ref, UNPRIVILEGED_SINCE):
+            # an older box would ignore the setting and run everything as root, silently
+            raise Denied("boxes install rixi %s, which cannot run workloads unprivileged "
+                         "(needs v%d.%d.%d or later)" % ((self.cfg.rixi_ref,) + UNPRIVILEGED_SINCE),
+                         400)
+        if unprivileged and ssh_key:
+            raise Denied("a box with unprivileged workloads takes no SSH key: the login user "
+                         "can become root, which is what it is there to rule out", 400)
         if serve is not None:
             kind = str(serve.get("kind") or "ollama")
             if kind not in self.SERVE_KINDS:
@@ -313,13 +337,16 @@ class DirectService:
                           serve_model=serve["model"] if serve else None,
                           policy=None if net.is_default else json.dumps(net.to_dict()),
                           volumes=json.dumps([v.id for v in vols]) if vols else None,
-                          on_idle=on_idle,
+                          on_idle=on_idle, unprivileged=1 if unprivileged else 0,
                           stopped_eur_per_hour=round(disk_gb * self.cfg.volume_eur_per_gb_hour, 6))
                 try:
                     user_data = cloudinit.render(
                         self.cfg, box_id=box_id, tenant=tenant, hostname=box.hostname,
                         box_secret=secret, ssh_key=ssh_key, serve=serve, llm=llm,
-                        volumes=[(v.provider_id, v.name) for v in vols], s3=s3)
+                        volumes=[(v.provider_id, v.name) for v in vols], s3=s3,
+                        hold=not net.is_default,
+                        run_as=WORKLOAD_USER if unprivileged else None,
+                        revocation_max_age=self.cfg.revocation_max_age)
                 except ValueError as exc:
                     raise Denied(f"the box cannot be set up: {exc}", 400)
                 self.store.insert(box)

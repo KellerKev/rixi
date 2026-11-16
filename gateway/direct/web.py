@@ -1,7 +1,8 @@
 """HTTP API for direct mode, on websaw-ng.
 
     GET    /api/templates                 what can be claimed, with prices
-    POST   /api/boxes                     claim a box   {template, zone?, ttl?, idle_timeout?, ssh_key?}
+    POST   /api/boxes                     claim a box   {template, zone?, ttl?, idle_timeout?, ssh_key?,
+                                                         unprivileged?}
     GET    /api/boxes                     your tenant's boxes (admin: all, or ?tenant=)
     GET    /api/boxes/<id>
     DELETE /api/boxes/<id>                release it now
@@ -199,7 +200,8 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
                           idle_timeout=_num(body, "idle_timeout", default=-1, allow_null=True),
                           ssh_key=_str(body, "ssh_key"), serve=serve, policy=policy, llm=llm,
                           volumes=volumes, on_idle=_str(body, "on_idle") or "release",
-                          require=require, among=among, storage=storage)
+                          require=require, among=among, storage=storage,
+                          unprivileged=body.get("unprivileged", False))
         out = box.public(svc.clock())
         key = getattr(box, "endpoint_key", None)
         if key:

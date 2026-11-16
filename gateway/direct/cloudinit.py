@@ -22,6 +22,7 @@ def valid_ssh_key(key: str) -> bool:
     return bool(_SSH_KEY.match(key.strip()))
 
 
+_USER = re.compile(r"[a-z_][a-z0-9_-]{0,30}")
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,100}$")
 
 
@@ -69,7 +70,11 @@ def valid_llm(llm: dict) -> bool:
 def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_secret: str,
            ssh_key: Optional[str] = None, serve: Optional[dict] = None,
            llm: Optional[dict] = None, volumes: Optional[list] = None,
-           s3: Optional[dict] = None) -> str:
+           s3: Optional[dict] = None, hold: bool = False, run_as: Optional[str] = None,
+           revocation_max_age: Optional[float] = None) -> str:
+    """`hold`: the box has a network policy, so its API stays shut until the gateway has put
+    the policy on its firewall and called it ready. `run_as`: what callers start on the box
+    belongs to that user, not to root, so it cannot touch what the box guards."""
     env = {
         "RIXI_BOX_ID": box_id,
         "RIXI_TENANT": tenant,
@@ -80,6 +85,14 @@ def render(cfg: DirectConfig, *, box_id: str, tenant: str, hostname: str, box_se
         "RIXI_REF": cfg.rixi_ref,
         "RIXI_REPO": cfg.rixi_repo,
     }
+    if hold:
+        env["RIXI_HOLD"] = "1"
+    if run_as:
+        if not _USER.fullmatch(run_as) or run_as == "root":
+            raise ValueError("not a usable user name")
+        env["RIXI_RUN_AS"] = run_as
+        if revocation_max_age:
+            env["RIXI_REVOCATION_MAX_AGE"] = str(int(revocation_max_age))
     if cfg.acme_email:
         env["RIXI_ACME_EMAIL"] = cfg.acme_email
     if cfg.acme_ca:

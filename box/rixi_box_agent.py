@@ -108,6 +108,7 @@ def write_revoked(path: str, jtis) -> None:
     try:
         with open(path) as f:
             if f.read() == body:
+                os.utime(path)      # confirmed just now: the server may ask how fresh it is
                 return
     except FileNotFoundError:
         pass
@@ -159,6 +160,23 @@ def beat(env: dict) -> dict:
         return json.loads(r.read() or b"{}")
 
 
+def open_when_ready(env: dict, resp: dict) -> bool:
+    """A box with a network policy keeps its API shut until the gateway calls it ready — which
+    it does only once the policy is on the box's firewall. Then this creates the file the
+    server waits for (see rixi_server --hold-until). Returns whether the box is open."""
+    if env.get("RIXI_HOLD") != "1":
+        return True
+    path = env.get("RIXI_READY_FILE", "/etc/rixi/ready")
+    if os.path.exists(path):
+        return True
+    if resp.get("state") != "ready":
+        return False
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    os.close(fd)
+    print("rixi-box-agent: the box is ready; its API is open", flush=True)
+    return True
+
+
 def main() -> None:
     env = dict(os.environ)
     for key in ("RIXI_BOX_ID", "RIXI_BOX_SECRET", "RIXI_HEARTBEAT_URL", "RIXI_HOSTNAME"):
@@ -170,6 +188,7 @@ def main() -> None:
         try:
             resp = beat(env)
             write_revoked(revoked_path, resp.get("revoked_jti", []))
+            open_when_ready(env, resp)
         except urllib.error.HTTPError as exc:
             print(f"rixi-box-agent: heartbeat refused: {exc.code}", file=sys.stderr, flush=True)
         except Exception as exc:
