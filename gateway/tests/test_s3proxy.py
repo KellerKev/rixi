@@ -969,3 +969,17 @@ def test_the_access_log_leaves_out_signatures_and_share_tokens():
     assert redact("/b/k?X-Amz-Signature=abc&X-Amz-Credential=K") == "/b/k?-"
     assert redact("/s/Zm9vYmFy") == "/s/-" and redact("/s/Zm9vYmFy?x=1") == "/s/-?-"
     assert redact("/api/buckets") == "/api/buckets"
+    # the gateway's own API keeps its queries; a share token goes there too
+    assert redact("/api/usage?since=17&tenant=a1", queries=False) == "/api/usage?since=17&tenant=a1"
+    assert redact("/s/Zm9vYmFy?x=1", queries=False) == "/s/-?x=1"
+    import io
+    import logging
+    import logging.config
+
+    from gateway.direct.accesslog import log_config
+    logging.config.dictConfig(log_config(queries=False))
+    log, buf = logging.getLogger("uvicorn.access"), io.StringIO()
+    for h in log.handlers:
+        h.stream = buf
+    log.info('%s - "%s %s HTTP/%s" %d', "1.2.3.4:5", "GET", "/s/SECRET?since=1", "1.1", 302)
+    assert "SECRET" not in buf.getvalue() and "/s/-?since=1" in buf.getvalue()

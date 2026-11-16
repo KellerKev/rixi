@@ -148,6 +148,12 @@ async def provision(args: dict, gateway: Any):
 
     if not module.exists():
         raise RuntimeError(f"unknown provider/module: {provider} ({module})")
+    ref = tvars.get("rixi_ref")
+    if provider != "dummy" and (ref is None or ref in ("main", "master", "HEAD")):
+        # the box installs rixi from that ref as root: a branch is whatever it holds that day
+        print(f"⚠️  {rdef.name if rdef is not None else provider}: boxes install rixi from "
+              f"'{ref or 'main'}', a moving ref — set rixi_ref to a release tag or a commit",
+              flush=True)
     if claim is not None:
         claim.workdir = workdir
         claim.node_id = node_id

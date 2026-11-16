@@ -56,8 +56,12 @@ class Gateway:
                  verifier=None, policy=None, auditor=None,
                  admin_host: str = "127.0.0.1", admin_port: int = 0, kdf_salt: str = "",
                  node_secret: str | None = None, allow_dummy: bool | None = None,
-                 tls_cert: str | None = None, tls_key: str | None = None):
+                 tls_cert: str | None = None, tls_key: str | None = None,
+                 require_node_tokens: bool = False):
         self.secret = secret
+        # Every box must prove a registration token — the ones attached by hand as well (the
+        # operator gets a node's token with --print-node-token and gives it to that box).
+        self.require_node_tokens = require_node_tokens
         # With a certificate the gateway serves wss://: the shared secret keeps strangers out,
         # TLS keeps what crosses the network from others who hold that secret.
         self.tls_cert, self.tls_key = tls_cert, tls_key
@@ -238,7 +242,7 @@ class Gateway:
             # them can take the place of a node that is connected.
             provisioned = node_id.startswith(_PROVISIONED)
             sent = reply.get("node_proof")
-            if provisioned or sent:
+            if provisioned or sent or self.require_node_tokens:
                 token = self.node_token(node_id)
                 if not isinstance(sent, str) or not hmac.compare_digest(
                         sent, node_proof(token, nonce, dialer_nonce)):
@@ -866,6 +870,12 @@ def main():
     ap.add_argument("--node-secret", default=os.getenv("RIXI_GATEWAY_NODE_SECRET"),
                     help="secret the per-box registration tokens are derived from (or "
                          "RIXI_GATEWAY_NODE_SECRET; default: generated once, kept in the state dir)")
+    ap.add_argument("--require-node-tokens", action="store_true",
+                    help="every box must prove a registration token, also the ones you attach "
+                         "by hand (give each its token: see --print-node-token)")
+    ap.add_argument("--print-node-token", metavar="NODE_ID",
+                    help="print the registration token for NODE_ID and exit (pass it to that "
+                         "box's tunnel agent as RIXI_NODE_TOKEN)")
     ap.add_argument("--allow-dummy-provider", action="store_true",
                     help="let clients ask for 'dummy' boxes, which run as processes on this host "
                          "(default: only when --ws-bind is loopback)")
@@ -880,6 +890,10 @@ def main():
     ap.add_argument("--otlp-endpoint", default=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
                     help="OTLP logs endpoint for audit export")
     args = ap.parse_args()
+    if args.print_node_token:
+        print(Gateway("-", "127.0.0.1", 0, node_secret=args.node_secret)
+              .node_token(args.print_node_token))
+        return
     if not args.secret:
         ap.error("a --secret (or RIXI_GATEWAY_SECRET) is required")
     host, _, port = args.ws_bind.rpartition(":")
@@ -910,7 +924,8 @@ def main():
                  verifier=verifier, auditor=auditor, admin_host=admin_host, admin_port=admin_port,
                  node_secret=args.node_secret,
                  allow_dummy=True if args.allow_dummy_provider else None,
-                 tls_cert=args.tls_cert, tls_key=args.tls_key)
+                 tls_cert=args.tls_cert, tls_key=args.tls_key,
+                 require_node_tokens=args.require_node_tokens)
     try:
         asyncio.run(gw.serve())
     except KeyboardInterrupt:

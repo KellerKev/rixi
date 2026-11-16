@@ -464,3 +464,20 @@ def test_the_gateway_serves_tls_when_given_a_certificate(tmp_path):
             await ws_server.wait_closed()
             await _stop_echo(echo)
     asyncio.run(run())
+
+
+def test_boxes_attached_by_hand_can_be_made_to_prove_themselves_too():
+    async def run():
+        async with _Gw() as t:
+            t.gw.require_node_tokens = True
+            await t.agent("my-workstation")                               # no token
+            await t.agent("my-workstation", t.gw.node_token("another-node"))
+            await asyncio.sleep(0.3)
+            assert t.gw.registry.get("my-workstation") is None
+            await t.agent("my-workstation", t.gw.node_token("my-workstation"))
+            assert await _wait(lambda: t.gw.registry.get("my-workstation") is not None)
+    asyncio.run(run())
+    # the operator reads a node's token off the gateway's own secret
+    a = Gateway("-", "127.0.0.1", 0, node_secret="s1").node_token("my-workstation")
+    assert a == Gateway("x", "127.0.0.1", 0, node_secret="s1").node_token("my-workstation")
+    assert a != Gateway("-", "127.0.0.1", 0, node_secret="s2").node_token("my-workstation")

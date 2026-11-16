@@ -275,3 +275,32 @@ def test_the_client_refuses_a_reply_played_back_or_meant_for_another_call():
         with pytest.raises(RuntimeError, match="expected a tool_response"):
             await client.invoke_tool("read_file", path="x")
     asyncio.run(run())
+
+
+def test_a_reply_names_the_request_it_answers():
+    import json
+    rixi_smcp, server, fernet, mac, _ = _replay_server()
+    token = server._issue_token("agent")
+
+    def call(tool):
+        return rixi_smcp._envelope(mac, fernet, "tool_invoke", {
+            "token": token, "tool_name": tool, "parameters": {}}, True)
+
+    async def run():
+        first, second = call("write_file"), call("write_file")
+        answer_to_first = await server.handle_message(first)
+        assert rixi_smcp._decrypt(fernet, answer_to_first)["request_id"] == first["id"]
+        bad = await server.handle_message({**call("write_file"), "signature": "0" * 64})
+        assert rixi_smcp._decrypt(fernet, bad)["error"] == "invalid signature"
+
+        class Swap:                       # somebody in the middle answers with an earlier reply
+            async def send(self, raw):
+                pass
+
+            async def recv(self):
+                return json.dumps(answer_to_first)
+        client = rixi_smcp.SMCPClient(rixi_smcp.SMCPConfig())
+        client._fernet, client._mac_key, client._token, client._ws = fernet, mac, token, Swap()
+        with pytest.raises(RuntimeError, match="answers another request"):
+            await client._rt(second, expect="tool_response")
+    asyncio.run(run())

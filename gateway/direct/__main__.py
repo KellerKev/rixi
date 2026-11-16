@@ -47,7 +47,7 @@ def main() -> None:
     try:
         from .accesslog import log_config
         uvicorn.run(app, host=host or "127.0.0.1", port=int(port), log_level="info",
-                    log_config=log_config())
+                    log_config=log_config(queries=False))
     finally:
         svc.stop(wait=False)
 

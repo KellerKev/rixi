@@ -63,9 +63,28 @@ def _check_ref(ref: str) -> None:
                       f"Pass --rixi-ref with a tag, branch, or commit that exists (e.g. main).")
 
 
+_IP_SERVICES = ("https://api.ipify.org", "https://checkip.amazonaws.com")
+
+
 def _public_ip() -> str:
+    """This machine's public address, for `--allow-from auto`. The answer decides who may reach
+    the box, so it is not taken from one service alone: two must say the same address."""
+    import ipaddress
+
     import requests
-    return requests.get("https://api.ipify.org", timeout=10).text.strip()
+    seen = []
+    for url in _IP_SERVICES:
+        try:
+            ip = requests.get(url, timeout=10).text.strip()
+            ipaddress.ip_address(ip)
+        except (requests.RequestException, ValueError) as exc:
+            raise UpError(f"could not find this machine's public address ({url}: {exc}); "
+                          f"pass --allow-from with your address or range") from exc
+        seen.append(ip)
+    if len(set(seen)) != 1:
+        raise UpError(f"services disagree about this machine's public address ({', '.join(seen)}); "
+                      f"pass --allow-from with your address or range")
+    return seen[0]
 
 
 def _default_ssh_key() -> Optional[str]:

@@ -52,8 +52,31 @@ fi
 
 # ── pixi ─────────────────────────────────────────────────────────────────
 export PIXI_HOME=/opt/pixi
-# a pinned pixi release, not whatever is newest on the day the box boots
-curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION="${PIXI_VERSION:-v0.70.1}" PIXI_NO_PATH_UPDATE=1 bash
+# pixi, pinned: the release archive itself, checked against the hash recorded here — not an
+# installer script fetched and run as root on the day the box boots.
+PIXI_VERSION="${PIXI_VERSION:-v0.70.1}"
+install_pixi() {  # $1 = the directory the pixi binary goes into
+  local arch sum tmp
+  case "$(uname -m)" in
+    x86_64|amd64)  arch=x86_64-unknown-linux-musl
+                   sum=09692fb29be000cde10ad3fbf61edb1d147cfb6ad539d365a573408615b774d1 ;;
+    aarch64|arm64) arch=aarch64-unknown-linux-musl
+                   sum=304c81982b14780230ca9fed6e9796ddc268c41a8883a27219595d57871ccd2c ;;
+    *) echo "pixi: unsupported architecture $(uname -m)" >&2; return 1 ;;
+  esac
+  # another release has another hash: say which
+  [ "$PIXI_VERSION" = "v0.70.1" ] || sum="${PIXI_SHA256:?set PIXI_SHA256 to the hash of pixi $PIXI_VERSION for this architecture}"
+  tmp="$(mktemp -d)"
+  curl -fsSL --retry 5 -o "$tmp/pixi.tar.gz" \
+    "https://github.com/prefix-dev/pixi/releases/download/$PIXI_VERSION/pixi-$arch.tar.gz"
+  echo "$sum  $tmp/pixi.tar.gz" | sha256sum -c - >/dev/null \
+    || { echo "pixi: the download does not match its recorded hash — not installing it" >&2; rm -rf "$tmp"; return 1; }
+  mkdir -p "$1"
+  tar -xzf "$tmp/pixi.tar.gz" -C "$1" pixi
+  chmod 755 "$1/pixi"
+  rm -rf "$tmp"
+}
+install_pixi /opt/pixi/bin
 PIXI=/opt/pixi/bin/pixi
 "$PIXI" --version
 

@@ -595,3 +595,22 @@ def test_a_box_is_reached_over_tls_with_its_own_certificate_and_no_other(tmp_pat
         stop()
     with pytest.raises(ValueError, match="https"):
         Client("http://127.0.0.1:9000", tls_cert=cert)
+
+
+def test_allow_from_auto_takes_an_address_only_when_two_services_agree(monkeypatch):
+    import requests
+    answers = {}
+
+    class R:
+        def __init__(self, text):
+            self.text = text
+    monkeypatch.setattr(requests, "get", lambda url, timeout=10: R(answers[url]))
+    a, b = up_mod._IP_SERVICES
+    answers.update({a: "198.51.100.7\n", b: "198.51.100.7"})
+    assert up_mod._public_ip() == "198.51.100.7"
+    answers[b] = "203.0.113.9"                               # one of them is wrong, or lying
+    with pytest.raises(up_mod.UpError, match="disagree"):
+        up_mod._public_ip()
+    answers.update({a: "0.0.0.0/0", b: "0.0.0.0/0"})         # not an address at all
+    with pytest.raises(up_mod.UpError, match="could not find"):
+        up_mod._public_ip()

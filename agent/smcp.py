@@ -205,6 +205,14 @@ class SMCPClient:
             raise RuntimeError(f"smcp: server reply refused: {stale}")
         if expect and resp.get("type") not in (expect, "error"):
             raise RuntimeError(f"smcp: expected a {expect} reply, got {resp.get('type')!r}")
+        # … and the answer to THIS request, when the server says which one it answers (a rixi
+        # server does; one that does not is still held to the checks above)
+        try:
+            inner = _decrypt(self._fernet, resp) if self._fernet is not None else resp.get("payload")
+        except Exception:
+            inner = None
+        if isinstance(inner, dict) and inner.get("request_id") not in (None, "", msg.get("id")):
+            raise RuntimeError("smcp: the reply answers another request")
         return resp
 
     async def connect(self) -> None:
@@ -434,17 +442,27 @@ class SMCPToolServer:
         ``fed`` is the per-connection FederationReceiver (created by
         _conn_handler); when federation is enabled it carries the connection's
         ECDH sessions and proof-nonce cache."""
+        # Every answer names the request it answers (inside the signed, sealed payload), so a
+        # client can tell it from an answer to some other request.
+        rid = str(raw.get("id") or "")
+
+        def reply(mtype: str, payload: dict, encrypt: bool = True) -> dict:
+            return self._reply(mtype, {**payload, "request_id": rid}, encrypt)
+
+        def error(detail: str) -> dict:
+            return self._reply("error", {"error": detail, "request_id": rid}, True)
+
         if not _verify_signature(self._mac_key, raw):
-            return self._error("invalid signature")
+            return error("invalid signature")
         stale = self._seen.fresh(raw)
         if stale:
-            return self._error(stale)
+            return error(stale)
 
         mtype = raw.get("type")
         try:
             inner = _decrypt(self._fernet, raw) if raw.get("encrypted") else (raw.get("payload") or {})
         except Exception:
-            return self._error("could not decrypt payload")
+            return error("could not decrypt payload")
         if not isinstance(inner, dict):
             inner = {}
 
@@ -453,12 +471,12 @@ class SMCPToolServer:
             # (2.x/4.x) rather than silently accepting it. A future 3.x still interoperates.
             client_version = str(inner.get("protocol_version", PROTOCOL_VERSION))
             if _protocol_major(client_version) != _protocol_major(PROTOCOL_VERSION):
-                return self._error(
+                return error(
                     f"unsupported protocol version {client_version!r} "
                     f"(server requires major {_protocol_major(PROTOCOL_VERSION)})")
             # Mutual auth: echo the client's nonce so it can confirm the server holds the shared secret
             # and is answering THIS handshake (not a replay).
-            return self._reply("handshake", {
+            return reply("handshake", {
                 "node_id": self.node_id,
                 "protocol_version": PROTOCOL_VERSION,
                 "capabilities_count": len(self.tools),
@@ -469,19 +487,19 @@ class SMCPToolServer:
         if mtype == "auth":
             agent = self._resolve_agent(str(inner.get("api_key", "")))
             if agent is None:
-                return self._error("Authentication failed")
-            return self._reply("auth", {"status": "success",
+                return error("Authentication failed")
+            return reply("auth", {"status": "success",
                                         "token": self._issue_token(agent),
                                         "expires_in": 3600})
 
         if mtype == "capability_discovery":
             if not self._valid_token(str(inner.get("token", ""))):
-                return self._error("Unauthorized")
-            return self._reply("capability_discovery", {"capabilities": self.capabilities()})
+                return error("Unauthorized")
+            return reply("capability_discovery", {"capabilities": self.capabilities()})
 
         if mtype == "tool_invoke":
             if not self._valid_token(str(inner.get("token", ""))):
-                return self._error("Unauthorized")
+                return error("Unauthorized")
             name = str(inner.get("tool_name", ""))
             params = inner.get("parameters", {})
 
@@ -489,30 +507,30 @@ class SMCPToolServer:
             # handled before normal tool dispatch when federation is enabled.
             if name in ("federated_key_exchange", "federated_forward"):
                 if not self.federation_enabled or fed is None:
-                    return self._error("federation not enabled on this node")
+                    return error("federation not enabled on this node")
                 p = params if isinstance(params, dict) else {}
                 try:
                     if name == "federated_key_exchange":
                         result = fed.key_exchange(p)
                     else:
                         result = fed.forward(p)
-                    return self._reply("tool_response", {"tool_name": name, "result": result, "status": "success"})
+                    return reply("tool_response", {"tool_name": name, "result": result, "status": "success"})
                 except Exception as e:  # noqa: BLE001 - report federation failures over the wire
-                    return self._error(f"federation error: {e}")
+                    return error(f"federation error: {e}")
 
             tool = self.tools.get(name)
             if tool is None:
-                return self._error(f"unknown tool '{name}'")
+                return error(f"unknown tool '{name}'")
             try:
                 handler: ToolHandler = tool["handler"]
                 result = handler(params if isinstance(params, dict) else {})
                 if hasattr(result, "__await__"):
                     result = await result  # type: ignore[assignment]
-                return self._reply("tool_response", {"tool_name": name, "result": result, "status": "success"})
+                return reply("tool_response", {"tool_name": name, "result": result, "status": "success"})
             except Exception as e:  # noqa: BLE001 - report tool failures over the wire
-                return self._error(f"Tool execution failed: {e}")
+                return error(f"Tool execution failed: {e}")
 
-        return self._error(f"unsupported message type: {mtype}")
+        return error(f"unsupported message type: {mtype}")
 
     async def _conn_handler(self, ws):
         # Per-connection federation state (ECDH sessions + proof-nonce cache).

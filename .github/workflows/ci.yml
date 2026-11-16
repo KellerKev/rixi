@@ -15,8 +15,8 @@ jobs:
     name: Ruff lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.13"
       - name: Install ruff
@@ -28,7 +28,7 @@ jobs:
     name: ShellCheck scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
       - name: ShellCheck all shell scripts
         run: shellcheck install-rixi.sh bootstrap.sh provision-scaleway-gpu.sh docker-entrypoint.sh
 
@@ -36,8 +36,8 @@ jobs:
     name: Byte-compile sources
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.13"
       - name: Compile all Python sources
@@ -47,8 +47,8 @@ jobs:
     name: SDK unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.13"
       - name: Install package (editable) + dev deps
@@ -62,11 +62,11 @@ jobs:
     name: TypeScript SDK
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.13"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020   # v4
         with:
           node-version: "22"
       - name: Install the server (the tests run against a real one)
@@ -82,7 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15     # the suite takes ~30s; a hang should fail fast, not run for 6 hours
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
       - uses: prefix-dev/setup-pixi@2058dcd92f5dbe3befd7379ec6a3022bb746bdfd   # v0.8.0, by commit: a tag can be moved
         with:
           manifest-path: gateway/pixi.toml
@@ -94,8 +94,8 @@ jobs:
     name: Metaflow @rixi extension tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.13"
       - name: Install the rixi SDK + the metaflow extension
@@ -109,7 +109,7 @@ jobs:
     name: Agent tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
       - uses: prefix-dev/setup-pixi@2058dcd92f5dbe3befd7379ec6a3022bb746bdfd   # v0.8.0, by commit: a tag can be moved
         with:
           manifest-path: agent/pixi.toml
@@ -121,8 +121,8 @@ jobs:
     name: Client, proxy and tunnel tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.13"
       - name: Install what the components need
@@ -134,8 +134,8 @@ jobs:
     name: Install the way users do
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
         with:
           python-version: "3.13"
       # rixi is not on PyPI yet, so the documented install is a git URL. Prove that the
