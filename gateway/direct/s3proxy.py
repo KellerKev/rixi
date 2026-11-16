@@ -361,16 +361,34 @@ class Proxy:
         try:
             await self.handle(scope, receive, send, rid, cors)
         except S3Error as e:
+            await self._refusal_cors(cors, origin)
             await self._send_error(send, e.status, e.code, e.message, path, rid, unread["open"])
         except sigv4.SigError as e:
             if getattr(e, "canonical_request", None):
                 log.info("request %s: signature mismatch; canonical request was %r", rid,
                          e.canonical_request)
+            await self._refusal_cors(cors, origin)
             await self._send_error(send, e.status, e.code, e.message, path, rid, unread["open"])
         except Exception:
             log.exception("request %s failed", rid)
+            await self._refusal_cors(cors, origin)
             await self._send_error(send, 500, "InternalError", "We encountered an internal error. "
                                    "Please try again.", path, rid, unread["open"])
+
+    async def _refusal_cors(self, cors: dict, origin: str) -> None:
+        """A refusal may be read by a page of any web origin that some bucket allows, the origins
+        a preflight is answered for. Without this a browser hides the answer and the page can
+        only say "network error", where the reason (the URL expired, the signature does not
+        match) is what its user needs. The error names nothing a client without a browser is
+        not told as well, and a stored object is only ever readable through its own bucket's
+        origins (handle() sets those)."""
+        if not origin or cors.get("origin"):
+            return
+        try:
+            if origin in await self._bucket_origins():
+                cors["origin"] = origin
+        except Exception:        # the refusal itself matters more than who may read it
+            log.debug("could not look up the web origins for a refusal", exc_info=True)
 
     async def _preflight(self, send, origin: str, hdrs: Dict[bytes, bytes], rid: str,
                          methods: str = "GET, HEAD, PUT, POST, DELETE") -> None:

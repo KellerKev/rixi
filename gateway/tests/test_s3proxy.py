@@ -827,6 +827,20 @@ def test_a_tenants_web_origins_may_read_signed_answers_from_that_bucket_only(env
     # without a signature the origin gets nothing
     assert httpx.get(env.endpoint + "/app-cors/f", headers={"origin": APP},
                      verify=False).status_code == 403
+    # a refusal can be read by the page, so it can say why (expired, changed) and not only
+    # "network error"; a page of an origin no bucket allows still learns nothing
+    url = env.storage.presign(A, b.id, "get", "f")["url"]
+    for bad in (url.replace("/f?", "/g?"), env.endpoint + "/app-cors/f", env.endpoint + "/no-such/f"):
+        r = httpx.get(bad, headers={"origin": APP}, verify=False)
+        assert r.status_code == 403 and r.headers["access-control-allow-origin"] == APP
+        assert "<Code>" in r.text
+        r = httpx.get(bad, headers={"origin": "https://elsewhere.example"}, verify=False)
+        assert r.status_code == 403 and "access-control-allow-origin" not in r.headers
+    r = httpx.put(url, content=b"x", headers={"origin": APP}, verify=False)      # a download URL
+    assert r.status_code == 403 and r.headers["access-control-allow-origin"] == APP
+    # what is stored in a bucket that does not allow the origin stays unreadable to its pages
+    r = _do(env, env.storage.presign(A, other.id, "get", "f"), headers={"origin": APP})
+    assert r.status_code == 200 and "access-control-allow-origin" not in r.headers
     env.storage.set_cors(A, b.id, [])
     assert env.store.get_bucket(b.id).cors is None
 
