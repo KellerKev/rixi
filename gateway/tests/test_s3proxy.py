@@ -92,6 +92,7 @@ def env(tmp_path_factory):
     folder = tmp_path_factory.mktemp("s3")
     s3proxy_flush, s3proxy_cache = s3proxy.FLUSH_S, s3proxy.CACHE_S
     s3proxy.FLUSH_S, s3proxy.CACHE_S, s3proxy.WRITE_CACHE_S = 0.1, 0.0, 0.0
+    s3proxy.KEY_CACHE_S = 0.0
     up_port, px_port, plain_port = _free_port(), _free_port(), _free_port()
     cfg = parse({"direct": {
         "box_domain": "run.example.com", "heartbeat_url": "https://gw/hb",
@@ -754,6 +755,10 @@ def test_public_downloads_stop_at_the_monthly_limit_and_when_the_account_cannot_
     r = httpx.get(url, verify=False)
     assert r.status_code == 403 and b"limit" in r.content
     asyncio.run(env.proxy.flush())
+    for _ in range(40):                 # the proxy's own flush may be the one writing them
+        if env.store.get_bucket(b.id).public_bytes == 2000.0:
+            break
+        time.sleep(0.05)
     assert env.store.get_bucket(b.id).public_bytes == 2000.0
 
     b2 = _public_bucket(env, "pub-pay", {"f.bin": b"x"})
@@ -833,3 +838,134 @@ def test_no_page_may_ask_to_read_a_public_file_without_a_key(env):
            "access-control-request-headers": "range"}
     r = httpx.options(f"{env.endpoint}/{b.id}/f.png", headers=pre, verify=False)
     assert r.status_code == 403 and "access-control-allow-origin" not in r.headers
+
+
+# -- what a request may not talk its way around ------------------------------
+def _raw(env, ak, sk, method, path, query="", headers=None, body=b""):
+    """A request signed by hand, so it can carry what an SDK would not send."""
+    from gateway.direct import sigv4
+    host = env.endpoint.split("//")[1]
+    h = sigv4.sign(method, host, path, query, headers or {}, ak, sk, "fr-par",
+                   payload_hash=sigv4.UNSIGNED)
+    h.pop("host")
+    return httpx.request(method, env.endpoint + path + ("?" + query if query else ""),
+                         headers=h, content=body, verify=False)
+
+
+def test_a_presigned_url_cannot_be_given_headers_it_did_not_sign(env):
+    ak, sk = key_for(env, A, "presign-hdr")
+    s3 = client(env, ak, sk)
+    s3.create_bucket(Bucket="ps-up")
+    s3.create_bucket(Bucket="ps-secret")
+    s3.put_object(Bucket="ps-secret", Key="payroll", Body=b"TOPSECRET")
+    put = s3.generate_presigned_url("put_object", Params={"Bucket": "ps-up", "Key": "u/avatar"},
+                                    ExpiresIn=300)
+    for extra in ({"x-amz-copy-source": "/ps-secret/payroll"}, {"x-amz-storage-class": "ONEZONE_IA"},
+                  {"x-amz-meta-note": "1"}, {"x-amz-tagging": "a=b"},
+                  {"x-amz-server-side-encryption-customer-algorithm": "AES256"}):
+        r = httpx.put(put, verify=False, content=b"mine", headers=extra)
+        assert r.status_code == 403 and b"must be signed" in r.content, extra
+    with pytest.raises(ClientError):
+        s3.head_object(Bucket="ps-up", Key="u/avatar")                # nothing was written
+    assert httpx.put(put, verify=False, content=b"mine").status_code == 200
+    assert s3.get_object(Bucket="ps-up", Key="u/avatar")["Body"].read() == b"mine"
+
+
+def test_the_storage_limit_does_not_take_the_requests_word_for_its_size(env):
+    ak, sk = key_for(env, B, "quota-lies")
+    s3 = client(env, ak, sk)
+    s3.create_bucket(Bucket="quota2")
+    s3.put_object(Bucket="quota2", Key="small", Body=b"x" * 1000)
+    b = env.store.find_bucket("t-b", "quota2")
+    body = b"x" * 300_000
+    env.store.update_bucket(b.id, bytes_std=0.9999e9)                 # 100 kB of room left
+    try:
+        assert _raw(env, ak, sk, "PUT", "/quota2/honest", body=body).status_code == 403
+        for lie in ("0", "-1e18", "nan", "1e2"):
+            r = _raw(env, ak, sk, "PUT", "/quota2/lie", body=body,
+                     headers={"x-amz-decoded-content-length": lie})
+            assert r.status_code in (400, 403), lie
+        assert _raw(env, ak, sk, "PUT", "/quota2/copy",
+                    headers={"x-amz-copy-source": "/quota2/small"}).status_code == 200
+        env.store.update_bucket(b.id, bytes_std=0.9999995e9)          # 500 bytes of room left
+        r = _raw(env, ak, sk, "PUT", "/quota2/copy2", headers={"x-amz-copy-source": "/quota2/small"})
+        assert r.status_code == 403 and b"QuotaExceeded" in r.content
+        r = _raw(env, ak, sk, "PUT", "/quota2/part", "partNumber=1&uploadId=u",
+                 headers={"x-amz-copy-source": "/quota2/small",
+                          "x-amz-copy-source-range": "bytes=0-999"})
+        assert r.status_code == 403 and b"QuotaExceeded" in r.content
+        env.store.update_bucket(b.id, bytes_std=5e9)
+        assert _raw(env, ak, sk, "PUT", "/quota2/empty").status_code == 403
+        listed = [o["Key"] for o in s3.list_objects_v2(Bucket="quota2").get("Contents", [])]
+        assert sorted(listed) == ["copy", "small"]
+    finally:
+        env.store.update_bucket(b.id, bytes_std=0.0)
+
+
+def test_a_body_without_a_length_is_cut_off_at_the_storage_limit(env):
+    ak, sk = key_for(env, B, "quota-chunked")
+    s3 = client(env, ak, sk)
+    s3.create_bucket(Bucket="quota3")
+    b = env.store.find_bucket("t-b", "quota3")
+    env.store.update_bucket(b.id, bytes_std=0.9999e9)                 # 100 kB of room left
+
+    def chunks(n):
+        for _ in range(n):
+            yield b"x" * 100_000
+    try:
+        assert _raw(env, ak, sk, "PUT", "/quota3/fits", body=chunks(1)).status_code == 200
+        r = _raw(env, ak, sk, "PUT", "/quota3/long", body=chunks(30))  # 3 MB, said nothing
+        assert r.status_code == 403 and b"QuotaExceeded" in r.content
+        with pytest.raises(ClientError):
+            s3.head_object(Bucket="quota3", Key="long")
+    finally:
+        env.store.update_bucket(b.id, bytes_std=0.0)
+
+
+def test_an_object_is_never_run_as_a_page_of_the_storage_host(env):
+    s3 = client(env, *key_for(env, A, "html"))
+    s3.create_bucket(Bucket="htmlb")
+    s3.put_object(Bucket="htmlb", Key="x.bin", Body=b"<script>alert(1)</script>",
+                  ContentType="text/html")
+    url = s3.generate_presigned_url("get_object", ExpiresIn=300, Params={
+        "Bucket": "htmlb", "Key": "x.bin", "ResponseContentType": "text/html",
+        "ResponseContentDisposition": "inline"})
+    for r in (httpx.get(url, verify=False), httpx.head(
+            s3.generate_presigned_url("head_object", Params={"Bucket": "htmlb", "Key": "x.bin"},
+                                      ExpiresIn=300), verify=False)):
+        assert r.status_code == 200
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert "sandbox" in r.headers["content-security-policy"]
+    r = httpx.get(s3.generate_presigned_url("list_objects_v2", Params={"Bucket": "htmlb"},
+                                            ExpiresIn=300), verify=False)
+    assert r.status_code == 200 and "content-security-policy" not in r.headers
+
+
+def test_what_goes_upstream_is_what_was_judged(env):
+    ak, sk = key_for(env, A, "query")
+    s3 = client(env, ak, sk)
+    s3.create_bucket(Bucket="qpb")
+    s3.create_bucket(Bucket="qpb2")
+    s3.put_object(Bucket="qpb", Key="k", Body=b"1")
+    s3.put_object(Bucket="qpb2", Key="k", Body=b"2")
+    seen = len(env.fake.requests)
+    assert _raw(env, ak, sk, "GET", "/qpb/k", "%58-Amz-Foo=bar").status_code == 200
+    assert "Amz-Foo" not in str(env.fake.requests[seen:])             # dropped, however spelled
+    for q in ("versionId=1;acl", "%61cl", "acl"):
+        assert _raw(env, ak, sk, "GET", "/qpb/k", q).status_code in (400, 501), q
+    real2 = env.store.find_bucket("t-a", "qpb2").real_name
+    for src in ("/qpb/../qpb2/k", f"/qpb/../{real2}/k", "/qpb/%2e%2e/qpb2/k", "/qpb/k?acl",
+                "/qpb/k?versionId=1&x=y"):
+        r = _raw(env, ak, sk, "PUT", "/qpb/copied", headers={"x-amz-copy-source": src})
+        assert r.status_code == 400, src
+    assert _raw(env, ak, sk, "PUT", "/qpb/a/%2e%2e/b", body=b"x").status_code == 400
+    assert _raw(env, ak, sk, "PUT", "/qpb/copied",
+                headers={"x-amz-copy-source": "/qpb2/k"}).status_code == 200
+    assert s3.get_object(Bucket="qpb", Key="copied")["Body"].read() == b"2"
+
+
+def test_the_access_log_leaves_out_signatures_and_share_tokens():
+    from gateway.direct.accesslog import redact
+    assert redact("/b/k?X-Amz-Signature=abc&X-Amz-Credential=K") == "/b/k?-"
+    assert redact("/s/Zm9vYmFy") == "/s/-" and redact("/s/Zm9vYmFy?x=1") == "/s/-?-"
+    assert redact("/api/buckets") == "/api/buckets"

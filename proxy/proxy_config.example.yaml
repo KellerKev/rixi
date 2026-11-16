@@ -30,8 +30,15 @@ cache_max_size: 10000
 cache_ttl_seconds: 7200  # 2 hours
 
 # Security Configuration
-require_api_key: true
-api_key: "${PROXY_API_KEY}"  # Set via environment variable
+# ${NAME} is the environment variable NAME; the proxy refuses to start when it is not set.
+authentication:
+  require_api_key: true
+  api_key: "${PROXY_API_KEY}"
+  # Or (as well): callers present a JWT signed with a shared secret. Tokens must carry `exp`.
+  # jwt:
+  #   enabled: true
+  #   secret_key: "${PROXY_JWT_SECRET}"
+  #   algorithm: "HS256"
 cors_origins:
   - "https://your-frontend-domain.com"
   - "https://api.your-company.com"

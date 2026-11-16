@@ -18,10 +18,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import hmac
 import os
+import re
+import secrets
 import time
 import uuid
+from pathlib import Path
 
 import websockets
 
@@ -31,8 +35,18 @@ from .auth import ANON
 from .claims import Claims
 from .config import load_catalog, load_policy
 from .policy import GlobalPolicy, PolicyEngine, UsageView
-from .protocol import AgentConn, dec, derive_keys, enc, proof
+from .protocol import (TO_DIALER, AgentConn, dec, derive_keys, enc, node_proof, proof,
+                       session_key)
 from .registry import RegisteredNode, Registry
+
+
+# Node ids of boxes the gateway provisions: a claim's one-time token, or a catalog resource.
+_PROVISIONED = ("rxtok_", "res-")
+_PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,40}")
+_PROVIDERS_DIR = Path(__file__).resolve().parent / "provisioning" / "terraform" / "providers"
+# What a client may set on a box it asks for by provider.
+_CLIENT_SPEC = ("instance_type", "region", "server_port", "rixi_ref", "spot", "spot_ttl")
+_SPEC_TEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")     # goes into cloud-init
 
 
 class Gateway:
@@ -40,8 +54,16 @@ class Gateway:
                  local_host: str = "127.0.0.1", public_ws_url: str | None = None,
                  config_path: str | None = None, reap_interval: float = 60.0,
                  verifier=None, policy=None, auditor=None,
-                 admin_host: str = "127.0.0.1", admin_port: int = 0, kdf_salt: str = ""):
+                 admin_host: str = "127.0.0.1", admin_port: int = 0, kdf_salt: str = "",
+                 node_secret: str | None = None, allow_dummy: bool | None = None):
         self.secret = secret
+        # Known to the gateway only: each provisioned box gets a token derived from it, so a box
+        # proves which node it is. (The tunnel secret cannot do that: every box holds it.)
+        self._node_secret = node_secret
+        # The dummy provider runs a "box" as a process on the gateway's own host: for trying
+        # things out on one machine, never for clients of a gateway others can reach.
+        self.allow_dummy = allow_dummy if allow_dummy is not None else \
+            ws_host in ("127.0.0.1", "localhost", "::1")
         self.kdf_salt = kdf_salt            # per-deployment KDF salt (must reach provisioned boxes)
         self.key, self.proof_key = derive_keys(secret, kdf_salt)
         self.ws_host = ws_host
@@ -140,10 +162,52 @@ class Gateway:
             created = st.get("created_at")
             if created:
                 running += rate * (now - created) / 3600.0
-        return UsageView(per_identity_concurrent=per_id,
+        # Boxes asked for by provider (claims) burn money too, and count per owner.
+        boxes: dict = {}
+        for claim in self.claims.list():
+            if claim.status not in ("pending", "active") or claim.expired:
+                continue
+            boxes[claim.owner] = boxes.get(claim.owner, 0) + 1
+            cdef = getattr(claim, "resource", None)
+            itype = (cdef.vars.get("instance_type") if cdef is not None
+                     else claim.spec.get("instance_type"))
+            rate = offerings.price_per_hour(claim.provider, itype) or 0.0
+            burn += rate
+            running += rate * (now - claim.created_at) / 3600.0
+        return UsageView(per_identity_concurrent=per_id, per_identity_boxes=boxes,
                          total_provisions=dict(self._provision_count),
                          fleet_eur_per_hour=round(burn, 6),
                          total_eur_spent=round(self._spent_eur + running, 6))
+
+    # -- who a node is ---------------------------------------------------
+    def _secret_for_nodes(self) -> bytes:
+        if self._node_secret is None:
+            # kept beside the resource state, so reusable boxes still prove themselves after a
+            # gateway restart
+            path = Path(os.getenv("RIXI_STATE_DIR") or (Path.home() / ".rixi")) / "gateway-node.key"
+            try:
+                self._node_secret = path.read_text().strip()
+            except OSError:
+                self._node_secret = secrets.token_urlsafe(48)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(self._node_secret + "\n")
+        return self._node_secret.encode()
+
+    def node_token(self, node_id: str) -> str:
+        """The token a provisioned box is given for its node id (and only that one)."""
+        return hmac.new(self._secret_for_nodes(), b"rixi-node|" + node_id.encode(),
+                        hashlib.sha256).hexdigest()
+
+    def _owner_of(self, conn, client_id: str) -> str:
+        """Who a client is, for what belongs to it: the JWT subject, else its connection's id."""
+        identity = getattr(conn, "identity", ANON)
+        return identity.sub or client_id
+
+    def _may_use_claim(self, conn, client_id: str, claim) -> bool:
+        identity = getattr(conn, "identity", ANON)
+        return self.policy.is_admin(identity) or claim.owner == self._owner_of(conn, client_id)
 
     # -- connection entrypoint -------------------------------------------
     async def _on_agent(self, ws):
@@ -159,8 +223,34 @@ class Gateway:
 
         node_id = str(reply.get("node_id") or uuid.uuid4().hex[:8])
         role = reply.get("role", "server")
-        conn = AgentConn(ws, self.key)
+        dialer_nonce = reply.get("nonce")
+        if not isinstance(dialer_nonce, str) or len(dialer_nonce) < 16 or len(node_id) > 128:
+            return                          # the older tunnel protocol (no connection nonce)
+        token = ""
+        if role != "client":
+            # A provisioned box (a claim token, or a catalog resource's `res-<name>`) must prove
+            # the token the gateway made for that node id; no other holder of the tunnel secret
+            # can. Other names (boxes someone attached by hand) need no token — and none of
+            # them can take the place of a node that is connected.
+            provisioned = node_id.startswith(_PROVISIONED)
+            sent = reply.get("node_proof")
+            if provisioned or sent:
+                token = self.node_token(node_id)
+                if not isinstance(sent, str) or not hmac.compare_digest(
+                        sent, node_proof(token, nonce, dialer_nonce)):
+                    await self._audit(audit_mod.AUTH_DENIED, node_id, "register", decision="deny",
+                                      reason="node did not prove its registration token")
+                    return
+            if node_id.startswith("rxtok_") and self.claims.get(node_id) is None:
+                return                      # a claim nobody made
+            if node_id.startswith("res-") and self._resource_name_for(node_id) is None \
+                    and node_id[4:] not in self.catalog:
+                return                      # a resource nobody defined
+        elif node_id.startswith(_PROVISIONED):
+            return                          # those names are for boxes, not for clients
+        conn = AgentConn(ws, session_key(self.key, nonce, dialer_nonce, token), sends=TO_DIALER)
         conn.identity = ANON
+        conn.node_token_proved = bool(token)
 
         if role == "client":
             # JWT RBAC applies to CLIENTS only; server agents auth by PSK + their claim token.
@@ -192,6 +282,19 @@ class Gateway:
                 return
             await conn.pump_tcp_to_ws(sid, reader)
 
+        existing = self.registry.get(node_id)
+        if existing is not None:
+            if not getattr(conn, "node_token_proved", False) or existing.kind != "server":
+                # the name is taken by a node that is connected: nobody stands in for it
+                print(f"⛔ refused a second registration as '{node_id}'", flush=True)
+                return
+            # the same box, proven by its token, dialling in again before the old connection
+            # was noticed dead: the new connection replaces it
+            self.registry.unregister(node_id, existing.conn)
+            try:
+                await existing.conn.ws.close()
+            except Exception:
+                pass
         local = await asyncio.start_server(on_local, self.local_host, 0)
         port = local.sockets[0].getsockname()[1]
         self.registry.register(RegisteredNode(node_id=node_id, kind="server", identity=node_id,
@@ -205,7 +308,7 @@ class Gateway:
 
         try:
             async for raw in ws:
-                obj = dec(raw, self.key)
+                obj = conn.open(raw)
                 t = obj.get("type")
                 if t == "session_data":
                     await self._on_session_data(conn, obj)
@@ -216,9 +319,12 @@ class Gateway:
         finally:
             await conn.close_all()
             local.close()
-            self.registry.unregister(node_id)
+            replaced = self.registry.get(node_id) is not None and \
+                self.registry.get(node_id).conn is not conn
+            self.registry.unregister(node_id, conn)
             print(f"❌ deregistered server '{node_id}'", flush=True)
-            await self._on_server_gone(node_id)
+            if not replaced:
+                await self._on_server_gone(node_id)
 
     async def _redeem_claim(self, token):
         claim = self.claims.redeem(token, token)
@@ -229,14 +335,18 @@ class Gateway:
 
     # -- client role -----------------------------------------------------
     async def _serve_client(self, ws, conn, node_id, identity=ANON):
-        self.registry.register(RegisteredNode(node_id=node_id, kind="client",
-                                              identity=identity.sub or node_id, conn=conn,
-                                              auth=identity))
+        conn.client_id = node_id
+        if not self.registry.register(RegisteredNode(node_id=node_id, kind="client",
+                                                     identity=identity.sub or node_id, conn=conn,
+                                                     auth=identity)):
+            # a connected node has this name: its `compute_ready` signals stay its own
+            print(f"⛔ refused a second registration as '{node_id}'", flush=True)
+            return
         print(f"✅ registered client '{node_id}'"
               + (f" as '{identity.sub}'" if identity.sub else ""), flush=True)
         try:
             async for raw in ws:
-                obj = dec(raw, self.key)
+                obj = conn.open(raw)
                 t = obj.get("type")
                 if t == "control":
                     await self._handle_control(conn, node_id, obj)
@@ -252,7 +362,7 @@ class Gateway:
             # tear down any bridges this client owned
             for (cid, sid) in [k for k in self._bridges if k[0] == id(conn)]:
                 await self._unbridge(conn, sid)
-            self.registry.unregister(node_id)
+            self.registry.unregister(node_id, conn)
             print(f"❌ deregistered client '{node_id}'", flush=True)
 
     async def _open_routed(self, client_conn, obj):
@@ -264,6 +374,14 @@ class Gateway:
             return
         # per-session policy re-check (deny here closes the session)
         identity = getattr(client_conn, "identity", ANON)
+        claim = self.claims.get(route)
+        if claim is not None and not self._may_use_claim(
+                client_conn, getattr(client_conn, "client_id", ""), claim):
+            # a box somebody asked for is theirs: knowing its name is not enough
+            await self._audit(audit_mod.RES_DENIED, identity.sub or identity.label, "route",
+                              target="claim", decision="deny", reason="not the claim's owner")
+            await client_conn.send({"type": "session_close", "sid": sid})
+            return
         name = self._resource_name_for(route)
         rdef = self.catalog.get(name) if name else None
         decision = self.policy.evaluate(identity, "route", resource=rdef, usage=self._usage())
@@ -329,6 +447,8 @@ class Gateway:
             request = dict(obj.get("tighten") or {})
             if op == "request_compute" and not obj.get("resource"):
                 request["provider"] = obj.get("provider")
+                spec_in = obj.get("spec") if isinstance(obj.get("spec"), dict) else {}
+                request["instance_type"] = spec_in.get("instance_type")
             # For budget caps, don't count the requested resource's own rate in the fleet burn
             # (a reused, already-up box would otherwise be double-counted against the cap).
             usage = self._usage(exclude_resource=obj.get("resource") if op == "request_compute" else None)
@@ -340,10 +460,13 @@ class Gateway:
                 return
 
             if op == "list":
-                result = {"nodes": self.list_nodes()}
+                result = {"nodes": self.list_nodes(conn, client_id)}
             elif op == "route":
                 node = self.registry.get(str(obj.get("node_id", "")))
-                result = {"node_id": obj.get("node_id"), "exists": node is not None and node.kind == "server"}
+                claim = self.claims.get(str(obj.get("node_id", "")))
+                mine = claim is None or self._may_use_claim(conn, client_id, claim)
+                result = {"node_id": obj.get("node_id"),
+                          "exists": mine and node is not None and node.kind == "server"}
             elif op == "request_compute":
                 rname = obj.get("resource")
                 if rname:
@@ -359,8 +482,25 @@ class Gateway:
                     await self._audit(audit_mod.RES_REQUESTED, actor, op, target=rname,
                                       decision="allow", attrs={"reused": result.get("reused")})
                 else:
-                    claim = self.claims.create(client_id, str(obj.get("provider", "dummy")),
-                                               obj.get("spec", {}) or {})
+                    provider = str(obj.get("provider", "dummy"))
+                    if not _PROVIDER_NAME.fullmatch(provider) or not (_PROVIDERS_DIR / provider).is_dir():
+                        raise RuntimeError(f"unknown provider: {provider!r}")
+                    if provider == "dummy" and not self.allow_dummy:
+                        raise RuntimeError("the dummy provider runs boxes on the gateway's own "
+                                           "host and is off (start the gateway with "
+                                           "--allow-dummy-provider to try it out)")
+                    spec = obj.get("spec", {}) or {}
+                    if not isinstance(spec, dict):
+                        raise RuntimeError("spec must be a table")
+                    # only what a client may choose; where the box's software comes from and
+                    # what it dials back to are the gateway's to say
+                    spec = {k: v for k, v in spec.items() if k in _CLIENT_SPEC and
+                            isinstance(v, (str, int, float, bool))}
+                    for k, v in spec.items():
+                        if isinstance(v, str) and not _SPEC_TEXT.fullmatch(v):
+                            raise RuntimeError(f"spec.{k} has characters that are not allowed")
+                    claim = self.claims.create(client_id, provider, spec,
+                                               owner=self._owner_of(conn, client_id))
                     result = {"token": claim.token, "node_id": claim.token, "ttl": claim.ttl}
                     self._provision_count[actor] = self._provision_count.get(actor, 0) + 1
                     asyncio.create_task(self._provision(claim))
@@ -373,7 +513,10 @@ class Gateway:
             elif op == "list_resources":
                 result = {"resources": self.list_resources()}
             elif op == "release":
-                claim = self.claims.release(str(obj.get("token", "")))
+                identity_admin = self.policy.is_admin(identity)
+                claim = self.claims.release(
+                    str(obj.get("token", "")),
+                    owner=None if identity_admin else self._owner_of(conn, client_id))
                 if claim is not None:
                     asyncio.create_task(self._deprovision(claim))
                 result = {"released": claim is not None}
@@ -409,7 +552,9 @@ class Gateway:
             raise RuntimeError(f"unknown resource: {rname}")
         if not rdef.reuse:
             # always-fresh: ride the ephemeral one-time-token claim flow, but resource-driven.
-            claim = self.claims.create(client_id, rdef.provider, {})
+            client = self.registry.get(client_id)
+            claim = self.claims.create(client_id, rdef.provider, {}, owner=self._owner_of(
+                client.conn if client is not None else None, client_id))
             claim.resource = rdef
             claim.security = security
             asyncio.create_task(self._provision(claim))
@@ -618,7 +763,8 @@ class Gateway:
     def reload_policy(self, global_dict: dict):
         """Atomically swap the global policy (admin API). Affects new requests/sessions only."""
         from .config import parse_global_policy
-        self.policy = PolicyEngine(parse_global_policy(global_dict or {}), self.catalog)
+        self.policy = PolicyEngine(parse_global_policy(global_dict or {}, expand=False),
+                                   self.catalog)
 
     # -- lifecycle / control surface -------------------------------------
     async def serve(self):
@@ -656,9 +802,24 @@ class Gateway:
             if self.auditor is not None:
                 await self.auditor.close()
 
-    def list_nodes(self):
-        return [{"node_id": n.node_id, "kind": n.kind, "port": n.port,
-                 "capabilities": n.capabilities} for n in self.registry.list()]
+    def list_nodes(self, conn=None, client_id: str = "", identity=None):
+        """The nodes a caller may know of. A box somebody asked for is named by its claim token,
+        which is what reaches it: only its owner (and an admin) is told. Other clients are not
+        listed to a client at all."""
+        identity = identity if identity is not None else getattr(conn, "identity", ANON)
+        admin = self.policy.is_admin(identity)
+        owner = identity.sub or client_id
+        out = []
+        for n in self.registry.list():
+            if not admin:
+                if n.kind == "client" and n.node_id != client_id:
+                    continue
+                claim = self.claims.get(n.node_id)
+                if claim is not None and claim.owner != owner:
+                    continue
+            out.append({"node_id": n.node_id, "kind": n.kind, "port": n.port,
+                        "capabilities": n.capabilities})
+        return out
 
     async def fire_action(self, name: str, args: dict):
         from . import actions
@@ -680,6 +841,17 @@ def main():
                     help="PEM (file or text) to verify client JWTs for RBAC")
     ap.add_argument("--jwt-jwks-url", default=os.getenv("RIXI_JWT_JWKS_URL"),
                     help="JWKS URL to verify client JWTs for RBAC")
+    ap.add_argument("--jwt-audience", default=os.getenv("RIXI_JWT_AUDIENCE"),
+                    help="only tokens with this `aud` are accepted (set it: without it, any "
+                         "token of the same issuer works here, whatever it was issued for)")
+    ap.add_argument("--jwt-issuer", default=os.getenv("RIXI_JWT_ISSUER"),
+                    help="only tokens with this `iss` are accepted")
+    ap.add_argument("--node-secret", default=os.getenv("RIXI_GATEWAY_NODE_SECRET"),
+                    help="secret the per-box registration tokens are derived from (or "
+                         "RIXI_GATEWAY_NODE_SECRET; default: generated once, kept in the state dir)")
+    ap.add_argument("--allow-dummy-provider", action="store_true",
+                    help="let clients ask for 'dummy' boxes, which run as processes on this host "
+                         "(default: only when --ws-bind is loopback)")
     ap.add_argument("--admin-bind", default=os.getenv("RIXI_ADMIN_BIND", ""),
                     help="management API host:port (e.g. 127.0.0.1:7101); empty = off")
     ap.add_argument("--audit-db", default=os.getenv("RIXI_AUDIT_DB"), help="DuckDB audit file")
@@ -697,7 +869,11 @@ def main():
         pub = open(pub).read()
     if pub or args.jwt_jwks_url:
         from .auth import JwtVerifier
-        verifier = JwtVerifier(public_key_pem=pub, jwks_url=args.jwt_jwks_url)
+        verifier = JwtVerifier(public_key_pem=pub, jwks_url=args.jwt_jwks_url,
+                               audience=args.jwt_audience, issuer=args.jwt_issuer)
+        if not args.jwt_audience:
+            print("⚠️  no --jwt-audience: any token from this issuer is accepted, whatever it "
+                  "was issued for", flush=True)
 
     from .audit import build_auditor
     auditor = build_auditor(json_path=args.audit_log, duckdb_path=args.audit_db,
@@ -710,7 +886,9 @@ def main():
 
     gw = Gateway(args.secret, host or "0.0.0.0", int(port), config_path=args.config, kdf_salt=args.kdf_salt,
                  public_ws_url=args.public_ws_url,
-                 verifier=verifier, auditor=auditor, admin_host=admin_host, admin_port=admin_port)
+                 verifier=verifier, auditor=auditor, admin_host=admin_host, admin_port=admin_port,
+                 node_secret=args.node_secret,
+                 allow_dummy=True if args.allow_dummy_provider else None)
     try:
         asyncio.run(gw.serve())
     except KeyboardInterrupt:

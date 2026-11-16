@@ -1,6 +1,7 @@
 """`rixi up` / `rixi down`: from a cloud API key to a ready, authenticated rixi box — and back.
 
-up:   keygen (ES256 + one-use handshake secret) → create the box (region fallback on stock-outs)
+up:   keygen (ES256, a TLS certificate for the box, a one-use handshake secret) → create the box
+      (region fallback on stock-outs)
       → save the profile (so `rixi down` works even if this process dies) → wait for /health
       → RSA→AES key handshake → network policy (if any) on the box's own firewall → ready.
 down: destroy every resource labeled for the box, then forget the profile.
@@ -19,7 +20,7 @@ from .. import __version__
 from .. import policy as netpolicy
 from . import cloudinit, presets
 from .profiles import (Profile, ProfileError, ProfileStore, _write_private, generate_keypair,
-                       load_credentials, save_credentials, validate_name)
+                       generate_tls_cert, load_credentials, save_credentials, validate_name)
 from .providers import BoxSpec, CapacityError, ProviderError, make_provider
 
 RIXI_PORT = 9000
@@ -144,23 +145,29 @@ def up(*, provider: str, size: str = "sample-cpu", name: Optional[str] = None,
     priv_pem, pub_pem = generate_keypair()
     key_secret = secrets.token_urlsafe(32)
     audience = f"rixi-{name}"
+    # The box serves TLS with a certificate made here; the profile keeps it and trusts only it.
+    tls_key_pem, tls_cert_pem = generate_tls_cert(name)
     user_data = cloudinit.render(rixi_ref=ref, port=RIXI_PORT, audience=audience,
                                  jwt_public_key_pem=pub_pem, key_secret=key_secret,
+                                 tls_cert_pem=tls_cert_pem, tls_key_pem=tls_key_pem,
                                  ssh_public_key=ssh_pub)
     spec = BoxSpec(name=name, instance_type=spec_r.instance_type, user_data=user_data,
-                   gpu=spec_r.gpu, ports=[RIXI_PORT, 22], allow_from=cidrs,
+                   # SSH is opened only when there is a key to log in with
+                   gpu=spec_r.gpu, ports=[RIXI_PORT] + ([22] if ssh_pub else []),
+                   allow_from=cidrs,
                    ssh_public_key=ssh_pub)
 
     price = f" (≈ €{spec_r.eur_per_hour}/h)" if spec_r.eur_per_hour else ""
     echo(f"▶ creating {provider} {spec_r.instance_type}{price} as {name!r} — rixi {ref}")
     box = _create_with_fallback(cloud, spec, spec_r.regions, echo)
 
-    profile = Profile(name=name, provider=provider, server_url=f"http://{box.ip}:{RIXI_PORT}",
+    profile = Profile(name=name, provider=provider, server_url=f"https://{box.ip}:{RIXI_PORT}",
                       ip=box.ip, region=box.region, instance_type=box.instance_type,
                       box_id=box.box_id, audience=audience, rixi_ref=ref,
                       created_at=time.time(), eur_per_hour=spec_r.eur_per_hour)
     try:
         _write_private(profile.dir / "jwt_private.pem", priv_pem)
+        profile.save_tls_cert(tls_cert_pem)
         store.put(profile, make_default=make_default)
         echo(f"✔ box {box.box_id} at {box.ip} ({box.region}) — installing rixi "
              f"(first boot takes a few minutes)…")

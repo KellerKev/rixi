@@ -219,10 +219,13 @@ def parse_resource_policy(d) -> Optional[ResourcePolicy]:
     )
 
 
-def parse_global_policy(d) -> GlobalPolicy:
+def parse_global_policy(d, expand: bool = True) -> GlobalPolicy:
+    """`expand` resolves ${env:…} / ${file:…} placeholders: for the operator's own config file
+    only. A policy that arrives over the API is taken as written — expanding it would let whoever
+    may edit the policy read the gateway's environment and files back out of it."""
     if not d:
         return GlobalPolicy()
-    d = _subst(dict(d))
+    d = _subst(dict(d)) if expand else dict(d)
     roles = {}
     for rname, rd in (d.get("roles", {}) or {}).items():
         rd = dict(rd)

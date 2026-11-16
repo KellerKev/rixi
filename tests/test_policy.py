@@ -47,21 +47,21 @@ def _out(c):
 
 def test_block_keeps_only_what_the_box_needs():
     c = compile_rules(parse({"egress": {"mode": "block"}}), own_ip="51.0.0.7",
-                      control_plane=["65.21.252.62"], resolvers=["51.159.47.28", "127.0.0.53"])
+                      control_plane=["203.0.113.10"], resolvers=["51.159.47.28", "127.0.0.53"])
     assert c.outbound_default == "drop"
     out = _out(c)
     assert ("accept", "UDP", "51.159.47.28/32", 53) in out and ("accept", "TCP", "51.159.47.28/32", 53) in out
-    assert ("accept", "TCP", "65.21.252.62/32", 443) in out          # heartbeats + token keys
+    assert ("accept", "TCP", "203.0.113.10/32", 443) in out          # heartbeats + token keys
     assert ("accept", "TCP", "51.0.0.7/32", 443) in out              # its own TLS self-check
     assert not any(cidr.startswith("127.") for _, _, cidr, _ in out)  # loopback is not a resolver
     accepted = {cidr for action, _, cidr, _ in out if action == "accept"}
-    assert accepted == {"51.159.47.28/32", "65.21.252.62/32", "51.0.0.7/32"}
+    assert accepted == {"51.159.47.28/32", "203.0.113.10/32", "51.0.0.7/32"}
 
 
 def test_allowlist_adds_exactly_the_listed_destinations():
     c = compile_rules(parse({"egress": {"mode": "allowlist",
                                         "allow": ["203.0.113.0/24", "198.51.100.7:443"]}}),
-                      own_ip="51.0.0.7", control_plane=["65.21.252.62"], resolvers=[])
+                      own_ip="51.0.0.7", control_plane=["203.0.113.10"], resolvers=[])
     out = _out(c)
     assert ("accept", "ANY", "203.0.113.0/24", None) in out
     assert ("accept", "TCP", "198.51.100.7/32", 443) in out

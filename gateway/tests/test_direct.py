@@ -616,7 +616,7 @@ BLOCK = {"egress": {"mode": "block"}, "ingress": {"allow": ["192.0.2.0/24"]}}
 
 
 def test_a_policy_is_validated_at_claim_and_gets_a_firewall_of_its_own():
-    svc = _svc(control_plane=["65.21.252.62"])
+    svc = _svc(control_plane=["203.0.113.10"])
     with pytest.raises(Denied, match="not an IP"):
         svc.claim(A, "cpu", policy={"egress": {"mode": "allowlist", "allow": ["example.com"]}})
     plain = svc.claim(A, "cpu")
@@ -630,7 +630,7 @@ def test_a_policy_is_validated_at_claim_and_gets_a_firewall_of_its_own():
 
 
 def test_a_policed_box_is_ready_only_after_its_policy_is_live():
-    svc = _svc(control_plane=["65.21.252.62"])
+    svc = _svc(control_plane=["203.0.113.10"])
     box = svc.claim(A, "cpu", policy=BLOCK)
     _settle(svc)
     secret = _secret_of(svc, box.id)
@@ -647,13 +647,26 @@ def test_a_policed_box_is_ready_only_after_its_policy_is_live():
     allowed = {(r.protocol, r.cidr, r.port_from) for r in compiled.rules
                if r.direction == "outbound" and r.action == "accept"}
     assert ("UDP", "51.159.47.28/32", 53) in allowed
-    assert ("TCP", "65.21.252.62/32", 443) in allowed
+    assert ("TCP", "203.0.113.10/32", 443) in allowed
     assert any(e == "box.policy_applied" for e, _ in svc.events)
     assert svc.heartbeat(box.id, secret, 0, True)["state"] == "ready"
 
 
+def test_the_operators_resolvers_replace_what_the_box_reports():
+    svc = _svc(control_plane=["203.0.113.10"], resolvers=["198.51.100.53"])
+    box = svc.claim(A, "cpu", policy=BLOCK)
+    _settle(svc)
+    secret = _secret_of(svc, box.id)
+    svc.heartbeat(box.id, secret, 0, True, resolvers=["192.0.2.66"])     # the box's own choice
+    _settle(svc)
+    dns = {r.cidr for r in svc.providers["dummy"].firewalls[box.id].rules if r.port_from == 53}
+    assert dns == {"198.51.100.53/32"}
+    with pytest.raises(ConfigError, match="resolvers"):
+        parse(_conf(resolvers=["dns.example.com"]))
+
+
 def test_an_open_policy_needs_no_resolvers():
-    svc = _svc(control_plane=["65.21.252.62"])
+    svc = _svc(control_plane=["203.0.113.10"])
     box = svc.claim(A, "cpu", policy={"ingress": {"allow": ["192.0.2.0/24"]}})
     _settle(svc)
     secret = _secret_of(svc, box.id)
@@ -1073,3 +1086,112 @@ def test_a_box_asked_for_a_zone_stays_there_when_it_is_out_of_stock():
     cur = svc.store.get(box.id)
     assert cur.end_reason == "out_of_stock" and cur.zone == "fr-par-2"
     assert not svc.providers["dummy"].servers
+
+
+# ── what a caller or a box may not talk its way around ──────────────────
+
+def test_a_token_without_a_tenant_sees_nothing_of_anyone():
+    tc, svc, h = _api()
+    tc.post("/api/boxes", json={"template": "cpu"}, headers=h("alice", "t-a"))
+    _settle(svc)
+    _volume(svc)
+    nobody = Caller(sub="new-user", tenant=None)
+    assert svc.usage(nobody, 0) == [] and svc.volume_usage(nobody, 0) == []
+    assert svc.list_volumes(nobody) == [] and svc.list(nobody) == []
+    r = tc.get("/api/usage", headers=h("new-user"))
+    assert r.status_code == 200 and r.json()["usage"] == [] and not r.json().get("volumes")
+    r = tc.get("/api/volumes", headers=h("new-user"))
+    assert r.status_code == 200 and "t-a" not in r.text
+    assert len(tc.get("/api/usage", headers=h("portal", roles=["admin"])).json()["usage"]) == 1
+
+
+def test_a_lifetime_must_be_a_real_number():
+    tc, svc, h = _api()
+    for field in ("ttl", "idle_timeout"):
+        for bad in ("NaN", "Infinity", "-Infinity"):
+            r = tc.post("/api/boxes", content='{"template": "cpu", "%s": %s}' % (field, bad),
+                        headers={**h("alice", "t-a"), "content-type": "application/json"})
+            assert r.status_code == 400, (field, bad)
+    for bad in (float("nan"), float("inf"), 0, -5):
+        with pytest.raises(Denied, match="ttl"):
+            svc.claim(A, "cpu", ttl=bad)
+    with pytest.raises(Denied, match="idle_timeout"):
+        svc.claim(A, "cpu", idle_timeout=float("nan"))
+    assert svc.store.list() == []
+
+
+def test_claims_sent_together_stay_under_the_tenants_limits():
+    from concurrent.futures import ThreadPoolExecutor
+    seen = []
+
+    def authorize(payload):
+        time.sleep(0.05)                                   # a portal that takes a moment
+        seen.append(len(svc.store.list(tenant=payload["tenant"], live_only=True)))
+        return True, ""
+    svc = _svc(authorize=authorize)
+
+    def claim(_):
+        try:
+            return svc.claim(A, "cpu").id
+        except Denied as d:
+            return d.status
+    with ThreadPoolExecutor(8) as pool:
+        got = list(pool.map(claim, range(8)))
+    assert sorted(x for x in got if isinstance(x, int)) == [429] * 6
+    assert len(svc.store.list(tenant="t-a", live_only=True)) == 2      # max_boxes
+    assert seen == [0, 1]                  # the authorizer saw each claim after the one before
+    _settle(svc)
+
+
+def test_a_claim_that_fails_late_gives_back_what_it_took():
+    svc = _svc()
+    v = _volume(svc)
+    for bad in ("a b", "short", "x" * 200, "k\ney=1" + "x" * 20):
+        with pytest.raises(Denied, match="serve.key"):
+            svc.claim(A, "gpu", zone="fr-par-2", volumes=[v.id],
+                      serve={"model": "llama3", "key": bad})
+    assert svc.store.get_volume(v.id).state == "available"
+    # and whatever else goes wrong once the volume is taken
+    real = cloudinit.render
+    cloudinit.render = lambda *a, **kw: (_ for _ in ()).throw(ValueError("no good"))
+    try:
+        with pytest.raises(Denied, match="cannot be set up"):
+            svc.claim(A, "cpu", volumes=[v.id])
+    finally:
+        cloudinit.render = real
+    assert svc.store.get_volume(v.id).state == "available" and svc.store.list() == []
+    box = svc.claim(A, "cpu", volumes=[v.id])
+    _settle(svc)
+    assert svc.store.get_volume(v.id).box_id == box.id
+
+
+def test_a_box_cannot_report_numbers_the_store_cannot_hold():
+    tc, svc, h = _api()
+    box = tc.post("/api/boxes", json={"template": "cpu"}, headers=h("alice", "t-a")).json()
+    _settle(svc)
+    auth = {"Authorization": f"Bearer {_secret_of(svc, box['id'])}"}
+    for field, bad in (("active_tasks", 10 ** 30), ("requests", 10 ** 30), ("requests", -1),
+                       ("active_tasks", 1.5)):
+        r = tc.post("/gw/heartbeat", headers=auth,
+                    json={"box_id": box["id"], "tls_ready": True, field: bad})
+        assert r.status_code == 400, (field, bad)
+    assert tc.post("/gw/heartbeat", headers=auth, json={
+        "box_id": box["id"], "resolvers": ["1.1.1.1"] * 9}).status_code == 400
+    for _ in range(4):
+        assert tc.post("/gw/heartbeat", headers=auth, json={
+            "box_id": box["id"], "tls_ready": True, "requests": 10 ** 9}).status_code == 200
+    assert svc.store.get(box["id"]).requests_total == 2 * 10 ** 9      # fits a 32-bit column
+
+
+def test_a_failed_statement_does_not_poison_the_connection():
+    svc = _svc()
+    calls = []
+    real = svc.store.db.rollback
+    svc.store.db.rollback = lambda: (calls.append(1), real())[1]
+    try:
+        with pytest.raises(Exception):
+            svc.store.update("nope", no_such_column=1)       # every store method rolls back
+    finally:
+        svc.store.db.rollback = real
+    assert calls == [1]
+    assert svc.store.list() == []

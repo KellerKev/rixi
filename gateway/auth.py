@@ -80,13 +80,15 @@ class JwtVerifier:
 
     def __init__(self, public_key_pem: Optional[str] = None, jwks_url: Optional[str] = None,
                  algorithms=_ALGS, roles_claim: str = "roles", scopes_claim: str = "scope",
-                 audience: Optional[str] = None, jwks_cache_lifespan: float = 300.0):
+                 audience: Optional[str] = None, jwks_cache_lifespan: float = 300.0,
+                 issuer: Optional[str] = None):
         self.public_key_pem = public_key_pem
         self.jwks_url = jwks_url
         self.algorithms = list(algorithms)
         self.roles_claim = roles_claim
         self.scopes_claim = scopes_claim
         self.audience = audience
+        self.issuer = issuer
         self._jwk_client = (
             jwt.PyJWKClient(jwks_url, lifespan=int(jwks_cache_lifespan)) if jwks_url else None)
 
@@ -114,14 +116,15 @@ class JwtVerifier:
             return None
 
     def _verify_sync(self, token: str) -> Optional[Identity]:
-        opts = {"verify_aud": self.audience is not None}
+        # a token that never expires is not accepted: one that leaks would work for good
+        opts = {"verify_aud": self.audience is not None, "require": ["exp"]}
         try:
             if self._jwk_client is not None:
                 key = self._jwk_client.get_signing_key_from_jwt(token).key
             else:
                 key = self.public_key_pem
             payload = jwt.decode(token, key, algorithms=self.algorithms,
-                                 audience=self.audience, options=opts)
+                                 audience=self.audience, issuer=self.issuer, options=opts)
         except jwt.PyJWTError:
             return None
         return identity_from_claims(payload, self.roles_claim, self.scopes_claim)

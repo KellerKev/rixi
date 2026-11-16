@@ -61,19 +61,25 @@ class GenericAgentRunner:
             raise
     
     def resolve_context_variables(self, config: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        """Resolve ${VARIABLE} references in configuration"""
-        config_str = json.dumps(config)
-        
-        # Replace context variables
-        for key, value in context.items():
-            placeholder = f"${{{key}}}"
-            config_str = config_str.replace(placeholder, str(value))
-            
-            # Also support ${key} format
-            placeholder = f"${key}"
-            config_str = config_str.replace(placeholder, str(value))
-        
-        return json.loads(config_str)
+        """Resolve ${VARIABLE} references in configuration.
+
+        A value is put into the text of the settings that name it, and nowhere else: it cannot
+        add a setting, end a string, or change which tool a step calls (as it could when the
+        whole configuration was rewritten as one piece of text)."""
+        def fill(text: str) -> str:
+            for key, value in context.items():
+                text = text.replace(f"${{{key}}}", str(value))
+                text = text.replace(f"${key}", str(value))      # also the $key form
+            return text
+
+        def walk(node):
+            if isinstance(node, dict):
+                return {k: walk(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [walk(v) for v in node]
+            return fill(node) if isinstance(node, str) else node
+
+        return walk(config)
     
     async def run_with_config(self, config_path: str, context: Dict[str, Any] = None) -> Any:
         """

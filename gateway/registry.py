@@ -29,11 +29,19 @@ class Registry:
     def __init__(self) -> None:
         self._nodes: Dict[str, RegisteredNode] = {}
 
-    def register(self, node: RegisteredNode) -> None:
+    def register(self, node: RegisteredNode) -> bool:
+        """Add a node. A name that a connected node already holds is not taken over: whoever
+        dials in second is refused (False), so nobody can stand in for a node that is up."""
+        if node.node_id in self._nodes:
+            return False
         self._nodes[node.node_id] = node
+        return True
 
-    def unregister(self, node_id: str) -> None:
-        self._nodes.pop(node_id, None)
+    def unregister(self, node_id: str, conn: Any = None) -> None:
+        """Remove a node — with `conn`, only if that connection is the one registered."""
+        node = self._nodes.get(node_id)
+        if node is not None and (conn is None or node.conn is conn):
+            self._nodes.pop(node_id, None)
 
     def get(self, node_id: str) -> Optional[RegisteredNode]:
         return self._nodes.get(node_id)

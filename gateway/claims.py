@@ -25,6 +25,7 @@ class Claim:
     workdir: Optional[str] = None    # tofu workspace for this claim (for teardown)
     created_at: float = field(default_factory=time.time)
     ttl: float = 900.0               # token must be redeemed within this window
+    owner: Optional[str] = None      # who asked for it (the JWT subject; else the client id)
 
     @property
     def expired(self) -> bool:
@@ -37,9 +38,11 @@ class Claims:
     def __init__(self) -> None:
         self._by_token: Dict[str, Claim] = {}
 
-    def create(self, client_id: str, provider: str, spec: dict, ttl: float = 900.0) -> Claim:
+    def create(self, client_id: str, provider: str, spec: dict, ttl: float = 900.0,
+               owner: Optional[str] = None) -> Claim:
         token = "rxtok_" + secrets.token_urlsafe(24)
-        claim = Claim(token=token, client_id=client_id, provider=provider, spec=spec or {}, ttl=ttl)
+        claim = Claim(token=token, client_id=client_id, provider=provider, spec=spec or {}, ttl=ttl,
+                      owner=owner or client_id)
         self._by_token[token] = claim
         return claim
 
@@ -61,10 +64,13 @@ class Claims:
     def by_client(self, client_id: str):
         return [c for c in self._by_token.values() if c.client_id == client_id]
 
-    def release(self, token: str) -> Optional[Claim]:
+    def release(self, token: str, owner: Optional[str] = None) -> Optional[Claim]:
+        """Release a claim. With `owner`, only that owner's claim (somebody else's token, however
+        it was learned, releases nothing)."""
         claim = self._by_token.get(token)
-        if claim is not None:
-            claim.status = "released"
+        if claim is None or (owner is not None and claim.owner != owner):
+            return None
+        claim.status = "released"
         return claim
 
     def list(self):

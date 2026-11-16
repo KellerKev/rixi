@@ -16,6 +16,10 @@ point: anything inside the box, the agent can undo as root; the cloud firewall i
 "What the box needs to stay a box" is always allowed, so a policy can never strand it: DNS to its
 own resolvers, HTTPS to the control plane (heartbeats, token keys), HTTPS to its own address (its
 TLS self-check), and port 80 inbound for certificate challenges. IPv4 only for now.
+
+DNS stays open in every mode, and DNS can carry data: a determined process on the box can pass
+small amounts out through lookups even under `block`. The policy keeps a box from opening
+connections; it is not a seal against something that sets out to leak.
 """
 from __future__ import annotations
 

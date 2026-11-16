@@ -16,6 +16,11 @@ variable "python_bin" {
   type    = string
   default = "python3"
 }
+variable "node_token" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
 variable "kdf_salt" {
   type    = string
   default = ""
@@ -44,6 +49,7 @@ resource "terraform_data" "box" {
       NODE_ID     = var.node_id
       SECRET      = var.tunnel_secret
       SALT        = var.kdf_salt
+      NODE_TOKEN  = var.node_token
       SPOT        = var.spot ? "true" : "false"
       SPOT_TTL    = tostring(var.spot_ttl)
     }

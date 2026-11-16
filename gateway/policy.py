@@ -82,6 +82,7 @@ class UsageView:
     """Live usage, derived on read from the gateway's bridges (no drift-prone counters)."""
     per_identity_concurrent: Dict[str, int] = field(default_factory=dict)
     total_provisions: Dict[str, int] = field(default_factory=dict)
+    per_identity_boxes: Dict[str, int] = field(default_factory=dict)   # boxes asked for by provider
     fleet_eur_per_hour: float = 0.0     # sum of active boxes' hourly rates (excl. the requested one)
     total_eur_spent: float = 0.0        # cumulative estimated spend so far
 
@@ -143,6 +144,10 @@ class PolicyEngine:
         rpol = getattr(resource, "policy", None) or ResourcePolicy() if resource is not None else ResourcePolicy()
 
         if not admin:
+            if self.glob.roles and role not in self.glob.roles:
+                # roles are spelled out, and this caller has none of them (nor is the default
+                # role one of them): that is no permission, not every permission
+                return Decision(False, f"role '{role}' is not defined in the policy")
             rp = self.glob.roles.get(role, RolePolicy())
             # 2. op allowed for role
             if rp.allowed_ops and "*" not in rp.allowed_ops and action not in rp.allowed_ops:
@@ -157,6 +162,19 @@ class PolicyEngine:
                     return Decision(False, str(e))
                 if providers is not None and provider not in providers:
                     return Decision(False, f"provider '{provider}' not allowed for role '{role}'")
+
+            # 3a. a box asked for by provider (no catalog entry) counts toward the same
+            #     per-identity ceilings as a named one
+            if resource is None and action == "request_compute":
+                actor = self._actor(identity)
+                ceiling = tighten_quota(self.glob.quotas.max_concurrent_resources,
+                                        rp.quotas.max_concurrent_resources)
+                if ceiling is not None and usage.per_identity_boxes.get(actor, 0) >= ceiling:
+                    return Decision(False, "quota exceeded (max concurrent resources)")
+                tot_ceiling = tighten_quota(self.glob.quotas.max_total_provisions,
+                                            rp.quotas.max_total_provisions)
+                if tot_ceiling is not None and usage.total_provisions.get(actor, 0) >= tot_ceiling:
+                    return Decision(False, "quota exceeded (max total provisions)")
 
             # 3. resource-scoped RBAC + quota
             if resource is not None:
@@ -185,7 +203,8 @@ class PolicyEngine:
         if action == "request_compute":
             from . import offerings
             provider = getattr(resource, "provider", None) or request.get("provider")
-            itype = (getattr(resource, "vars", None) or {}).get("instance_type")
+            itype = (getattr(resource, "vars", None) or {}).get("instance_type") \
+                or request.get("instance_type")
             new_rate = offerings.price_per_hour(provider, itype) or 0.0
             if self.glob.quotas.max_eur_per_hour is not None and \
                     usage.fleet_eur_per_hour + new_rate > self.glob.quotas.max_eur_per_hour + 1e-9:

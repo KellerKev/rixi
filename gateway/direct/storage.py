@@ -46,6 +46,7 @@ MAX_DELETE = 10000
 # fresh URL valid for a few minutes, so a revoked link stops working within that.
 SHARE_MAX_HOURS = 7 * 24
 SHARE_URL_EXPIRES = 5 * 60
+SHARE_URL_CAPPED = 60          # for a link with a download limit
 MAX_SHARES = 1000                           # live links per tenant
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 # Web pages a tenant lets call a bucket from the browser: https, or http on the tenant's own
@@ -84,6 +85,7 @@ class StorageService:
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rixi-s3")
         self._busy: set = set()
         self._lock = threading.Lock()
+        self._tenant_locks: dict = {}
 
     # -- helpers ----------------------------------------------------------
     def _tenant(self, caller: Caller) -> str:
@@ -136,8 +138,18 @@ class StorageService:
         return sum(b.estimated_bytes() for b in self.store.list_buckets(tenant, live_only=True))
 
     # -- buckets ----------------------------------------------------------
+    def _tenant_lock(self, tenant: str) -> threading.Lock:
+        with self._lock:
+            return self._tenant_locks.setdefault(tenant, threading.Lock())
+
     def create_bucket(self, caller: Caller, name: str, region: Optional[str] = None,
                       expire_days: Optional[int] = None) -> Bucket:
+        # counted and recorded in one step, so buckets created together stay under the limit
+        with self._tenant_lock(self._tenant(caller)):
+            return self._create_bucket(caller, name, region, expire_days)
+
+    def _create_bucket(self, caller: Caller, name: str, region: Optional[str],
+                       expire_days: Optional[int]) -> Bucket:
         tenant = self._tenant(caller)
         if not valid_bucket_name(name):
             raise Denied("bucket name: 3-63 lowercase letters, digits and '-'", 400)
@@ -214,7 +226,8 @@ class StorageService:
 
     def set_public(self, caller: Caller, bucket_id: str, public: bool,
                    cap_gb=None) -> Bucket:
-        """Let anyone download the bucket's files with no key (never list them), or stop that.
+        """Let any other account download the bucket's files with its own key (never without
+        one, and never list them), or stop that.
         Downloads count as the tenant's traffic, up to `cap_gb` a month."""
         b = self._visible(caller, self.store.get_bucket(bucket_id))
         if b.state != "ready":
@@ -366,11 +379,12 @@ class StorageService:
             raise Denied("buckets must be a non-empty list of bucket names (or omitted for all)",
                          400)
         ids = self._resolve(tenant, buckets) if buckets is not None else None
-        mine = [k for k in self.store.list_s3_keys(tenant) if not k.box_id and
-                k.name != CONSOLE_KEY]
-        if len(mine) >= self.cfg.limits.max_s3_keys:
-            raise Denied(f"S3 key limit reached ({self.cfg.limits.max_s3_keys})", 429)
-        return self._new_key(tenant, caller.sub, name, ids, bool(write))
+        with self._tenant_lock(tenant):
+            mine = [k for k in self.store.list_s3_keys(tenant) if not k.box_id and
+                    k.name != CONSOLE_KEY]
+            if len(mine) >= self.cfg.limits.max_s3_keys:
+                raise Denied(f"S3 key limit reached ({self.cfg.limits.max_s3_keys})", 429)
+            return self._new_key(tenant, caller.sub, name, ids, bool(write))
 
     def box_key(self, tenant: str, sub: str, box_id: str, buckets: Optional[List[str]],
                 write: bool) -> Tuple[S3Key, str]:
@@ -621,9 +635,12 @@ class StorageService:
             raise Denied("Storage is not reachable; try again in a minute.", 502)
         if not self.store.take_download(sh.id, now):
             raise Denied("This link has reached its download limit.", 410)
+        # a link with a download limit hands out an address that is only good for starting the
+        # download now, so that one opening is not passed around as many downloads
+        life = SHARE_URL_CAPPED if sh.max_downloads else SHARE_URL_EXPIRES
         signed = self._sign(b, sh.tenant, sh.owner, "GET", sh.key,
                             self._attachment(sh.key, sh.filename),
-                            max(1, min(SHARE_URL_EXPIRES, int(sh.expires_at - now))))
+                            max(1, min(life, int(sh.expires_at - now))))
         return signed["url"]
 
     # -- what boxes wrote -------------------------------------------------
@@ -699,6 +716,8 @@ class StorageService:
     def usage(self, caller: Caller, since: float, tenant: Optional[str] = None) -> List[dict]:
         if not caller.admin:
             tenant = caller.tenant
+            if not tenant:
+                return []           # no tenant: nothing, never everybody's
         out = []
         for b in self.store.list_buckets(tenant, since=since):
             if b.state not in BUCKET_LIVE + ("deleted",):

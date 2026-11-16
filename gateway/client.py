@@ -18,7 +18,7 @@ import uuid
 
 import websockets
 
-from .protocol import AgentConn, dec, derive_keys, enc, proof
+from .protocol import TO_LISTENER, AgentConn, dec, derive_keys, enc, proof, session_key
 
 
 class GatewayClient:
@@ -40,18 +40,19 @@ class GatewayClient:
         ch = dec(await asyncio.wait_for(ws.recv(), timeout=10), self.key)
         if ch.get("type") != "challenge":
             raise RuntimeError("expected challenge")
+        mine = os.urandom(16).hex()
         auth = {"type": "auth", "proof": proof(self.proof_key, ch["nonce"]),
-                "node_id": self.node_id, "role": "client"}
+                "node_id": self.node_id, "role": "client", "nonce": mine}
         if self.token:
             auth["token"] = self.token
         await ws.send(enc(auth, self.key))
-        self.conn = AgentConn(ws, self.key)
+        self.conn = AgentConn(ws, session_key(self.key, ch["nonce"], mine), sends=TO_LISTENER)
         self._loop_task = asyncio.create_task(self._recv_loop(ws))
 
     async def _recv_loop(self, ws):
         try:
             async for raw in ws:
-                obj = dec(raw, self.key)
+                obj = self.conn.open(raw)
                 t = obj.get("type")
                 if t == "session_data":
                     await self.conn.on_session_data(obj["sid"], obj["data"])

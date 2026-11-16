@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import math
 from typing import Optional
 
 import ombott_ng
@@ -89,8 +90,8 @@ def _num(body: dict, key: str, default=None, allow_null: bool = False):
     v = body[key]
     if v is None and allow_null:
         return None
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise json_error(400, f"{key} must be a number of seconds")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise json_error(400, f"{key} must be a number of seconds")     # NaN is valid JSON here
     return float(v)
 
 
@@ -462,13 +463,15 @@ def build_app(svc: DirectService, verifier: JwtVerifier) -> DefaultApp:
 
         def count(name):
             v = body.get(name, 0)
-            if isinstance(v, bool) or not isinstance(v, int):
-                raise json_error(400, f"{name} must be an integer")
+            if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 10 ** 9:
+                # a box is its tenant's machine: what it reports must fit the columns it goes into
+                raise json_error(400, f"{name} must be an integer from 0 to 1e9")
             return v
 
         resolvers = body.get("resolvers")
-        if resolvers is not None and not (isinstance(resolvers, list)
-                                          and all(isinstance(r, str) for r in resolvers)):
+        if resolvers is not None and not (isinstance(resolvers, list) and len(resolvers) <= 8
+                                          and all(isinstance(r, str) and len(r) <= 64
+                                                  for r in resolvers)):
             raise json_error(400, "resolvers must be a list of addresses")
         return await _call(svc.heartbeat, _str(body, "box_id", required=True), _bearer() or "",
                            count("active_tasks"), bool(body.get("tls_ready")),

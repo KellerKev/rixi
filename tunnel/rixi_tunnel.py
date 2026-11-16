@@ -12,9 +12,13 @@ the tunnel forwards raw TCP and is protocol-agnostic.
     reachable host:    rixi-tunnel listen  --bind 127.0.0.1:9100 --ws-bind 0.0.0.0:7000 --secret S
                        rixi_client.py --server http://127.0.0.1:9100   # reaches the firewalled server
 
-Security: every frame is AES-256-GCM with a key derived from the shared --secret (PBKDF2); a wrong
-secret cannot decrypt the auth challenge and is rejected. The --ws-bind side is the exposed
-surface; keep --bind on loopback.
+Security: the two sides prove they hold the shared --secret (PBKDF2-derived key) and each adds a
+fresh nonce; everything after that is AES-256-GCM under a key made for this one connection, with
+the direction and a running counter bound into every frame. A recording of an earlier connection
+therefore cannot be played back, in either direction, and frames cannot be reordered or dropped
+unnoticed. A wrong secret cannot decrypt the auth challenge and is rejected. The --ws-bind side is
+the exposed surface; keep --bind on loopback. The secret gives no confidentiality against others
+who hold it: across a network you do not control, dial a wss:// URL.
 """
 from __future__ import annotations
 
@@ -71,19 +75,61 @@ def _proof(proof_key: bytes, nonce_hex: str) -> str:
     return hmac.new(proof_key, nonce_hex.encode(), hashlib.sha256).hexdigest()
 
 
+# Which way a frame travels: bound into it, so one side's frames cannot be fed back to it.
+TO_DIALER, TO_LISTENER = b"L", b"D"
+
+
+def session_key(key: bytes, listener_nonce: str, dialer_nonce: str, node_token: str = "") -> bytes:
+    """The key for one connection: from the shared key and both sides' fresh nonces — and, for a
+    node that was given a token of its own, that token, so others who hold the shared secret
+    cannot derive it."""
+    return HKDF(algorithm=hashes.SHA256(), length=32,
+                salt=(listener_nonce + "|" + dialer_nonce).encode(),
+                info=b"rixi-tunnel-v3-session").derive(key + node_token.encode())
+
+
+def node_proof(node_token: str, listener_nonce: str, dialer_nonce: str) -> str:
+    """Proof of a node's own token for this connection (the token itself is never sent)."""
+    return hmac.new(node_token.encode(), f"rixi-node|{listener_nonce}|{dialer_nonce}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def seal(obj: dict, key: bytes, direction: bytes, counter: int) -> bytes:
+    nonce = os.urandom(NONCE_LEN)
+    return nonce + AESGCM(key).encrypt(nonce, json.dumps(obj).encode(),
+                                       direction + counter.to_bytes(8, "big"))
+
+
+def unseal(raw: bytes, key: bytes, direction: bytes, counter: int) -> dict:
+    return json.loads(AESGCM(key).decrypt(raw[:NONCE_LEN], raw[NONCE_LEN:],
+                                          direction + counter.to_bytes(8, "big")).decode())
+
+
 # ───────────────────────── connection wrapper ─────────────────────────────
 class Conn:
     """One tunnel WebSocket: serialized encrypted sends + a session→writer map."""
 
-    def __init__(self, ws, key: bytes):
+    def __init__(self, ws, key: bytes, sends: bytes = TO_DIALER):
+        """`key` is this connection's session key; `sends` the direction this side's frames go."""
         self.ws = ws
         self.key = key
+        self._sends = sends
+        self._receives = TO_LISTENER if sends == TO_DIALER else TO_DIALER
+        self._tx = self._rx = 0
         self._lock = asyncio.Lock()
         self.sessions: dict[str, asyncio.StreamWriter] = {}
 
     async def send(self, obj: dict):
         async with self._lock:
-            await self.ws.send(enc(obj, self.key))
+            frame = seal(obj, self.key, self._sends, self._tx)
+            self._tx += 1
+            await self.ws.send(frame)
+
+    def open(self, raw: bytes) -> dict:
+        """Decrypt the next frame from the peer: it must be the next one, and one of theirs."""
+        obj = unseal(raw, self.key, self._receives, self._rx)
+        self._rx += 1
+        return obj
 
     async def pump_tcp_to_ws(self, sid: str, reader: asyncio.StreamReader):
         """Read bytes from a local/target socket and forward them as session_data frames."""
@@ -146,14 +192,19 @@ async def run_listen(bind: str, ws_bind: str, secret: str, kdf_salt: str = ""):
                 reply.get("proof", ""), _proof(proof_key, nonce)):
             log.warning("agent rejected: bad auth proof")
             return
+        dialer_nonce = reply.get("nonce")
+        if not isinstance(dialer_nonce, str) or len(dialer_nonce) < 16:
+            log.warning("agent rejected: it speaks the older tunnel protocol (no connection "
+                        "nonce); update it")
+            return
 
-        conn = Conn(ws, key)
+        conn = Conn(ws, session_key(key, nonce, dialer_nonce), sends=TO_DIALER)
         state["conn"] = conn
         log.info("agent connected (node=%s) — local port %s:%d is live",
                  reply.get("node_id", "?"), bind_host, bind_port)
         try:
             async for raw in ws:
-                obj = dec(raw, key)
+                obj = conn.open(raw)
                 t = obj.get("type")
                 if t == "session_data":
                     await conn.on_session_data(obj["sid"], obj["data"])
@@ -192,13 +243,14 @@ async def run_listen(bind: str, ws_bind: str, secret: str, kdf_salt: str = ""):
 
 
 # ──────────────────────────── connect role ────────────────────────────────
-async def run_connect(to_url: str, target: str, secret: str, node_id: str = "rixi", kdf_salt: str = ""):
+async def run_connect(to_url: str, target: str, secret: str, node_id: str = "rixi", kdf_salt: str = "",
+                      node_token: str = ""):
     key, proof_key = derive_keys(secret, kdf_salt)
     t_host, t_port = _split_hostport(target, 9000)
     delay = 2
     while True:
         try:
-            await _connect_once(to_url, t_host, t_port, key, proof_key, node_id)
+            await _connect_once(to_url, t_host, t_port, key, proof_key, node_id, node_token)
             delay = 2
         except asyncio.CancelledError:
             raise
@@ -208,18 +260,23 @@ async def run_connect(to_url: str, target: str, secret: str, node_id: str = "rix
         delay = min(delay * 2, 60)
 
 
-async def _connect_once(to_url, t_host, t_port, key, proof_key, node_id):
+async def _connect_once(to_url, t_host, t_port, key, proof_key, node_id, node_token=""):
     async with websockets.connect(to_url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
         # Auth: decrypt the challenge (proves we hold the key), return the proof.
         ch = dec(await asyncio.wait_for(ws.recv(), timeout=10), key)
         if ch.get("type") != "challenge":
             raise RuntimeError("expected challenge")
-        await ws.send(enc({"type": "auth", "proof": _proof(proof_key, ch["nonce"]), "node_id": node_id}, key))
-        conn = Conn(ws, key)
+        mine = os.urandom(16).hex()
+        auth = {"type": "auth", "proof": _proof(proof_key, ch["nonce"]), "node_id": node_id,
+                "nonce": mine}
+        if node_token:      # a node given a token of its own proves it, without sending it
+            auth["node_proof"] = node_proof(node_token, ch["nonce"], mine)
+        await ws.send(enc(auth, key))
+        conn = Conn(ws, session_key(key, ch["nonce"], mine, node_token), sends=TO_LISTENER)
         log.info("connected to %s — forwarding to %s:%d", to_url, t_host, t_port)
         try:
             async for raw in ws:
-                obj = dec(raw, key)
+                obj = conn.open(raw)
                 t = obj.get("type")
                 if t == "session_open":
                     await _open_target(conn, obj["sid"], t_host, t_port)
@@ -265,7 +322,11 @@ def main():
     pc.add_argument("--target", default="127.0.0.1:9000", help="local service to expose (the rixi server)")
     pc.add_argument("--secret", default=os.getenv("RIXI_TUNNEL_SECRET"), help="shared secret (or RIXI_TUNNEL_SECRET)")
     pc.add_argument("--kdf-salt", default=os.getenv("RIXI_TUNNEL_SALT", ""), help="per-deployment KDF salt (or RIXI_TUNNEL_SALT); must match the peer")
-    pc.add_argument("--node-id", default="rixi", help="identifier sent at auth (for logs)")
+    pc.add_argument("--node-id", default=os.getenv("RIXI_NODE_ID", "rixi"),
+                    help="identifier sent at auth (or RIXI_NODE_ID)")
+    pc.add_argument("--node-token", default=os.getenv("RIXI_NODE_TOKEN", ""),
+                    help="this node's own registration token, if a gateway issued one (or "
+                         "RIXI_NODE_TOKEN — prefer the environment: flags show in `ps`)")
 
     args = ap.parse_args()
     if not args.secret:
@@ -275,7 +336,8 @@ def main():
         if args.role == "listen":
             asyncio.run(run_listen(args.bind, args.ws_bind, args.secret, args.kdf_salt))
         else:
-            asyncio.run(run_connect(args.to, args.target, args.secret, args.node_id, args.kdf_salt))
+            asyncio.run(run_connect(args.to, args.target, args.secret, args.node_id, args.kdf_salt,
+                                    args.node_token))
     except KeyboardInterrupt:
         pass
 

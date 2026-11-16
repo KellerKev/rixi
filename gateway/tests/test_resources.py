@@ -16,7 +16,8 @@ from gateway.provisioning.tofu import find_tofu  # noqa: E402
 from gateway.server import Gateway  # noqa: E402
 
 SECRET = "gw-res-secret"
-RIXI_DIR = os.getenv("RIXI_DIR", "/Users/kevin/DevelopmentStudio/rixi")
+RIXI_DIR = os.getenv("RIXI_DIR") or os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))                       # this checkout
 _DUMMY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "provisioning", "terraform", "providers", "dummy")
 

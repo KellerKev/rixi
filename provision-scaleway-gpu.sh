@@ -52,9 +52,13 @@ command -v scw >/dev/null || { log "installing scaleway-cli…"; "$PIXI" global 
 
 # resolve org/project from the API key so you only need access + secret
 log "resolving organization/project from the API key…"
-PROJECT_ID=$(curl -s -H "X-Auth-Token: $SCW_SECRET_KEY" "https://api.scaleway.com/iam/v1alpha1/api-keys/$SCW_ACCESS_KEY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('default_project_id') or '')")
+# the secret goes to curl in a file only this user can read, not on its command line (`ps`)
+SCW_HDR="$(mktemp)"; chmod 600 "$SCW_HDR"; printf 'X-Auth-Token: %s\n' "$SCW_SECRET_KEY" > "$SCW_HDR"
+SCW_OUT="$(mktemp)"; SCW_ERR="$(mktemp)"
+trap 'rm -f "$SCW_HDR" "$SCW_OUT" "$SCW_ERR"' EXIT
+PROJECT_ID=$(curl -s -H @"$SCW_HDR" "https://api.scaleway.com/iam/v1alpha1/api-keys/$SCW_ACCESS_KEY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('default_project_id') or '')")
 [ -n "$PROJECT_ID" ] || { err "could not resolve project — check the API key/secret"; exit 1; }
-ORG_ID=$(curl -s -H "X-Auth-Token: $SCW_SECRET_KEY" "https://api.scaleway.com/account/v3/projects/$PROJECT_ID" | python3 -c "import sys,json;print(json.load(sys.stdin).get('organization_id') or '')")
+ORG_ID=$(curl -s -H @"$SCW_HDR" "https://api.scaleway.com/account/v3/projects/$PROJECT_ID" | python3 -c "import sys,json;print(json.load(sys.stdin).get('organization_id') or '')")
 export SCW_ACCESS_KEY SCW_SECRET_KEY
 export SCW_DEFAULT_ORGANIZATION_ID="$ORG_ID" SCW_DEFAULT_PROJECT_ID="$PROJECT_ID"
 export SCW_DEFAULT_ZONE="$ZONE" SCW_DEFAULT_REGION="${ZONE%-*}"
@@ -82,13 +86,13 @@ if [ -z "${SID:-}" ]; then
   log "creating $GPU_TYPE in $ZONE (image=$IMAGE, root=${ROOT_GB}GB) — this is a PAID GPU…"
   create(){ scw instance server create name="$NAME" type="$GPU_TYPE" zone="$1" image="$IMAGE" \
               root-volume="block:${ROOT_GB}GB" ip=new project-id="$PROJECT_ID" -w -o json; }
-  if ! create "$ZONE" >/tmp/scw_create.json 2>/tmp/scw_create.err; then
-    if grep -qiE 'stock|exhausted|no server|not available' /tmp/scw_create.err; then
+  if ! create "$ZONE" >"$SCW_OUT" 2>"$SCW_ERR"; then
+    if grep -qiE 'stock|exhausted|no server|not available' "$SCW_ERR"; then
       log "$ZONE out of stock — retrying in fr-par-2…"; ZONE=fr-par-2; export SCW_DEFAULT_ZONE=$ZONE
-      create fr-par-2 >/tmp/scw_create.json
-    else cat /tmp/scw_create.err >&2; exit 1; fi
+      create fr-par-2 >"$SCW_OUT"
+    else cat "$SCW_ERR" >&2; exit 1; fi
   fi
-  SID=$(python3 -c "import json;print(json.load(open('/tmp/scw_create.json'))['id'])"); SZONE="$ZONE"
+  SID=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['id'])" "$SCW_OUT"); SZONE="$ZONE"
 else log "reusing existing instance '$NAME' ($SID, $SZONE)"; fi
 
 IP=$(scw instance server get "$SID" zone="$SZONE" -o json | python3 -c "import sys,json;d=json.load(sys.stdin);print((d.get('public_ip') or {}).get('address') or (d.get('public_ips') or [{}])[0].get('address',''))")
@@ -98,7 +102,7 @@ ssh-keygen -R "$IP" >/dev/null 2>&1 || true   # drop any stale host key (Scalewa
 # ─────────────── wait for SSH ───────────────
 log "waiting for SSH on $IP…"
 for _ in $(seq 1 60); do
-  if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i "$SSH_KEY" root@"$IP" true 2>/dev/null; then log "SSH ready"; break; fi
+  if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -i "$SSH_KEY" root@"$IP" true 2>/dev/null; then log "SSH ready"; break; fi
   sleep 5
 done
 
@@ -109,7 +113,7 @@ log "installing RIXI server via install-rixi.sh…"
 
 sleep 4
 # Health-check on the box itself (works whether bound to loopback or 0.0.0.0).
-if ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" root@"$IP" \
+if ssh -o StrictHostKeyChecking=accept-new -i "$SSH_KEY" root@"$IP" \
      "curl -fs -m 10 http://127.0.0.1:$RIXI_PORT/health" >/dev/null 2>&1; then
   log "RIXI healthy ✅"
 else

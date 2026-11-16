@@ -64,7 +64,7 @@ def main():
     app.run(
         host='127.0.0.1', 
         port=5000, 
-        debug=True,  # This should produce more startup logs
+        debug=False,  # never the debugger: this app is reached through the rixi proxy
         use_reloader=False  # Disable reloader to avoid process complications
     )
 

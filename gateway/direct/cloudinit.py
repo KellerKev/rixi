@@ -29,6 +29,14 @@ def valid_model(name: str) -> bool:
     return bool(_MODEL.match(name))
 
 
+_ENDPOINT_KEY = re.compile(r"[A-Za-z0-9._+/=-]{16,128}")
+
+
+def valid_endpoint_key(key: str) -> bool:
+    """The key a box guards the model it serves with: long enough not to be guessed."""
+    return bool(_ENDPOINT_KEY.fullmatch(key))
+
+
 _LLM_URL = re.compile(r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)*/?$")
 # A box-only token from the hosted gateway, or the customer's own provider key (direct mode).
 _LLM_TOKEN = re.compile(r"^[A-Za-z0-9._+/=-]{8,256}$")

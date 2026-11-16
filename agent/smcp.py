@@ -119,6 +119,42 @@ def _decrypt(fernet, resp: dict):
     return resp.get("payload")
 
 
+# How far a message's (signed) timestamp may be from now, and so how long its id is remembered:
+# a message is accepted once, while it is fresh. Without this a recorded frame — a write_file,
+# say — could be sent again on a new connection for as long as the token inside it lives.
+FRESH_S = 120.0
+_MAX_SEEN = 200_000
+
+
+class _Seen:
+    """Message ids accepted within the freshness window."""
+
+    def __init__(self, window: float = FRESH_S) -> None:
+        self.window = window
+        self._ids: Dict[str, float] = {}
+
+    def fresh(self, msg: dict, now: Optional[float] = None) -> Optional[str]:
+        """None when the message is fresh and new (and remembers it), else why it is not."""
+        now = time.time() if now is None else now
+        try:
+            ts = float(msg.get("timestamp"))
+        except (TypeError, ValueError):
+            return "message has no timestamp"
+        if abs(now - ts) > self.window:
+            return "message is not fresh (check the clocks on both sides)"
+        mid = str(msg.get("id") or "")
+        if not mid:
+            return "message has no id"
+        if len(self._ids) >= _MAX_SEEN or (self._ids and len(self._ids) % 1024 == 0):
+            self._ids = {k: t for k, t in self._ids.items() if now - t <= self.window}
+            if len(self._ids) >= _MAX_SEEN:
+                return "too many messages"          # never forgets one that is still fresh
+        if mid in self._ids:
+            return "message was already received"
+        self._ids[mid] = ts
+        return None
+
+
 def _verify_signature(mac_key: bytes, msg: dict) -> bool:
     """Recompute and constant-time-compare the payload-bound envelope signature."""
     try:
@@ -154,13 +190,20 @@ class SMCPClient:
         self._token = None
         self._fernet = None
         self._mac_key = b""
+        self._seen = _Seen()
 
-    async def _rt(self, msg: dict) -> dict:
+    async def _rt(self, msg: dict, expect: Optional[str] = None) -> dict:
         await self._ws.send(json.dumps(msg))
         resp = json.loads(await self._ws.recv())
         # Mutual auth: every server reply must carry a valid payload-bound signature.
         if self._mac_key and not _verify_signature(self._mac_key, resp):
             raise RuntimeError("smcp: server message signature invalid (mutual auth failed)")
+        # … and be a reply made now, not an earlier (validly signed) one played back
+        stale = self._seen.fresh(resp)
+        if stale:
+            raise RuntimeError(f"smcp: server reply refused: {stale}")
+        if expect and resp.get("type") not in (expect, "error"):
+            raise RuntimeError(f"smcp: expected a {expect} reply, got {resp.get('type')!r}")
         return resp
 
     async def connect(self) -> None:
@@ -202,12 +245,16 @@ class SMCPClient:
             raise RuntimeError("smcp client not connected")
         msg = _envelope(self._mac_key, self._fernet, "tool_invoke",
                         {"token": self._token, "tool_name": tool_name, "parameters": params}, True)
-        resp = await self._rt(msg)
+        resp = await self._rt(msg, expect="tool_response")
         if resp.get("type") == "error":
             err = _decrypt(self._fernet, resp)
             detail = err.get("error") if isinstance(err, dict) else err
             raise RuntimeError(f"smcp tool error: {detail}")
         out = _decrypt(self._fernet, resp)
+        if isinstance(out, dict) and out.get("tool_name") not in (None, tool_name):
+            # the answer to another tool's call, however validly signed, is not this one's
+            raise RuntimeError(f"smcp: reply is for tool {out.get('tool_name')!r}, "
+                               f"not {tool_name!r}")
         return out.get("result") if isinstance(out, dict) else out
 
     async def federated_forward(self, target_node: str, task: dict, client_jwt: str, *,
@@ -297,7 +344,17 @@ class SMCPToolServer:
         # HMAC proof-fallback secret defaults to the (independent) jwt_secret;
         # set federation_hmac_secret to share one across a federation.
         self.federation_enabled = federation_enabled
-        self._fed_hmac_secret = federation_hmac_secret or jwt_secret
+        # Never the session-token key: whoever is given the federation secret could then sign
+        # session tokens and skip the api_key gate. Unset, it is a key nobody else has (so only
+        # registered peer keys verify).
+        self._fed_hmac_secret = federation_hmac_secret or secrets.token_urlsafe(32)
+        if federation_enabled and node_id == "rixi":
+            # a proof names the node it is for; two nodes left at the default would accept
+            # each other's
+            raise RuntimeError("federation needs a node_id of this node's own (not the "
+                               "default 'rixi')")
+        self._seen = _Seen()
+        self._fed_nonces: Dict[str, float] = {}     # proof nonces, across all connections
         self._fed_issuer_pem = federation_issuer_pem
         self._fed_peer_keys = federation_peer_keys or {}
         self._fed_strict = federation_strict
@@ -316,6 +373,7 @@ class SMCPToolServer:
             issuer_pem=self._fed_issuer_pem,
             strict_asymmetric=self._fed_strict,
             dispatch=self._fed_dispatch,
+            seen_nonces=self._fed_nonces,       # one proof, once — on whichever connection
         )
         for nid, pem in self._fed_peer_keys.items():
             receiver.register_peer_public_key(nid, pem)
@@ -372,6 +430,9 @@ class SMCPToolServer:
         ECDH sessions and proof-nonce cache."""
         if not _verify_signature(self._mac_key, raw):
             return self._error("invalid signature")
+        stale = self._seen.fresh(raw)
+        if stale:
+            return self._error(stale)
 
         mtype = raw.get("type")
         try:

@@ -64,9 +64,10 @@ rixi down mybox                                              # destroy it — bi
 | `sample-cpu` — builds, tests, light jobs | `cx23` | `DEV1-M` | `t3.medium` |
 | `sample-gpu` — basic ML and model inference | — | `L4-1-24G` (24 GB) | `g6.xlarge` |
 
-The box serves plain HTTP on an open port, and RIXI secures it end to end: every request carries a
-two-minute token signed by a key that never leaves your machine, and code, inputs, and output travel
-AES-256-GCM-sealed under a key negotiated over RSA right after boot. Credentials come from flags or
+The box serves HTTPS with a certificate `rixi up` makes for it, and your machine trusts that one
+certificate and no other, so nothing on the way can read, change or replay a request. Every request
+carries a two-minute token signed by a key that never leaves your machine, and code, inputs, and
+output are AES-256-GCM-sealed as well, under a key negotiated right after boot. Credentials come from flags or
 the provider's usual env vars (`HCLOUD_TOKEN`, `SCW_SECRET_KEY` + `SCW_DEFAULT_PROJECT_ID`, …); see
 `rixi up --help`. Requires rixi 0.2.8+.
 

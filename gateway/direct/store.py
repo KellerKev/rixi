@@ -9,6 +9,8 @@ one; every write commits immediately.
 """
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import logging
 import os
@@ -726,3 +728,24 @@ class Store:
 
     def close(self) -> None:
         self.db.close()
+
+
+def _rolls_back(fn):
+    """A statement that fails leaves the thread's connection inside a transaction that Postgres
+    refuses to continue: without a rollback, every later call on that thread would fail too."""
+    @functools.wraps(fn)
+    def wrapped(self, *a, **kw):
+        try:
+            return fn(self, *a, **kw)
+        except Exception:
+            try:
+                self.db.rollback()
+            except Exception:
+                log.exception("rollback failed")
+            raise
+    return wrapped
+
+
+for _name, _fn in list(vars(Store).items()):
+    if inspect.isfunction(_fn) and not _name.startswith("_") and _name != "close":
+        setattr(Store, _name, _rolls_back(_fn))

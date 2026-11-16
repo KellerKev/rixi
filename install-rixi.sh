@@ -317,10 +317,10 @@ if ! [ -x "$PIXI" ] && command -v pixi >/dev/null 2>&1; then PIXI="$(command -v 
 if ! [ -x "$PIXI" ]; then
   if command -v curl >/dev/null 2>&1; then
     log "Installing Pixi via curl…"
-    curl -fsSL https://pixi.sh/install.sh | bash >/dev/null
+    curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.70.1 bash >/dev/null
   elif command -v wget >/dev/null 2>&1; then
     log "Installing Pixi via wget…"
-    wget -qO- https://pixi.sh/install.sh | bash >/dev/null
+    wget -qO- https://pixi.sh/install.sh | PIXI_VERSION=v0.70.1 bash >/dev/null
   else
     echo "no curl/wget and pixi was not pre-staged — cannot install pixi" >&2; exit 1
   fi

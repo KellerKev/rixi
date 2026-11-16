@@ -129,8 +129,7 @@ class MCPManager:
                     instance.state = MCPServerState.ERROR
                     return False
                 instance.state = MCPServerState.RUNNING
-                for tool in instance.available_tools:
-                    self.tool_registry[tool] = server_name
+                self._register_tools(server_name, instance)
                 print(f"✅ Started SMCP server: {server_name} ({len(instance.available_tools)} tools)")
                 return True
 
@@ -154,8 +153,7 @@ class MCPManager:
             instance.state = MCPServerState.RUNNING
 
             # Register tools
-            for tool in instance.available_tools:
-                self.tool_registry[tool] = server_name
+            self._register_tools(server_name, instance)
 
             mode = "real" if instance.is_real else "simulated"
             print(f"✅ Started MCP server: {server_name} ({mode})")
@@ -209,6 +207,21 @@ class MCPManager:
             print(f"❌ Failed to start real MCP server: {e}")
             return False
 
+    def _register_tools(self, server_name: str, instance: MCPServerInstance) -> None:
+        """Route each of the server's tools to it — unless another server already has a tool
+        of that name. The first to offer a name keeps it: a server that comes later (a remote
+        one, say) cannot take over `read_file` or `write_file` by advertising them."""
+        kept = []
+        for tool in instance.available_tools:
+            owner = self.tool_registry.get(tool)
+            if owner is not None and owner != server_name:
+                print(f"⚠️  {server_name} also offers '{tool}', which {owner} already serves: "
+                      f"ignored (rename one, or list {server_name} first)")
+                continue
+            self.tool_registry[tool] = server_name
+            kept.append(tool)
+        instance.available_tools = kept
+
     async def _start_smcp_server(self, instance: MCPServerInstance) -> bool:
         """Connect to an SMCP (Secure MCP) server and discover its tools."""
         try:
@@ -231,8 +244,18 @@ class MCPManager:
 
         instance.smcp_client = client
         instance.is_real = True
-        # Prefer the server-advertised capabilities; fall back to configured tools.
-        instance.available_tools = list(client.capabilities.keys()) or list(instance.config.tools)
+        # What the server advertises — but when the config lists the tools this server is for,
+        # only those: a remote server does not get to add tools by announcing them.
+        advertised = list(client.capabilities.keys())
+        wanted = list(instance.config.tools or [])
+        if advertised and wanted:
+            extra = [t for t in advertised if t not in wanted]
+            if extra:
+                print(f"⚠️  {instance.config.name} advertises tools that are not in its "
+                      f"configured list, ignored: {extra}")
+            instance.available_tools = [t for t in advertised if t in wanted]
+        else:
+            instance.available_tools = advertised or wanted
         print(f"🔐 SMCP connected: {instance.config.name} → tools {instance.available_tools}")
         return True
 

@@ -2,7 +2,7 @@
 """Shared transport/encryption logic for the pixi Remote Runner clients."""
 
 from __future__ import annotations
-import base64, json, os, re, sys
+import base64, fnmatch, hashlib, hmac, json, os, re, sys, tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -12,6 +12,18 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 NONCE_LEN = 12
+SEAL_CHUNK = 1024 * 1024
+
+# What the client keeps beside the project (its keys, its config with tokens, its header file)
+# and what plainly is a credential: never packed into what is shipped to a server.
+LOCAL_SECRETS = ("aes.key", "rotation.secret", "pixi_remote_config.toml", "rixi_headers.json",
+                 "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa", "id_rsa.*", "id_ed25519",
+                 "id_ed25519.*", "id_ecdsa", "id_ecdsa.*", "credentials.json", "*.tfstate",
+                 "*.tfvars")
+
+
+def is_local_secret(filename: str) -> bool:
+    return any(fnmatch.fnmatch(filename, pat) for pat in LOCAL_SECRETS)
 
 # HTTP defaults: (connect timeout, read timeout); streaming reads may block indefinitely
 CONNECT_TIMEOUT = 10
@@ -217,7 +229,26 @@ class Transport:
                     plain_buf = self._push_buffer(plain_buf, on_obj)
 
     # ───────────────────────── Upload / attach wrappers ───────────────────
+    def _seal_package(self, pkg: str) -> str:
+        """The package as length-prefixed AES-GCM frames, the way the server reads a sealed
+        upload: with a key, the code does not cross the wire in the clear."""
+        fd, sealed = tempfile.mkstemp(suffix=".sealed")
+        with os.fdopen(fd, "wb") as out, open(pkg, "rb") as src:
+            while True:
+                chunk = src.read(SEAL_CHUNK)
+                if not chunk:
+                    break
+                nonce = os.urandom(NONCE_LEN)
+                enc = nonce + AESGCM(self.aes_key).encrypt(nonce, chunk, None)
+                out.write(len(enc).to_bytes(4, "big") + enc)
+        return sealed
+
     def _upload_and_run(self, pkg, task, headers, on_obj=None):
+        plain = pkg
+        if self.aes_key is not None:
+            pkg = self._seal_package(plain)
+            os.unlink(plain)
+            headers = {**headers, "X-Rixi-Encrypted": "1"}
         try:
             with open(pkg, "rb") as fh:
                 files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
@@ -264,7 +295,19 @@ class Transport:
 
     # ───────────────────────── Handshake ──────────────────────────────────
     def perform_handshake(self, secret: str, rotate: bool):
-        data = {"secret": secret, "rotate": rotate}
+        def proof(step: bytes, *parts: bytes) -> bytes:
+            mac = hmac.new(secret.encode(), step, hashlib.sha256)
+            for part in parts:
+                mac.update(len(part).to_bytes(4, "big") + part)
+            return mac.digest()
+
+        def b64(raw: bytes) -> str:
+            return base64.b64encode(raw).decode()
+
+        # The secret is never sent: this side proves it knows it, and so must the server —
+        # over the public key it answers with, so the key cannot be swapped on the way.
+        nonce = os.urandom(32)
+        data = {"nonce": b64(nonce), "proof": b64(proof(b"rixi-hs1", nonce)), "rotate": rotate}
         r = _http("POST", f"{self.server_url}/handshake", json=data, headers=self.auth_headers)
         if r.status_code != 200:
             # Better error handling for handshake limits
@@ -276,7 +319,20 @@ class Transport:
                     sys.exit(1)
             print("Handshake step-1 failed:", r.text)
             sys.exit(1)
-        pub_pem = r.json()["public_key"]
+        try:
+            answer = r.json()
+            pub_pem = answer["public_key"]
+            server_nonce = base64.b64decode(answer["nonce"])
+            server_proof = base64.b64decode(answer["proof"])
+        except (ValueError, KeyError, TypeError):
+            print("Handshake failed: the server did not prove it knows the secret "
+                  "(an older rixi server? update it to match this client)")
+            sys.exit(1)
+        if not hmac.compare_digest(server_proof, proof(b"rixi-hs2", nonce, server_nonce,
+                                                       pub_pem.encode())):
+            print("Handshake failed: the key offered is not from a server that knows the secret "
+                  "— something sits between this client and the server")
+            sys.exit(1)
 
         # generate AES key + new rotation secret
         new_aes = os.urandom(32)
@@ -284,15 +340,15 @@ class Transport:
 
         pub_key = serialization.load_pem_public_key(pub_pem.encode())
         blob = new_aes + new_rot
-        cipher = base64.b64encode(
-            pub_key.encrypt(
-                blob,
-                padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),
-                             algorithm=hashes.SHA256(), label=None)
-            )
-        ).decode()
+        raw_cipher = pub_key.encrypt(
+            blob,
+            padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),
+                         algorithm=hashes.SHA256(), label=None)
+        )
+        finish = {"cipher": b64(raw_cipher),
+                  "proof": b64(proof(b"rixi-hs3", nonce, server_nonce, raw_cipher))}
 
-        r2 = _http("POST", f"{self.server_url}/handshake/finish", json={"cipher": cipher},
+        r2 = _http("POST", f"{self.server_url}/handshake/finish", json=finish,
                    headers=self.auth_headers)
         if r2.status_code != 200:
             print("Handshake step-2 failed:", r2.text)

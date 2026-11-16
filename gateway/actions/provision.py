@@ -58,7 +58,14 @@ def _candidates(rdef, base_type, base_region, spot=False):
     return out
 
 
+_PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,40}")
+
+
 def _module(provider: str) -> Path:
+    # a name, never a path: `../..` or an absolute path would run tofu in a directory of the
+    # caller's choosing
+    if not _PROVIDER_NAME.fullmatch(str(provider)):
+        raise RuntimeError(f"unknown provider: {provider!r}")
     return _PROVIDERS / provider
 
 
@@ -88,8 +95,11 @@ def _dummy_defaults(tvars: dict) -> dict:
 
 def _provider_vars(provider: str, spec: dict) -> dict:
     if provider == "dummy":
-        return _dummy_defaults({"python_bin": spec.get("python_bin"),
-                                "rixi_dir": spec.get("rixi_dir")})
+        # which interpreter and which checkout the local "box" runs are the gateway's own
+        out = _dummy_defaults({})
+        if spec.get("spot_ttl") is not None:
+            out["spot_ttl"] = spec["spot_ttl"]
+        return out
     out = {}
     for k in ("server_port", "rixi_ref", "instance_type", "region"):
         if spec.get(k) is not None:
@@ -133,7 +143,7 @@ async def provision(args: dict, gateway: Any):
         env = None
         node_id = claim.token
         workdir = tempfile.mkdtemp(prefix=f"rixi-tofu-{provider}-")
-        gw_url = spec.get("gateway_ws_url") or _gateway_url(gateway)
+        gw_url = _gateway_url(gateway)
 
     if not module.exists():
         raise RuntimeError(f"unknown provider/module: {provider} ({module})")
@@ -148,6 +158,10 @@ async def provision(args: dict, gateway: Any):
     }
     # The tunnel secret is sensitive — pass it via TF_VAR env, not tfvars.json.
     secret_vars["tunnel_secret"] = gateway.secret
+    # The box's own registration token: it proves which node it is when it dials in (the tunnel
+    # secret cannot, every box has it).
+    if hasattr(gateway, "node_token"):
+        secret_vars["node_token"] = gateway.node_token(node_id)
     # per-deployment KDF salt must match the gateway, or the box's tunnel derives different keys
     # and can't authenticate (v2 tunnel crypto). Only pass a non-default salt.
     if getattr(gateway, "kdf_salt", ""):

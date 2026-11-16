@@ -45,7 +45,9 @@ def main() -> None:
     host, _, port = args.bind.rpartition(":")
     import uvicorn
     try:
-        uvicorn.run(app, host=host or "127.0.0.1", port=int(port), log_level="info")
+        from .accesslog import log_config
+        uvicorn.run(app, host=host or "127.0.0.1", port=int(port), log_level="info",
+                    log_config=log_config())
     finally:
         svc.stop(wait=False)
 

@@ -78,7 +78,9 @@ def main():
     ap.add_argument("--jwt-secret",
                     default=os.getenv("RIXI_SMCP_JWT_SECRET", ""),
                     help="HS256 secret for session tokens (or RIXI_SMCP_JWT_SECRET); "
-                         "derived from --secret-key when omitted")
+                         "a random one for this process when omitted (never the channel secret)")
+    ap.add_argument("--node-id", default=os.getenv("RIXI_SMCP_NODE_ID", "rixi"),
+                    help="this node's name (or RIXI_SMCP_NODE_ID); give each node its own")
     ap.add_argument("--allow-open", action="store_true",
                     default=os.getenv("RIXI_SMCP_ALLOW_OPEN", "").lower() in ("1", "true", "yes"),
                     help="accept any client when no api-key is set (dev only; refuses to run open otherwise)")
@@ -96,7 +98,7 @@ def main():
             secret_key=args.secret_key,
             jwt_secret=args.jwt_secret,
             api_key=args.api_key,
-            node_id="rixi",
+            node_id=args.node_id,
             allow_open=args.allow_open,
         )
     except RuntimeError as exc:

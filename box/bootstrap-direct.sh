@@ -63,7 +63,8 @@ fi
 # 1. pixi + caddy -------------------------------------------------------------
 if [ ! -x "$HOME/.pixi/bin/pixi" ]; then
   log "installing pixi"
-  curl -fsSL --retry 5 https://pixi.sh/install.sh | bash >/dev/null
+  # a pinned pixi release, not whatever is newest on the day the box boots
+  curl -fsSL --retry 5 https://pixi.sh/install.sh | PIXI_VERSION="${PIXI_VERSION:-v0.70.1}" bash >/dev/null
 fi
 PIXI="$HOME/.pixi/bin/pixi"
 export PATH="$HOME/.pixi/bin:$PATH"

@@ -25,6 +25,9 @@ tenant_claim   = "tenant"                                    # JWT claim naming 
 admin_role     = "admin"                                     # role that sees every tenant
 # acme_email   = "ops@example.com"
 # acme_ca      = "zerossl"            # many boxes: ZeroSSL first, Let's Encrypt as fallback
+# DNS servers a box with a network policy may reach. Unset, each box reports its own, which is
+# its tenant's word; set it when the policy is one the tenant must not be able to widen.
+# resolvers    = ["51.159.47.28", "51.159.47.26"]
 # Optional: ask a billing service before every claim; it must answer {"allow": true}.
 # authorizer_url   = "http://127.0.0.1:8030/internal/authorize"
 # authorizer_token = "${env:RIXI_AUTHORIZER_TOKEN}"

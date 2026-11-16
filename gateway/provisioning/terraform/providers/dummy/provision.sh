@@ -17,6 +17,8 @@ port="$(cat "$portf")"
 
 salt_args=()
 [ -n "${SALT:-}" ] && salt_args=(--kdf-salt "$SALT")   # v2 per-deployment salt (must match gateway)
+# the box's own registration token, by environment (it proves which node this is)
+RIXI_NODE_TOKEN="${NODE_TOKEN:-}" \
 nohup "$PYTHON" "$RIXI_DIR/tunnel/rixi_tunnel.py" connect \
   --to "$GATEWAY_WS" --node-id "$NODE_ID" --secret "$SECRET" \
   "${salt_args[@]+"${salt_args[@]}"}" --target "127.0.0.1:$port" \

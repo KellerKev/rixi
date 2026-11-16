@@ -144,6 +144,9 @@ class DirectConfig:
     ollama_version: str = "v0.35.1"      # pinned; boxes install exactly this
     dns_publish_timeout: float = 180.0   # wait for all nameservers before booting a box
     control_plane: Tuple[str, ...] = ()  # addresses a policed box must keep reaching (default: resolved)
+    # DNS servers a policed box may reach. Unset, the box says which it uses (a box is its
+    # tenant's machine, so that is the tenant's word); set, only these are opened.
+    resolvers: Tuple[str, ...] = ()
     heartbeat_timeout: float = 10 * 60
     boot_timeout: float = 25 * 60
     reap_interval: float = 30.0
@@ -252,6 +255,22 @@ def _origins(v) -> Tuple[str, ...]:
     return out
 
 
+def _addresses(value, name: str) -> Tuple[str, ...]:
+    import ipaddress
+    if value in (None, []):
+        return ()
+    if not isinstance(value, list) or len(value) > 8:
+        raise ConfigError(f"[direct] {name} must be a list of up to 8 IPv4 addresses")
+    for a in value:
+        try:
+            ok = ipaddress.ip_address(a).version == 4
+        except (ValueError, TypeError):
+            ok = False
+        if not ok:
+            raise ConfigError(f"[direct] {name}: {a!r} is not an IPv4 address")
+    return tuple(value)
+
+
 def parse(data: dict) -> DirectConfig:
     d = _subst(dict(data.get("direct") or {}))
     if not d:
@@ -324,6 +343,7 @@ def parse(data: dict) -> DirectConfig:
         acme_ca=_acme_ca(d.get("acme_ca")),
         dns_publish_timeout=_duration(d.get("dns_publish_timeout", "3m")),
         control_plane=tuple(d.get("control_plane") or ()),
+        resolvers=_addresses(d.get("resolvers"), "resolvers"),
         heartbeat_timeout=_duration(d.get("heartbeat_timeout", "10m")),
         boot_timeout=_duration(d.get("boot_timeout", "25m")),
         reap_interval=_duration(d.get("reap_interval", "30s")),

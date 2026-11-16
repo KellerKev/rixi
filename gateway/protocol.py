@@ -7,8 +7,11 @@ the exact same wire format to interoperate with the unmodified public `rixi-tunn
   master    = PBKDF2-HMAC-SHA256(secret, kdf_salt or b"rixi-tunnel-v2", 600_000, 32)
   AES key   = HKDF(master, info=b"rixi-tunnel-v2-aes")   (AES-256-GCM channel key)
   proof key = HKDF(master, info=b"rixi-tunnel-v2-proof") (separate from the AES key)
-  frame     = nonce(12) || AES-256-GCM(json)
-  auth      = listener sends challenge{nonce}; dialer returns auth{proof=HMAC(proof_key,nonce), node_id}
+  auth      = listener sends challenge{nonce}; dialer returns auth{proof=HMAC(proof_key,nonce),
+              node_id, nonce, [node_proof]} — both under the shared AES key
+  session   = HKDF(AES key ‖ node token, salt="<listener nonce>|<dialer nonce>",
+              info=b"rixi-tunnel-v3-session"): the key for this one connection
+  frame     = nonce(12) || AES-256-GCM(session key, json, aad = direction ‖ counter(8))
   sessions  = session_open{sid} / session_data{sid, data(b64)} / session_close{sid}
 
 KEEP THE SALT/INFO STRINGS AND FRAME FORMAT IN SYNC with the open primitive; the per-deployment
@@ -58,6 +61,36 @@ def proof(proof_key: bytes, nonce_hex: str) -> str:
     return hmac.new(proof_key, nonce_hex.encode(), hashlib.sha256).hexdigest()
 
 
+# Which way a frame travels: bound into it, so one side's frames cannot be fed back to it.
+TO_DIALER, TO_LISTENER = b"L", b"D"
+
+
+def session_key(key: bytes, listener_nonce: str, dialer_nonce: str, node_token: str = "") -> bytes:
+    """The key for one connection: from the shared key and both sides' fresh nonces — and, for a
+    node that was given a token of its own, that token, so others who hold the shared secret
+    cannot derive it."""
+    return HKDF(algorithm=hashes.SHA256(), length=32,
+                salt=(listener_nonce + "|" + dialer_nonce).encode(),
+                info=b"rixi-tunnel-v3-session").derive(key + node_token.encode())
+
+
+def node_proof(node_token: str, listener_nonce: str, dialer_nonce: str) -> str:
+    """Proof of a node's own token for this connection (the token itself is never sent)."""
+    return hmac.new(node_token.encode(), f"rixi-node|{listener_nonce}|{dialer_nonce}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def seal(obj: dict, key: bytes, direction: bytes, counter: int) -> bytes:
+    nonce = os.urandom(NONCE_LEN)
+    return nonce + AESGCM(key).encrypt(nonce, json.dumps(obj).encode(),
+                                       direction + counter.to_bytes(8, "big"))
+
+
+def unseal(raw: bytes, key: bytes, direction: bytes, counter: int) -> dict:
+    return json.loads(AESGCM(key).decrypt(raw[:NONCE_LEN], raw[NONCE_LEN:],
+                                          direction + counter.to_bytes(8, "big")).decode())
+
+
 class AgentConn:
     """One registered agent's tunnel: serialized encrypted sends + a session→writer map.
 
@@ -65,15 +98,27 @@ class AgentConn:
     acts as the `listen` side toward it: a local TCP connection opens a session that the agent
     bridges to its own target (the rixi server)."""
 
-    def __init__(self, ws, key: bytes):
+    def __init__(self, ws, key: bytes, sends: bytes = TO_DIALER):
+        """`key` is this connection's session key; `sends` the direction this side's frames go."""
         self.ws = ws
         self.key = key
+        self._sends = sends
+        self._receives = TO_LISTENER if sends == TO_DIALER else TO_DIALER
+        self._tx = self._rx = 0
         self._lock = asyncio.Lock()
         self.sessions: dict[str, asyncio.StreamWriter] = {}
 
     async def send(self, obj: dict):
         async with self._lock:
-            await self.ws.send(enc(obj, self.key))
+            frame = seal(obj, self.key, self._sends, self._tx)
+            self._tx += 1
+            await self.ws.send(frame)
+
+    def open(self, raw: bytes) -> dict:
+        """Decrypt the next frame from the peer: it must be the next one, and one of theirs."""
+        obj = unseal(raw, self.key, self._receives, self._rx)
+        self._rx += 1
+        return obj
 
     async def pump_tcp_to_ws(self, sid: str, reader: asyncio.StreamReader):
         try:

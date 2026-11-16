@@ -18,6 +18,7 @@ import json
 import socket
 import hmac
 import logging
+import math
 import re
 import secrets
 import threading
@@ -80,6 +81,7 @@ class DirectService:
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rixi-box")
         self._inflight: set = set()
         self._lock = threading.Lock()
+        self._tenant_locks: Dict[str, threading.Lock] = {}
         self._stop = threading.Event()
         missing = {t.provider for t in cfg.templates.values()} - set(providers)
         if missing:
@@ -99,6 +101,10 @@ class DirectService:
         if box is None or not (caller.admin or box.tenant == caller.tenant):
             raise NotFound()
         return box
+
+    def _tenant_lock(self, tenant: str) -> threading.Lock:
+        with self._lock:
+            return self._tenant_locks.setdefault(tenant, threading.Lock())
 
     def _begin(self, box_id: str) -> bool:
         with self._lock:
@@ -217,10 +223,12 @@ class DirectService:
             raise Denied(f"region {zone} is not allowed", 403)
         lim = self.cfg.limits
         ttl = lim.default_ttl if ttl is None else float(ttl)
-        if ttl <= 0 or ttl > lim.max_ttl:
+        if not (math.isfinite(ttl) and 0 < ttl <= lim.max_ttl):      # NaN compares false both ways
             raise Denied(f"ttl must be between 1s and {lim.max_ttl:.0f}s", 400)
         if idle_timeout == -1:
             idle_timeout = lim.idle_timeout
+        if idle_timeout is not None and not (math.isfinite(idle_timeout) and idle_timeout > 0):
+            raise Denied("idle_timeout must be a number of seconds, or null for none", 400)
         if ssh_key and not cloudinit.valid_ssh_key(ssh_key):
             raise Denied("ssh_key is not an OpenSSH public key", 400)
         if serve is not None:
@@ -231,6 +239,8 @@ class DirectService:
                 raise Denied("serve.model is required and must be a model name", 400)
             serve = {"kind": kind, "model": str(serve["model"]),
                      "key": str(serve.get("key") or "") or secrets.token_urlsafe(32)}
+            if not cloudinit.valid_endpoint_key(serve["key"]):
+                raise Denied("serve.key: 16-128 letters, digits and ._+/=-", 400)
         if llm is not None and not cloudinit.valid_llm(llm):
             raise Denied("llm must be {openai_base_url: https://…, anthropic_base_url?: "
                          "https://…, token: 8-256 key characters}", 400)
@@ -244,23 +254,6 @@ class DirectService:
                                        all(isinstance(n, str) for n in sb)):
                 raise Denied("storage.buckets must be a list of bucket names", 400)
         rate = self.rate(t)
-
-        live = self.store.list(tenant=tenant, live_only=True)
-        if lim.max_boxes is not None and len(live) >= lim.max_boxes:
-            raise Denied(f"tenant box limit reached ({lim.max_boxes})", 429)
-        burn = sum(b.eur_per_hour for b in live if b.state != "stopped")
-        if lim.max_eur_per_hour is not None and burn + rate > lim.max_eur_per_hour + 1e-9:
-            raise Denied(f"tenant spend limit reached ({lim.max_eur_per_hour} €/h)", 429)
-        if self.authorize is not None:
-            allow, reason = self.authorize({
-                "tenant": tenant, "sub": caller.sub, "template": t.name, "provider": t.provider,
-                "instance_type": t.instance_type, "zone": zone, "eur_per_hour": rate,
-                "ttl_s": ttl})
-            if not allow:
-                self.audit("box.denied", tenant=tenant, sub=caller.sub, template=t.name,
-                           reason=reason)
-                raise Denied(reason or "not authorized", 402)
-
         try:
             net = netpolicy.parse(policy)
         except netpolicy.PolicyError as exc:
@@ -271,47 +264,76 @@ class DirectService:
 
         box_id = secrets.token_hex(5)
         secret = secrets.token_urlsafe(32)
-        now = self.clock()
-        # Volumes are taken compare-and-set, so two claims can never get the same one.
-        taken = []
-        for v in vols:
-            if not self.store.transition_volume(v.id, ("available",), state="attached",
-                                                box_id=box_id):
-                for got in taken:
-                    self.store.transition_volume(got, ("attached",), state="available",
-                                                 box_id=None)
-                raise Denied(f"volume {v.name} is no longer available", 409)
-            taken.append(v.id)
-        s3 = None
-        if storage is not None:
-            # The box's own key: works only while this box is live, revoked when it ends.
+        # One claim of a tenant at a time, from counting what it has to recording the new box:
+        # claims sent together would otherwise each see room under the limits, and each be
+        # shown to the authorizer as the only one.
+        with self._tenant_lock(tenant):
+            live = self.store.list(tenant=tenant, live_only=True)
+            if lim.max_boxes is not None and len(live) >= lim.max_boxes:
+                raise Denied(f"tenant box limit reached ({lim.max_boxes})", 429)
+            burn = sum(b.eur_per_hour for b in live if b.state != "stopped")
+            if lim.max_eur_per_hour is not None and burn + rate > lim.max_eur_per_hour + 1e-9:
+                raise Denied(f"tenant spend limit reached ({lim.max_eur_per_hour} €/h)", 429)
+            if self.authorize is not None:
+                allow, reason = self.authorize({
+                    "tenant": tenant, "sub": caller.sub, "template": t.name,
+                    "provider": t.provider, "instance_type": t.instance_type, "zone": zone,
+                    "eur_per_hour": rate, "ttl_s": ttl})
+                if not allow:
+                    self.audit("box.denied", tenant=tenant, sub=caller.sub, template=t.name,
+                               reason=reason)
+                    raise Denied(reason or "not authorized", 402)
+
+            now = self.clock()
+            taken: List[str] = []
+            keyed = False
             try:
-                k, secret_key = self.storage.box_key(tenant, caller.sub, box_id,
-                                                     storage.get("buckets"),
-                                                     bool(storage.get("write", True)))
-            except Denied:
+                # Volumes are taken compare-and-set, so two claims can never get the same one.
+                for v in vols:
+                    if not self.store.transition_volume(v.id, ("available",), state="attached",
+                                                        box_id=box_id):
+                        raise Denied(f"volume {v.name} is no longer available", 409)
+                    taken.append(v.id)
+                s3 = None
+                if storage is not None:
+                    # The box's own key: works only while this box is live, revoked when it ends.
+                    k, secret_key = self.storage.box_key(tenant, caller.sub, box_id,
+                                                         storage.get("buckets"),
+                                                         bool(storage.get("write", True)))
+                    keyed = True
+                    s3 = {"endpoint": self.storage.st.endpoint_url, "access_key": k.access_key,
+                          "secret_key": secret_key, "region": self.storage.st.regions[0]}
+                disk_gb = t.root_volume_gb or self.cfg.root_disk_gb
+                box = Box(id=box_id, tenant=tenant, owner=caller.sub, template=t.name,
+                          provider=t.provider, instance_type=t.instance_type, zone=zone,
+                          eur_per_hour=rate, hostname=f"b-{box_id}.{self.cfg.box_domain}",
+                          state="provisioning", created_at=now, expires_at=now + ttl,
+                          idle_timeout=idle_timeout, hb_hash=_hash(secret),
+                          serve_kind=serve["kind"] if serve else None,
+                          serve_model=serve["model"] if serve else None,
+                          policy=None if net.is_default else json.dumps(net.to_dict()),
+                          volumes=json.dumps([v.id for v in vols]) if vols else None,
+                          on_idle=on_idle,
+                          stopped_eur_per_hour=round(disk_gb * self.cfg.volume_eur_per_gb_hour, 6))
+                try:
+                    user_data = cloudinit.render(
+                        self.cfg, box_id=box_id, tenant=tenant, hostname=box.hostname,
+                        box_secret=secret, ssh_key=ssh_key, serve=serve, llm=llm,
+                        volumes=[(v.provider_id, v.name) for v in vols], s3=s3)
+                except ValueError as exc:
+                    raise Denied(f"the box cannot be set up: {exc}", 400)
+                self.store.insert(box)
+            except BaseException:
+                # no box came of it: give back what was taken for it
                 for got in taken:
                     self.store.transition_volume(got, ("attached",), state="available",
                                                  box_id=None)
+                if keyed:
+                    try:
+                        self.storage.revoke_box_keys(box_id)
+                    except Exception:
+                        log.exception("could not revoke the key of unborn box %s", box_id)
                 raise
-            s3 = {"endpoint": self.storage.st.endpoint_url, "access_key": k.access_key,
-                  "secret_key": secret_key, "region": self.storage.st.regions[0]}
-        disk_gb = t.root_volume_gb or self.cfg.root_disk_gb
-        box = Box(id=box_id, tenant=tenant, owner=caller.sub, template=t.name,
-                  provider=t.provider, instance_type=t.instance_type, zone=zone,
-                  eur_per_hour=rate, hostname=f"b-{box_id}.{self.cfg.box_domain}",
-                  state="provisioning", created_at=now, expires_at=now + ttl,
-                  idle_timeout=idle_timeout, hb_hash=_hash(secret),
-                  serve_kind=serve["kind"] if serve else None,
-                  serve_model=serve["model"] if serve else None,
-                  policy=None if net.is_default else json.dumps(net.to_dict()),
-                  volumes=json.dumps([v.id for v in vols]) if vols else None, on_idle=on_idle,
-                  stopped_eur_per_hour=round(disk_gb * self.cfg.volume_eur_per_gb_hour, 6))
-        user_data = cloudinit.render(self.cfg, box_id=box_id, tenant=tenant,
-                                     hostname=box.hostname, box_secret=secret, ssh_key=ssh_key,
-                                     serve=serve, llm=llm,
-                                     volumes=[(v.provider_id, v.name) for v in vols], s3=s3)
-        self.store.insert(box)
         self.audit("box.claimed", box=box_id, tenant=tenant, sub=caller.sub, template=t.name,
                    zone=zone, eur_per_hour=rate)
         self._begin(box_id)
@@ -451,6 +473,8 @@ class DirectService:
     def usage(self, caller: Caller, since: float, tenant: Optional[str] = None) -> List[dict]:
         if not caller.admin:
             tenant = caller.tenant
+            if not tenant:
+                return []           # no tenant: nothing, never everybody's
         now = self.clock()
         out = []
         for b in self.store.usage_since(since, tenant=tenant):
@@ -470,6 +494,8 @@ class DirectService:
                      tenant: Optional[str] = None) -> List[dict]:
         if not caller.admin:
             tenant = caller.tenant
+            if not tenant:
+                return []
         now = self.clock()
         out = []
         for v in self.store.list_volumes(tenant=tenant, since=since):
@@ -503,12 +529,14 @@ class DirectService:
                 self.audit("box.started", box=box_id, tenant=box.tenant)
             return {"state": "ready", "revoked_jti": self.store.revoked(box_id)}
         now = self.clock()
-        requests = max(0, int(requests))
-        changes = {"last_heartbeat": now, "active_tasks": max(0, int(active_tasks))}
+        # the box is its tenant's machine: what it reports is kept within what the columns hold
+        requests = min(max(0, int(requests)), 10 ** 9)
+        active_tasks = min(max(0, int(active_tasks)), 10 ** 9)
+        changes = {"last_heartbeat": now, "active_tasks": active_tasks}
         if active_tasks > 0 or requests > 0:
             changes["last_busy"] = now
         if requests:
-            changes["requests_total"] = (box.requests_total or 0) + requests
+            changes["requests_total"] = min((box.requests_total or 0) + requests, 2 * 10 ** 9)
             changes["last_request"] = now
         if box.serve_kind and model_ready and not box.model_ready:
             changes["model_ready"] = 1
@@ -568,26 +596,29 @@ class DirectService:
         if box.state != "stopped":
             raise Denied(f"only a stopped box can be started (this one is {box.state})", 409)
         lim = self.cfg.limits
-        burn = sum(b.eur_per_hour for b in self.store.list(tenant=box.tenant, live_only=True)
-                   if b.state != "stopped")
-        if lim.max_eur_per_hour is not None and burn + box.eur_per_hour > lim.max_eur_per_hour + 1e-9:
-            raise Denied(f"tenant spend limit reached ({lim.max_eur_per_hour} €/h)", 429)
-        if self.authorize is not None:
-            allow, reason = self.authorize({
-                "tenant": box.tenant, "sub": caller.sub, "template": box.template,
-                "provider": box.provider, "instance_type": box.instance_type, "zone": box.zone,
-                "eur_per_hour": box.eur_per_hour, "ttl_s": 0, "action": "start"})
-            if not allow:
-                raise Denied(reason or "not authorized", 402)
-        now = self.clock()
-        paused = max(0.0, now - (box.stopped_at or now))
-        if not self.store.transition(box_id, ("stopped",), state="starting", stopped_at=None,
-                                     stopped_total=(box.stopped_total or 0.0) + paused,
-                                     # the lifetime counts running time: push the end back
-                                     expires_at=(box.expires_at + paused) if box.expires_at
-                                     else None,
-                                     ready_at=now, last_busy=now, error=None):
-            raise Denied("the box changed state; try again", 409)
+        with self._tenant_lock(box.tenant):       # counted and marked running in one step
+            burn = sum(b.eur_per_hour for b in self.store.list(tenant=box.tenant, live_only=True)
+                       if b.state != "stopped")
+            if lim.max_eur_per_hour is not None and \
+                    burn + box.eur_per_hour > lim.max_eur_per_hour + 1e-9:
+                raise Denied(f"tenant spend limit reached ({lim.max_eur_per_hour} €/h)", 429)
+            if self.authorize is not None:
+                allow, reason = self.authorize({
+                    "tenant": box.tenant, "sub": caller.sub, "template": box.template,
+                    "provider": box.provider, "instance_type": box.instance_type,
+                    "zone": box.zone, "eur_per_hour": box.eur_per_hour, "ttl_s": 0,
+                    "action": "start"})
+                if not allow:
+                    raise Denied(reason or "not authorized", 402)
+            now = self.clock()
+            paused = max(0.0, now - (box.stopped_at or now))
+            if not self.store.transition(box_id, ("stopped",), state="starting", stopped_at=None,
+                                         stopped_total=(box.stopped_total or 0.0) + paused,
+                                         # the lifetime counts running time: push the end back
+                                         expires_at=(box.expires_at + paused) if box.expires_at
+                                         else None,
+                                         ready_at=now, last_busy=now, error=None):
+                raise Denied("the box changed state; try again", 409)
         try:
             self.providers[box.provider].start(box.id, box.zone)
         except Exception as exc:
@@ -633,15 +664,16 @@ class DirectService:
         zone = zone or zones[0]
         if zone not in zones:
             raise Denied(f"no box runs in {zone}", 400)
-        live = self.store.list_volumes(tenant=tenant, live_only=True)
-        if len(live) >= lim.max_volumes:
-            raise Denied(f"volume limit reached ({lim.max_volumes})", 429)
-        if any(v.name == name for v in live):
-            raise Denied(f"you already have a volume called {name}", 409)
-        v = Volume(id=secrets.token_hex(5), tenant=tenant, owner=caller.sub, name=name,
-                   provider=self._volume_provider(zone), zone=zone, size_gb=size_gb,
-                   eur_per_gb_hour=self.cfg.volume_eur_per_gb_hour, created_at=self.clock())
-        self.store.insert_volume(v)
+        with self._tenant_lock(tenant):           # counted and recorded in one step
+            live = self.store.list_volumes(tenant=tenant, live_only=True)
+            if len(live) >= lim.max_volumes:
+                raise Denied(f"volume limit reached ({lim.max_volumes})", 429)
+            if any(v.name == name for v in live):
+                raise Denied(f"you already have a volume called {name}", 409)
+            v = Volume(id=secrets.token_hex(5), tenant=tenant, owner=caller.sub, name=name,
+                       provider=self._volume_provider(zone), zone=zone, size_gb=size_gb,
+                       eur_per_gb_hour=self.cfg.volume_eur_per_gb_hour, created_at=self.clock())
+            self.store.insert_volume(v)
         self.audit("volume.created", volume=v.id, tenant=tenant, size_gb=size_gb, zone=zone)
         self._begin("vol:" + v.id)
         self._pool.submit(self._create_volume, v)
@@ -664,6 +696,8 @@ class DirectService:
             self._end("vol:" + v.id)
 
     def list_volumes(self, caller: Caller) -> List[Volume]:
+        if not caller.admin and not caller.tenant:
+            return []
         return self.store.list_volumes(tenant=None if caller.admin else caller.tenant,
                                        live_only=True)
 
@@ -713,12 +747,15 @@ class DirectService:
     def _apply_policy(self, box: Box) -> None:
         try:
             net = netpolicy.parse(json.loads(box.policy))
-            if net.egress_mode != "open" and not box.resolvers:
+            # the operator's list when there is one: what the box reports is its tenant's word
+            resolvers = list(self.cfg.resolvers) or (
+                json.loads(box.resolvers) if box.resolvers else [])
+            if net.egress_mode != "open" and not resolvers:
                 # Blocking egress before we know where the box resolves names would cut its DNS.
                 raise RuntimeError("the box has not reported its DNS resolvers yet")
             compiled = netpolicy.compile_rules(
                 net, own_ip=box.ip, control_plane=self.control_plane_ips(),
-                resolvers=json.loads(box.resolvers) if box.resolvers else [])
+                resolvers=resolvers)
             self.providers[box.provider].apply_firewall(box.id, box.zone, compiled)
             self.store.update(box.id, policy_applied=1)
             self.audit("box.policy_applied", box=box.id, tenant=box.tenant,

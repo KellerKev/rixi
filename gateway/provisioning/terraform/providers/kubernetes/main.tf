@@ -27,6 +27,13 @@ variable "rixi_ref" {
   type    = string
   default = "main"
 }
+variable "node_token" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "This box's own registration token (the gateway derives one per node id). The tunnel agent proves it when it dials in, so no other holder of the tunnel secret can register as this node. Reaches the box as RIXI_NODE_TOKEN."
+}
+
 variable "kdf_salt" {
   type    = string
   default = ""
@@ -140,6 +147,10 @@ resource "kubernetes_pod" "rixi" {
       env {
         name  = "RIXI_TUNNEL_SALT"
         value = var.kdf_salt
+      }
+      env {
+        name  = "RIXI_NODE_TOKEN"
+        value = var.node_token
       }
       env {
         name  = "RIXI_SERVER_PORT"

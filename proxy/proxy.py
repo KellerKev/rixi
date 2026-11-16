@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional, List, AsyncGenerator
@@ -128,6 +129,78 @@ def load_config_from_file(config_path: str) -> Dict[str, Any]:
     else:
         raise ValueError("Config file must be JSON or YAML")
 
+class ConfigError(ValueError):
+    """The configuration asks for something this proxy would silently not do."""
+
+
+_PLACEHOLDER = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand(value, where: str):
+    """${NAME} / ${env:NAME} in a setting is that environment variable; one that is not set is
+    an error, never the literal text (a key of "${PROXY_API_KEY}" is one anybody can guess)."""
+    if isinstance(value, dict):
+        return {k: _expand(v, f"{where}.{k}") for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand(v, f"{where}[{i}]") for i, v in enumerate(value)]
+    if not isinstance(value, str):
+        return value
+
+    def sub(m):
+        if m.group(1) not in os.environ:
+            raise ConfigError(f"{where}: environment variable {m.group(1)} is not set")
+        return os.environ[m.group(1)]
+    return _PLACEHOLDER.sub(sub, value)
+
+
+def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Bring a configuration into the shape the proxy reads, and refuse one whose security
+    settings would not take effect."""
+    config = dict(config or {})
+    aes_key = config.pop("aes_key", None)             # bytes, set from --aes-key
+    config = _expand(config, "config")
+    if aes_key is not None:
+        config["aes_key"] = aes_key
+    auth = dict(config.get("authentication") or {})
+    # written at the top level in older examples: they belong under `authentication`, and a
+    # config that asks for a key must get one
+    for name in ("require_api_key", "api_key"):
+        if name in config:
+            auth.setdefault(name, config.pop(name))
+    config["authentication"] = auth
+    if auth.get("api_key") and "require_api_key" not in auth:
+        auth["require_api_key"] = True
+    if auth.get("require_api_key") and not auth.get("api_key"):
+        raise ConfigError("authentication.require_api_key is on but there is no api_key")
+    jwt_cfg = auth.get("jwt") or {}
+    if jwt_cfg.get("enabled") and not jwt_cfg.get("secret_key"):
+        raise ConfigError("authentication.jwt.enabled is on but there is no jwt.secret_key")
+    key_file = config.pop("aes_key_file", None)
+    if key_file and not config.get("aes_key"):
+        try:
+            raw = Path(key_file).read_bytes().strip()
+            key = base64.b64decode(raw)
+        except Exception as exc:
+            raise ConfigError(f"aes_key_file {key_file!r} cannot be read: {exc}")
+        if len(key) != 32:
+            raise ConfigError(f"aes_key_file {key_file!r} does not hold a base64 32-byte key")
+        config["aes_key"] = key
+    return config
+
+
+def unsafe_path(path: str) -> bool:
+    """A passthrough path that would leave the task it is for: a `.` or `..` segment (however
+    encoded), a backslash, or a control character."""
+    seen = path
+    for _ in range(3):
+        decoded = urllib.parse.unquote(seen)
+        if decoded == seen:
+            break
+        seen = decoded
+    return (any(seg in (".", "..") for seg in seen.replace("\\", "/").split("/"))
+            or "\\" in seen or any(ord(c) < 32 for c in seen))
+
+
 def create_default_config() -> Dict[str, Any]:
     """Create default configuration"""
     return {
@@ -206,11 +279,14 @@ class JWTAuthenticator:
 
     def verify_token(self, token: str) -> bool:
         """Verify JWT token"""
-        if not self.enabled or not self.secret_key:
+        if not self.enabled:
             return True
+        if not self.secret_key:
+            return False            # enabled without a key verifies nothing: refuse
 
         try:
-            jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
+            jwt.decode(token, self.secret_key, algorithms=[self.algorithm],
+                       options={"require": ["exp"]})
             return True
         except jwt.PyJWTError:
             return False
@@ -633,6 +709,11 @@ class RemoteChannel:
     
     async def forward_http_request(self, request: Request, path: str, task_id: str = None) -> Dict[str, Any]:
         """Forward generic HTTP request to backend service with enhanced response handling"""
+        if unsafe_path(path):
+            # with `..` the URL below would resolve out of /task/<id>/proxy/ and reach the
+            # server's own API with this proxy's token
+            return {"success": False, "status_code": 400,
+                    "error": "path may not contain . or .. segments"}
         try:
             async with aiohttp.ClientSession() as session:
                 # Build target URL - if task_id provided, use task-specific endpoint
@@ -679,6 +760,7 @@ class RemoteChannel:
                 async with session.request(
                     method=method,
                     url=target_url,
+                    allow_redirects=False,      # the backend token goes to the backend only
                     params=query_params,
                     headers=headers,
                     data=body,
@@ -1211,6 +1293,7 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
         yield
         logger.info("Enhanced proxy server shutting down...")
     
+    config = normalize_config(config)
     app = FastAPI(
         title="Enhanced Universal Inference Proxy",
         description="Production-ready proxy for AI inference services",
@@ -1236,25 +1319,42 @@ def create_enhanced_app(config: Dict[str, Any]) -> FastAPI:
     # Initialize proxy server
     proxy = ProxyServer(config)
 
-    # ─────────────── API Key Authentication ─────────────────
+    # ─────────────── Who may call ─────────────────
+    # An API key, a JWT, or either when both are configured. With neither, the proxy is open
+    # (it binds to localhost unless told otherwise).
 
     auth_config = config.get("authentication", {})
     require_api_key = auth_config.get("require_api_key", False)
     configured_api_key = auth_config.get("api_key")
+    jwt_required = proxy.auth.enabled
 
     async def verify_api_key(request: Request):
-        if not require_api_key:
+        if not require_api_key and not jwt_required:
             return True
-        if not configured_api_key:
-            raise HTTPException(status_code=503, detail="API key required but not configured")
-        provided = request.headers.get("x-api-key")
-        if not provided:
-            authorization = request.headers.get("authorization", "")
-            if authorization.lower().startswith("bearer "):
-                provided = authorization[7:].strip()
-        if not provided or not hmac.compare_digest(provided.encode("utf-8"), configured_api_key.encode("utf-8")):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        return True
+        bearer = ""
+        authorization = request.headers.get("authorization", "")
+        if authorization.lower().startswith("bearer "):
+            bearer = authorization[7:].strip()
+        if require_api_key:
+            provided = request.headers.get("x-api-key") or bearer
+            if provided and hmac.compare_digest(provided.encode("utf-8"),
+                                                str(configured_api_key).encode("utf-8")):
+                return True
+        if jwt_required and bearer and proxy.auth.verify_token(bearer):
+            return True
+        raise HTTPException(status_code=401, detail="Invalid or missing credentials")
+
+    @app.middleware("http")
+    async def access_gate(request: Request, call_next):
+        """Every route answers only to a caller who may use the proxy — status, metrics and the
+        admin routes as much as inference. /health keeps its own setting; a browser's preflight
+        carries no credentials by design."""
+        if request.url.path != "/health" and request.method != "OPTIONS":
+            try:
+                await verify_api_key(request)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return await call_next(request)
 
     # ─────────────── OpenAI API Routes ─────────────────
     
@@ -1707,6 +1807,8 @@ def main():
     parser.add_argument("--port", type=int, default=8002, help="Server port")
     parser.add_argument("--host", default="127.0.0.1", help="Server host (use 0.0.0.0 to listen on all interfaces)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Allow listening on a non-loopback host with no authentication")
     
     # Quick setup options (override config file)
     parser.add_argument("--backend", help="Backend URL")
@@ -1763,6 +1865,7 @@ def main():
         logger.info("Backend auth token configured")
 
     if args.api_key:
+        config["authentication"] = dict(config.get("authentication") or {})
         config["authentication"]["require_api_key"] = True
         config["authentication"]["api_key"] = args.api_key
         logger.info("API key authentication enabled")
@@ -1806,6 +1909,22 @@ def main():
         logger.error("No backends configured")
         return 1
     
+    try:
+        config = normalize_config(config)
+    except ConfigError as exc:
+        logger.error(f"Configuration refused: {exc}")
+        return 1
+    auth_cfg = config.get("authentication", {})
+    has_auth = bool(auth_cfg.get("require_api_key") or (auth_cfg.get("jwt") or {}).get("enabled"))
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not has_auth:
+        if not args.insecure:
+            logger.error(f"Refusing to listen on {args.host} with no API key or JWT configured: "
+                         "anyone who reaches the port could use the backend with this proxy's "
+                         "token. Set --api-key (or authentication in the config), or pass "
+                         "--insecure to do it anyway.")
+            return 1
+        logger.warning(f"⚠️  Listening on {args.host} with NO authentication (--insecure)")
+
     # Create and run app
     app = create_enhanced_app(config)
     

@@ -27,8 +27,11 @@ from smcp import SMCPClient, SMCPConfig  # noqa: E402
 async def main():
     cfg = SMCPConfig()
     cfg.server_url = os.getenv("SMCP_URL", "ws://127.0.0.1:8770")
-    cfg.secret_key = os.getenv("SMCP_SECRET", "my_secret_key_2024")
-    cfg.api_key = os.getenv("SMCP_API_KEY", "demo_key_123")
+    # No built-in values: a secret printed in a README is one everybody has.
+    cfg.secret_key = os.environ.get("SMCP_SECRET", "")
+    cfg.api_key = os.environ.get("SMCP_API_KEY", "")
+    if not cfg.secret_key or not cfg.api_key:
+        raise SystemExit("set SMCP_SECRET and SMCP_API_KEY to the server's secret and api key")
     cfg.node_id = "probe"
 
     client = SMCPClient(cfg)

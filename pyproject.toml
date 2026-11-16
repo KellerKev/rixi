@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rixi"
-version = "0.16.0"
+version = "0.17.0"
 description = "Secure remote execution for Pixi projects — client SDK and CLI"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -36,9 +36,9 @@ Repository = "https://github.com/KellerKev/rixi"
 # Server-side components carry heavy deps; installing them via pip is best-effort — the
 # supported path is Pixi per component. These extras exist so `rixi-server`/`rixi-gateway`
 # launchers can run from a plain venv when desired.
-server = ["fastapi>=0.115,<0.116", "uvicorn>=0.30", "pyjwt>=2.10,<3", "python-multipart>=0.0.9",
+server = ["fastapi>=0.121,<0.130", "starlette>=0.49.1", "uvicorn>=0.30", "pyjwt>=2.10,<3", "python-multipart>=0.0.9",
           "websockets>=13"]
-gateway = ["fastapi", "uvicorn", "pyjwt>=2.8", "websockets>=12", "duckdb>=0.10", "tomli>=2; python_version < '3.11'"]
+gateway = ["fastapi>=0.121", "starlette>=0.49.1", "uvicorn", "pyjwt>=2.8", "websockets>=12", "duckdb>=0.10", "tomli>=2; python_version < '3.11'"]
 dev = ["pytest>=8", "ruff>=0.6", "httpx>=0.27"]   # httpx: starlette TestClient (server tests)
 aws = ["boto3>=1.28"]      # `rixi up --provider aws` (experimental)
 

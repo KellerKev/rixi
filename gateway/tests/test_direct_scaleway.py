@@ -236,7 +236,7 @@ def test_apply_firewall_replaces_rules_then_sets_defaults():
     p, s = _provider(routes)
     compiled = compile_rules(parse({"egress": {"mode": "allowlist",
                                                "allow": ["203.0.113.0/24", "198.51.100.7:8000-9000"]}}),
-                             own_ip="51.0.0.7", control_plane=["65.21.252.62"],
+                             own_ip="51.0.0.7", control_plane=["203.0.113.10"],
                              resolvers=["51.159.47.28"])
     p.apply_firewall("abc", "fr-par-2", compiled)
     calls = [(m, path) for m, path, _ in s.calls]

@@ -8,6 +8,7 @@ import shutil
 import lz4.frame
 from rixi_transport import (
     Transport, _http, _hdrs, DEFAULT_HEADERS_FILE, build_custom_headers, set_default_headers,
+    is_local_secret,
 )
 
 # ───────────────────────── Globals ────────────────────────────────────────
@@ -78,8 +79,8 @@ def _package_dir(path=".") -> str:
         for root, dirs, files in os.walk(path):
             dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
             for f in files:
-                if f.startswith(".") or f.endswith((".pyc", ".pyo")):
-                    continue
+                if f.startswith(".") or f.endswith((".pyc", ".pyo")) or is_local_secret(f):
+                    continue                    # the client's own keys and config stay here
                 tar.add(os.path.join(root, f), f"{os.path.relpath(root, path)}/{f}".lstrip("./"))
     lz4_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".lz4"); lz4_tmp.close()
     with open(tar_tmp.name, "rb") as src, lz4.frame.open(lz4_tmp.name, "wb") as dst:

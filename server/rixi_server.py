@@ -61,7 +61,9 @@ from fastapi import Request
 from fastapi import WebSocket
 
 class HandshakeReq(BaseModel):
-    secret: str
+    nonce: str | None = None          # base64, 16-64 random bytes chosen by the client
+    proof: str | None = None          # base64 HMAC-SHA256: the client knows the secret
+    secret: str | None = None         # the old protocol sent the secret itself: refused
     rotate: bool | None = False
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -280,7 +282,22 @@ require_encryption: bool = False
 ENC_FRAME_MAX = 4 * 1024 * 1024 + 64
 # at top
 handshake_secret: str | None = None          # set at startup if provided
-ephemeral_privkey = None                     # RSA private key for current handshake
+# The handshake under way: {"key": RSA private key, "client_nonce", "server_nonce", "at"}.
+# It is good for one finish, and only for HANDSHAKE_TTL seconds.
+pending_handshake: Optional[dict] = None
+HANDSHAKE_TTL = 60.0
+HANDSHAKE_BODY_MAX = 16 * 1024
+bind_host: Optional[str] = None              # what the server listens on (set in main)
+
+
+def _hs_proof(step: bytes, *parts: bytes) -> bytes:
+    """HMAC over one step of the key handshake, keyed with the shared secret. Neither side ever
+    sends the secret: each proves it knows it, and the server's proof covers its public key, so
+    nobody in between can swap in a key of their own."""
+    mac = hmac.new((handshake_secret or "").encode(), step, "sha256")
+    for part in parts:
+        mac.update(len(part).to_bytes(4, "big") + part)
+    return mac.digest()
 
 def setup_handshake(secret_arg: str | None, max_uses: int):
     global handshake_secret, secret_uses_remaining
@@ -321,7 +338,7 @@ async def lifespan(app: FastAPI):
         f"public_key_path={auth_settings.public_key_path}, jwks_url={auth_settings.jwks_url}"
     )
     if auth_settings.jwks_url:
-        await refresh_jwks_keys()
+        await refresh_jwks_keys(force=True)
     yield
     logger.info("Server shutting down")
     print("Shutdown complete")
@@ -337,9 +354,18 @@ app = FastAPI(title="LZ4 Pixi Runner with HTTP Proxy + Offline Deployment + Logg
 def _b64url_decode(val: str) -> bytes:
     return base64.urlsafe_b64decode(val + "=" * (-len(val) % 4))
 
-async def refresh_jwks_keys() -> None:
+_jwks_refreshed_at = 0.0
+JWKS_MIN_REFRESH_S = 10.0
+
+
+async def refresh_jwks_keys(force: bool = False) -> None:
+    global _jwks_refreshed_at
     if not auth_settings.jwks_url:
         return
+    # a token with an unknown kid asks for a refresh: anyone can send one, so not every time
+    if not force and time.monotonic() - _jwks_refreshed_at < JWKS_MIN_REFRESH_S:
+        return
+    _jwks_refreshed_at = time.monotonic()
     try:
         resp = await asyncio.to_thread(requests.get, auth_settings.jwks_url, timeout=5)
         resp.raise_for_status()
@@ -427,11 +453,16 @@ async def validate_token(token: str) -> tuple[bool, Optional[dict]]:
         return False, None
 
 async def verify_authentication(
+    request: Request,
     authorization: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     if not auth_settings.enabled:
         _note_activity()
         return True
+    checked = request.scope.get("rixi_auth")
+    if checked is not None:             # the guard already verified this request's token
+        _note_activity()
+        return checked
     bearer = authorization.credentials if authorization and authorization.scheme.lower() == "bearer" else None
     for tok in filter(None, (bearer,)):
         is_valid, payload = await validate_token(tok)
@@ -1495,6 +1526,91 @@ async def require_key_gate(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def seal_json_answers(request: Request, call_next):
+    """With a key, answers that are plain JSON (task lists, status, output, logs) are sealed too
+    — always under --require-encryption, otherwise for a client that says it reads them."""
+    response = await call_next(request)
+    wanted = require_encryption or request.headers.get("x-rixi-accept-sealed") == "1"
+    if (not aes_key or not wanted or request.url.path in _PRE_KEY_PATHS
+            or not 200 <= response.status_code < 300
+            or response.headers.get("x-rixi-encrypted") == "1"
+            or not response.headers.get("content-type", "").startswith("application/json")):
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    return Response(encrypt(body), status_code=response.status_code,
+                    media_type="application/octet-stream", headers={"X-Rixi-Encrypted": "1"})
+
+
+_LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+# Routes that answer without a token (each checks what it needs itself).
+_NO_TOKEN_PATHS = {"/health", "/preview/ask", "/preview/auth"}
+
+
+def _host_of(value: str) -> str:
+    """The host of a Host header or an Origin, without scheme or port."""
+    value = value.split("://", 1)[-1].split("/", 1)[0].strip().lower()
+    if value.startswith("["):
+        return value.split("]", 1)[0] + "]"
+    return value.rsplit(":", 1)[0] if ":" in value else value
+
+
+def _browser_refusal(headers: Dict[str, str]) -> Optional[str]:
+    """Without tokens, a web page the operator has open could call this server from their
+    browser (which sends no token anyway). A page of another site names itself in Origin, and
+    a name rebound to this address shows in Host: both are refused."""
+    host = headers.get("host", "")
+    if bind_host in _LOOPBACK_NAMES and _host_of(host) not in _LOOPBACK_NAMES:
+        return "this server answers on localhost only"
+    origin = headers.get("origin")
+    if origin is not None and origin.split("://", 1)[-1].lower() != host.lower():
+        return "requests from other sites are refused"
+    return None
+
+
+class _Guard:
+    """Runs before anything else, and before any of the request's body is read."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.inner(scope, receive, send)
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        path = scope["path"]
+        refusal = None
+        status = 403
+        if not auth_settings.enabled:
+            refusal = _browser_refusal(headers)
+        elif scope["type"] == "http" and path not in _NO_TOKEN_PATHS:
+            # the token first: a caller without one never gets a byte of body read or spooled
+            value = headers.get("authorization", "")
+            token = value[7:].strip() if value.lower().startswith("bearer ") else ""
+            ok, payload = await validate_token(token) if token else (False, None)
+            if not ok:
+                refusal, status = "Invalid or missing authentication token.", 401
+            else:
+                scope["rixi_auth"] = payload if payload is not None else True
+        if refusal is None and scope["type"] == "http" and path in ("/handshake",
+                                                                    "/handshake/finish"):
+            declared = headers.get("content-length", "")
+            if not declared.isdigit() or int(declared) > HANDSHAKE_BODY_MAX:
+                refusal, status = "handshake bodies are small and say how long they are", 413
+        if refusal is None:
+            return await self.inner(scope, receive, send)
+        if scope["type"] == "websocket":
+            return await send({"type": "websocket.close", "code": 4403})
+        body = json.dumps({"detail": refusal}).encode()
+        await send({"type": "http.response.start", "status": status, "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()), (b"connection", b"close")]})
+        await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(_Guard)
+
+
 def _is_encrypted_upload(header_value: Optional[str]) -> bool:
     return (header_value or "").strip() == "1"
 
@@ -1873,7 +1989,11 @@ async def task_http_proxy(
                 "path": path,
                 "query": query_string,
                 "headers": {
-                    **{k: v for k, v in headers.items() if not k.lower().startswith(('content-length', 'host', 'connection'))},
+                    # the caller's token and cookies are for this server, not for the task
+                    **{k: v for k, v in headers.items()
+                       if not k.lower().startswith(('content-length', 'host', 'connection'))
+                       and k.lower() not in ("authorization", "cookie", "proxy-authorization",
+                                             "x-rixi-encrypted", "x-rixi-accept-sealed")},
                     "X-Request-ID": request_id  # Inject request_id as header
                 },
                 "body": body_data
@@ -1887,7 +2007,6 @@ async def task_http_proxy(
             # Create response waiter BEFORE sending request to avoid race condition
             response_event = http_proxy_manager.create_request_waiter(tid, request_id)
             
-            print(f"📤 Sending HTTP request: {json.dumps(http_request)}")
             proc.stdin.write(f"{json.dumps(http_request)}\n")
             proc.stdin.flush()
 
@@ -2431,26 +2550,45 @@ async def redeploy_task(
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 
+def _b64(value, lo: int, hi: int) -> Optional[bytes]:
+    try:
+        raw = base64.b64decode(value or "", validate=True)
+    except Exception:
+        return None
+    return raw if lo <= len(raw) <= hi else None
+
+
 @app.post("/handshake")
 async def handshake_step1(body: HandshakeReq,
                           auth: bool = Depends(verify_authentication)):
     """
     Step-1  Client → Server:
-        JSON { "secret": <pre_shared>, "rotate": false|true }
+        JSON { "nonce": b64(16-64 random bytes), "proof": b64(HMAC), "rotate": false|true }
+        proof = HMAC-SHA256(secret, "rixi-hs1" ‖ nonce)        — the secret itself is never sent
     Response:
-        401 if secret mismatch
-        200 { "public_key": "<PEM>" }
+        401 if the proof does not match
+        200 { "public_key": "<PEM>", "nonce": b64, "proof": b64 }
+        proof = HMAC-SHA256(secret, "rixi-hs2" ‖ client nonce ‖ server nonce ‖ PEM)
+              — the client checks it, so the key it wraps its AES key with is this server's
     """
-    global secret_uses_remaining, ephemeral_privkey, aes_key
+    global secret_uses_remaining, pending_handshake, aes_key
 
     if handshake_secret is None:
         return JSONResponse({"error": "Handshake not configured"}, status_code=400)
+    if body.secret is not None:
+        return JSONResponse({"error": "This server does not take the handshake secret itself "
+                                      "any more (it travelled in the clear): update the client"},
+                            status_code=400)
+    client_nonce = _b64(body.nonce, 16, 64)
+    proof = _b64(body.proof, 32, 32)
+    if client_nonce is None or proof is None:
+        return JSONResponse({"error": "nonce and proof are required"}, status_code=400)
 
     # limit check
     if secret_uses_remaining is not None and secret_uses_remaining <= 0:
         return JSONResponse({"error": "Secret usage limit reached"}, status_code=403)
 
-    if not hmac.compare_digest(body.secret.encode(), handshake_secret.encode()):
+    if not hmac.compare_digest(proof, _hs_proof(b"rixi-hs1", client_nonce)):
         return JSONResponse({"error": "Bad secret"}, status_code=401)
 
     # consume one use only after the secret was validated
@@ -2461,45 +2599,56 @@ async def handshake_step1(body: HandshakeReq,
         aes_key = None                 # clear live key
         auth_settings.aes_key = None   # clear existing key
     # generate fresh RSA keypair
-    ephemeral_privkey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pub_pem = ephemeral_privkey.public_key().public_bytes(
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pub_pem = key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode()
+    server_nonce = os.urandom(32)
+    pending_handshake = {"key": key, "client_nonce": client_nonce, "server_nonce": server_nonce,
+                         "at": time.monotonic()}
 
-    return {"public_key": pub_pem}
+    return {"public_key": pub_pem, "nonce": base64.b64encode(server_nonce).decode(),
+            "proof": base64.b64encode(_hs_proof(b"rixi-hs2", client_nonce, server_nonce,
+                                                pub_pem.encode())).decode()}
 
 @app.post("/handshake/finish")
 async def handshake_step2(req: Dict[str, str],
                           auth: bool = Depends(verify_authentication)):
     """
     Client sends:
-        { "cipher": "<base64 RSA-encrypted blob>" }
-        blob = AES_KEY(32B) || ROT_SECRET(32B)
+        { "cipher": "<base64 RSA-encrypted blob>", "proof": b64(HMAC) }
+        blob  = AES_KEY(32B) || ROT_SECRET(32B)
+        proof = HMAC-SHA256(secret, "rixi-hs3" ‖ client nonce ‖ server nonce ‖ cipher)
+    Only whoever started this handshake with the secret can finish it, once, within a minute.
     """
-    if not ephemeral_privkey:
+    global pending_handshake
+    hs = pending_handshake
+    if hs is not None and time.monotonic() - hs["at"] > HANDSHAKE_TTL:
+        hs = pending_handshake = None
+    if not hs:
         return JSONResponse({"error": "No active handshake"}, status_code=400)
 
-    import base64
     from cryptography.hazmat.primitives.asymmetric import padding
     from cryptography.hazmat.primitives import hashes
 
-    cipher_b64 = req.get("cipher")
-    if not cipher_b64:
-        return JSONResponse({"error": "Missing 'cipher' field"}, status_code=400)
+    ct = _b64(req.get("cipher") if isinstance(req.get("cipher"), str) else None, 1, 1024)
+    proof = _b64(req.get("proof") if isinstance(req.get("proof"), str) else None, 32, 32)
+    if ct is None:
+        return JSONResponse({"error": "Missing or invalid 'cipher' field"}, status_code=400)
+    if proof is None or not hmac.compare_digest(
+            proof, _hs_proof(b"rixi-hs3", hs["client_nonce"], hs["server_nonce"], ct)):
+        return JSONResponse({"error": "Bad proof"}, status_code=401)
     try:
-        ct = base64.b64decode(cipher_b64)
-    except Exception:
-        return JSONResponse({"error": "Invalid base64 in 'cipher' field"}, status_code=400)
-    try:
-        plain = ephemeral_privkey.decrypt(
+        plain = hs["key"].decrypt(
             ct,
             padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
         )
-    except Exception as exc:
-        return JSONResponse({"error": f"Decrypt failed: {exc}"}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "Decrypt failed"}, status_code=400)
     if len(plain) < 64:
         return JSONResponse({"error": "Cipher payload too short: expected 64 bytes"}, status_code=400)
+    pending_handshake = None            # one finish per handshake: the key is gone now
     global aes_key
     aes_key = plain[:32]
     rotation_secret = plain[32:64]
@@ -3180,6 +3329,7 @@ if __name__ == "__main__":
     setup_logging(args.log_level, args.log_dir, args.log_size_mb, args.log_backup_count)
 
     max_upload_bytes = args.max_upload_mb * 1024 * 1024
+    bind_host = args.host
     WORKSPACE_ROOT = args.workspace
     PREVIEW_DOMAIN = args.preview_domain
     SERVER_PORT = args.port

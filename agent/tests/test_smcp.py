@@ -197,3 +197,81 @@ def test_smcp_config_from_dict():
     # default (no transport) stays stdio with a command — existing behavior unchanged
     legacy = MCPServerConfig.from_dict({"name": "fs", "command": ["python", "-m", "mcp_servers", "filesystem"]})
     assert legacy.transport == "stdio"
+
+
+# ── a message is taken once, while it is fresh ───────────────────────────────
+
+def _replay_server():
+    import smcp as rixi_smcp
+    calls = []
+    tools = {"write_file": {"description": "", "parameters": {},
+                            "handler": lambda p: calls.append(p) or "written"}}
+    secret = "integration-secret-value-32-bytes-x"
+    server = rixi_smcp.SMCPToolServer(tools, secret_key=secret, api_key="k")
+    fernet, mac = rixi_smcp._derive_keys(secret, "")
+    return rixi_smcp, server, fernet, mac, calls
+
+
+def test_a_recorded_tool_call_cannot_be_sent_again():
+    import copy
+    import time
+    rixi_smcp, server, fernet, mac, calls = _replay_server()
+    token = server._issue_token("agent")
+    env = rixi_smcp._envelope(mac, fernet, "tool_invoke", {
+        "token": token, "tool_name": "write_file", "parameters": {"path": "a", "content": "b"}}, True)
+
+    async def run():
+        first = await server.handle_message(copy.deepcopy(env))
+        assert first["type"] == "tool_response" and len(calls) == 1
+        for _ in range(3):                                  # the same frame, on new connections
+            again = await server.handle_message(copy.deepcopy(env))
+            assert again["type"] == "error"
+            assert "already received" in rixi_smcp._decrypt(fernet, again)["error"]
+        assert len(calls) == 1
+        # one stamped long ago (validly signed then) is refused however new its id
+        old = rixi_smcp._envelope(mac, fernet, "tool_invoke", {
+            "token": token, "tool_name": "write_file", "parameters": {}}, True)
+        old["timestamp"] = float(int(time.time()) - 10 * 365 * 86400)
+        old["signature"] = rixi_smcp._sign(mac, old["id"], old["type"],
+                                           f"{int(old['timestamp'])}.0",
+                                           rixi_smcp._canonical(old["payload"]))
+        stale = await server.handle_message(old)
+        assert stale["type"] == "error" and "not fresh" in rixi_smcp._decrypt(fernet, stale)["error"]
+        assert len(calls) == 1
+    asyncio.run(run())
+
+
+def test_the_client_refuses_a_reply_played_back_or_meant_for_another_call():
+    import json
+    rixi_smcp, server, fernet, mac, _ = _replay_server()
+
+    class FakeWs:
+        def __init__(self, replies):
+            self.replies = replies
+
+        async def send(self, raw):
+            pass
+
+        async def recv(self):
+            return json.dumps(self.replies.pop(0))
+    cfg = rixi_smcp.SMCPConfig()
+    client = rixi_smcp.SMCPClient(cfg)
+    client._fernet, client._mac_key, client._token = fernet, mac, "t"
+    reply = server._reply("tool_response", {"tool_name": "read_file", "result": "old content",
+                                            "status": "success"})
+
+    async def run():
+        client._ws = FakeWs([reply, reply])
+        assert await client.invoke_tool("read_file", path="x") == "old content"
+        with pytest.raises(RuntimeError, match="already received"):
+            await client.invoke_tool("read_file", path="x")           # the same reply again
+        other = server._reply("tool_response", {"tool_name": "list_directory", "result": [],
+                                                "status": "success"})
+        client._ws = FakeWs([other])
+        with pytest.raises(RuntimeError, match="not 'read_file'"):
+            await client.invoke_tool("read_file", path="x")
+        wrong_kind = server._reply("capability_discovery", {"capabilities": {}})
+        client._ws = FakeWs([wrong_kind])
+        with pytest.raises(RuntimeError, match="expected a tool_response"):
+            await client.invoke_tool("read_file", path="x")
+    asyncio.run(run())

@@ -46,7 +46,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from rixi_transport import (
     Transport, NONCE_LEN, STREAM_TIMEOUT, _http, _http_session, _hdrs,
     _write_secret_file, DEFAULT_HEADERS_FILE, build_custom_headers,
-    set_default_headers, mask_header_value,
+    set_default_headers, mask_header_value, is_local_secret,
 )
 
 # Optional aiohttp import for external MCP servers
@@ -279,6 +279,11 @@ def _package_dir(path=".", env_handler=None, env_profile=None, offline_mode=Fals
                     # (generated files are added separately from the temp dir)
                     if f in [".env", ".env_injection.sh", ".env_vars.json"]:
                         should_include = env_injection_enabled and arcname not in env_files_created
+                    # The client's own keys, its config (tokens) and its header file are not
+                    # part of the project: packing them would hand the server the key that
+                    # protects everything else
+                    elif is_local_secret(f):
+                        should_include = False
                     # Include regular project files (not hidden, not compiled)
                     elif not f.startswith(".") and not f.endswith(".pyc") and not f.endswith("~"):
                         should_include = True
@@ -1453,6 +1458,18 @@ class ProxyRequestHandler:
                     "body": json.dumps({"error": "No proxy mapping found for path", "path": path})
                 }
             
+            # The path comes from the task's output: one with a `..` (or an encoded one) would
+            # match the mapping and then leave it, reaching any path of the local service with
+            # the mapping's own headers attached.
+            decoded = urllib.parse.unquote(urllib.parse.unquote(str(path)))
+            if any(seg in ("..", ".") for seg in decoded.replace("\\", "/").split("/")) \
+                    or "\x00" in decoded:
+                return {
+                    "status_code": 400,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"error": "Path may not contain . or .. segments"})
+                }
+
             mapping_name = mapping.get("name", "unnamed")
             local_url = mapping.get("local_url", "http://localhost")
             
@@ -1597,7 +1614,9 @@ class ProxyRequestHandler:
             kwargs = {
                 "timeout": timeout,
                 "verify": mapping.get("verify_ssl", True),
-                "allow_redirects": mapping.get("follow_redirects", True)
+                # off unless the mapping asks: a redirect takes the mapping's secret headers
+                # to wherever the local service points
+                "allow_redirects": mapping.get("follow_redirects", False)
             }
             
             # Add body for methods that support it
@@ -1778,11 +1797,27 @@ class LocalProxyTestServer:
 # MCP BACK-CHANNEL CLASSES (Enhanced with Proxy Support)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-def _resolve_within_root(root_path: str, file_path: str) -> Optional[Path]:
-    """Resolve file_path inside root_path, rejecting traversal/symlink escapes."""
+# Inside the root, but not for a task: the places that turn a written file into code run on
+# this machine the next time git or a shell is used here, and the credentials kept beside the
+# project (the client's own keys and config among them), which a task may not read either.
+_NO_WRITE_DIRS = {".git", ".ssh", ".aws", ".gnupg", ".vscode", ".idea", ".github"}
+_NO_WRITE_FILES = {".envrc", ".bashrc", ".bash_profile", ".zshrc", ".profile", ".gitconfig"}
+_NO_READ_DIRS = {".ssh", ".aws", ".gnupg"}
+_NO_READ_FILES = {".env", ".envrc", ".netrc", ".npmrc", ".pypirc", ".git-credentials"}
+
+
+def _resolve_within_root(root_path: str, file_path: str, write: bool = False) -> Optional[Path]:
+    """Resolve file_path inside root_path, rejecting traversal/symlink escapes, credentials,
+    and for a write the places that would run it as code."""
     real = Path(root_path).resolve()
     target = (real / file_path).resolve()
     if not target.is_relative_to(real):
+        return None
+    parts = target.relative_to(real).parts
+    name = parts[-1] if parts else ""
+    if is_local_secret(name) or name in _NO_READ_FILES or any(p in _NO_READ_DIRS for p in parts):
+        return None
+    if write and (name in _NO_WRITE_FILES or any(p in _NO_WRITE_DIRS for p in parts)):
         return None
     return target
 
@@ -1990,7 +2025,7 @@ class MCPBackChannelHandler:
             root_path = self.mcp_servers[server_name]["root_path"]
 
             # Security: ensure path is within root
-            abs_path = _resolve_within_root(root_path, file_path)
+            abs_path = _resolve_within_root(root_path, file_path, write=True)
             if abs_path is None:
                 return {"error": "Path outside of allowed root directory"}
 
@@ -2047,7 +2082,7 @@ class MCPBackChannelHandler:
             root_path = self.mcp_servers[server_name]["root_path"]
 
             # Security: ensure path is within root
-            abs_path = _resolve_within_root(root_path, dir_path)
+            abs_path = _resolve_within_root(root_path, dir_path, write=True)
             if abs_path is None:
                 return {"error": "Path outside of allowed root directory"}
 

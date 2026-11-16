@@ -71,10 +71,13 @@ def step(ctx, step_name, server, resource, gateway, secret, provider, token, aes
     # Build the inner step command: `python -u flow.py <top_args> step <step> <step_args>`.
     # `python` (not an absolute path) so it resolves to the box's pixi-env interpreter.
     kwargs.pop("ubf_context", None)  # not a step CLI option
-    top_args = " ".join(util.dict_to_cli_options(ctx.parent.parent.params))
-    step_args = " ".join(util.dict_to_cli_options(kwargs))
+    # Each argument quoted for the shell that runs this line on the box: a tag or a namespace
+    # is a value, and must not be read as more commands.
+    top_args = " ".join(shlex.quote(str(a)) for a in util.dict_to_cli_options(ctx.parent.parent.params))
+    step_args = " ".join(shlex.quote(str(a)) for a in util.dict_to_cli_options(kwargs))
     flow_file = os.path.basename(sys.argv[0])
-    step_cli = "python -u %s %s step %s %s" % (flow_file, top_args, step_name, step_args)
+    step_cli = "python -u %s %s step %s %s" % (shlex.quote(flow_file), top_args,
+                                               shlex.quote(step_name), step_args)
 
     ctx.obj.echo("Running step '%s' on rixi (%s)" % (
         step_name, ("server " + server) if server else ("resource " + str(resource))))

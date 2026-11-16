@@ -15,6 +15,8 @@ _SECRET = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _SSH_KEY = re.compile(r"^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-[a-z0-9@.-]+) "
                       r"[A-Za-z0-9+/=]+( [^'\n\r]{0,200})?$")
 _PEM = re.compile(r"^-----BEGIN PUBLIC KEY-----\n[A-Za-z0-9+/=\n]+-----END PUBLIC KEY-----\n?$")
+_TLS_CERT = re.compile(r"^-----BEGIN CERTIFICATE-----\n[A-Za-z0-9+/=\n]+-----END CERTIFICATE-----\n?$")
+_TLS_KEY = re.compile(r"^-----BEGIN PRIVATE KEY-----\n[A-Za-z0-9+/=\n]+-----END PRIVATE KEY-----\n?$")
 
 
 class RenderError(ValueError):
@@ -28,7 +30,8 @@ def _check(name: str, value: str, pattern: re.Pattern) -> str:
 
 
 def render(*, rixi_ref: str, port: int, audience: str, jwt_public_key_pem: str,
-           key_secret: str, ssh_public_key: Optional[str] = None) -> str:
+           key_secret: str, tls_cert_pem: str, tls_key_pem: str,
+           ssh_public_key: Optional[str] = None) -> str:
     """Return the shell user-data that installs and starts the rixi server on a new box."""
     if not 1 <= int(port) <= 65535:
         raise RenderError("refusing to render user-data: invalid port")
@@ -44,6 +47,9 @@ def render(*, rixi_ref: str, port: int, audience: str, jwt_public_key_pem: str,
         "__RIXI_KEY_SECRET__": _check("key secret", key_secret, _SECRET),
         "__RIXI_SSH_PUBKEY__": ssh,
         "__RIXI_JWT_PUBLIC_KEY__": pem,
+        "__RIXI_TLS_CERT__": _check("TLS certificate", tls_cert_pem.strip() + "\n",
+                                    _TLS_CERT).rstrip("\n"),
+        "__RIXI_TLS_KEY__": _check("TLS key", tls_key_pem.strip() + "\n", _TLS_KEY).rstrip("\n"),
     }
     for placeholder, value in values.items():
         template = template.replace(placeholder, value)

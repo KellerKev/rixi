@@ -43,9 +43,10 @@ def interactive(client, cwd: Optional[str] = None) -> int:
     headers = client._headers()
     key = client.aes_key
     code = {"exit": 0}
+    ssl_context = client.ssl_context() if hasattr(client, "ssl_context") else None
     with connect(pty_url(client.server_url, size.columns, size.lines, cwd),
-                 additional_headers=headers, max_size=None,
-                 open_timeout=30) as ws:
+                 additional_headers=headers, max_size=None, open_timeout=30,
+                 **({"ssl": ssl_context} if ssl_context is not None else {})) as ws:
         def reader():
             try:
                 for msg in ws:

@@ -24,7 +24,11 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import fnmatch
+import hashlib
+import hmac
 import json
+import logging
 import os
 import tarfile
 import tempfile
@@ -39,10 +43,81 @@ from .crypto import decrypt, encrypt, frame, iter_frames
 # Packages are sealed in chunks of this size, each as one length-prefixed AES-GCM frame.
 _SEAL_CHUNK = 1024 * 1024
 
+log = logging.getLogger("rixi")
+
 DEFAULT_IGNORES = {
     ".git", ".pixi", "__pycache__", ".venv", "venv", ".mypy_cache",
     ".ruff_cache", ".pytest_cache", "node_modules", ".DS_Store",
 }
+
+# Files and directories that hold credentials are not shipped unless asked for: a project
+# directory often has them lying around, and a box is somebody else's machine. A `.rixiignore`
+# file in the project adds patterns (one per line), and a line starting with `!` ships a path
+# these would leave out (`!.env` to send it after all).
+SECRET_PATTERNS = (
+    ".env", ".env.*", ".envrc", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",
+    "id_rsa", "id_rsa.*", "id_dsa", "id_ecdsa", "id_ecdsa.*", "id_ed25519", "id_ed25519.*",
+    ".npmrc", ".pypirc", ".netrc", ".git-credentials", ".htpasswd", ".dockercfg",
+    ".ssh", ".aws", ".gnupg", ".azure", ".kube", ".docker",
+    "aes.key", "rotation.secret", "rixi_headers.json", "pixi_remote_config.toml",
+    "credentials.json", "terraform.tfstate", "terraform.tfstate.*", "*.tfvars",
+)
+_NOT_SECRET = (".env.example", ".env.sample", ".env.template", ".env.dist")
+
+
+def _matches(name: str, rel: str, patterns) -> bool:
+    return any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) for p in patterns)
+
+
+def _rixiignore(root: Path):
+    """(extra patterns to leave out, patterns to ship after all) from the project's .rixiignore."""
+    out, keep = [], []
+    try:
+        lines = (root / ".rixiignore").read_text().splitlines()
+    except OSError:
+        return out, keep
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        (keep if line.startswith("!") else out).append(line.lstrip("!").strip().rstrip("/"))
+    return out, keep
+
+
+def cert_fingerprint(pem: str) -> str:
+    """SHA-256 of a PEM certificate's DER form, in hex."""
+    import ssl
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem.strip() + "\n")).hexdigest()
+
+
+class _PinnedAdapter(requests.adapters.HTTPAdapter):
+    """TLS to a box that has a certificate of its own making: the one certificate whose SHA-256
+    fingerprint the profile holds is trusted, whatever address the box is reached at, and no
+    other — not even one a certificate authority signed."""
+
+    def __init__(self, fingerprint: str):
+        self._fingerprint = fingerprint.replace(":", "").lower()
+        if len(self._fingerprint) != 64 or any(c not in "0123456789abcdef"
+                                               for c in self._fingerprint):
+            raise ValueError("tls_fingerprint must be the SHA-256 of the certificate, in hex")
+        super().__init__()
+
+    def init_poolmanager(self, connections, maxsize, block=False, **kw):
+        kw["assert_fingerprint"] = self._fingerprint
+        super().init_poolmanager(connections, maxsize, block, **kw)
+
+    def cert_verify(self, conn, url, verify, cert):
+        # the fingerprint is the check (urllib3 makes it on every connection); the chain and the
+        # name have nothing to say about a certificate nobody signed
+        conn.cert_reqs = "CERT_NONE"
+        conn.ca_certs = None
+        conn.ca_cert_dir = None
+        conn.assert_fingerprint = self._fingerprint
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        host, pool = super().build_connection_pool_key_attributes(request, False, cert)
+        pool["assert_fingerprint"] = self._fingerprint
+        return host, pool
 
 
 @dataclass
@@ -85,23 +160,48 @@ class Client:
                 tokens can be minted fresh each time.
     aes_key:    optional base64 of a 32-byte AES key matching the server's ``--aes-key``.
     verify_ssl: verify TLS certs (default True); set False only for self-signed dev certs.
+    tls_cert:   PEM of the one certificate to trust, for a box that was given a certificate of
+                its own (``rixi up``): the connection is refused for any other certificate.
     timeout:    per-request timeout in seconds for non-streaming calls.
     """
 
     def __init__(self, server_url: str = "http://127.0.0.1:9000", *,
                  token: Union[str, Callable[[], str], None] = None,
                  aes_key: Optional[str] = None,
-                 verify_ssl: bool = True, timeout: float = 30.0) -> None:
+                 verify_ssl: bool = True, tls_cert: Optional[str] = None,
+                 timeout: float = 30.0) -> None:
         self.server_url = server_url.rstrip("/")
         self.token = token
         self.aes_key = base64.b64decode(aes_key) if aes_key else None
         self.verify_ssl = verify_ssl
+        self.tls_cert = tls_cert
         self.timeout = timeout
+        self._http = requests.Session()
+        if tls_cert:
+            if not self.server_url.startswith("https://"):
+                raise ValueError("tls_cert needs an https:// server_url")
+            self._http.mount("https://", _PinnedAdapter(cert_fingerprint(tls_cert)))
+
+    def ssl_context(self):
+        """For connections made outside this class (the terminal's WebSocket): trusts what
+        this client trusts. None for plain http."""
+        import ssl
+        if not self.server_url.startswith("https://"):
+            return None
+        if self.tls_cert:
+            ctx = ssl.create_default_context(cadata=self.tls_cert)   # that certificate only
+            ctx.check_hostname = False              # it names no address; the key is the check
+            return ctx
+        ctx = ssl.create_default_context()
+        if not self.verify_ssl:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
 
     # ── public API ─────────────────────────────────────────────────────────
     def health(self) -> dict:
         """GET /health — raises for a non-2xx response."""
-        r = requests.get(f"{self.server_url}/health", headers=self._headers(),
+        r = self._http.get(f"{self.server_url}/health", headers=self._headers(),
                          verify=self.verify_ssl, timeout=self.timeout)
         r.raise_for_status()
         return r.json()
@@ -116,20 +216,46 @@ class Client:
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import padding
 
-        r = requests.post(f"{self.server_url}/handshake",
-                          json={"secret": secret, "rotate": rotate}, headers=self._headers(),
-                          verify=self.verify_ssl, timeout=self.timeout)
+        def proof(step: bytes, *parts: bytes) -> bytes:
+            mac = hmac.new(secret.encode(), step, hashlib.sha256)
+            for part in parts:
+                mac.update(len(part).to_bytes(4, "big") + part)
+            return mac.digest()
+
+        def b64(raw: bytes) -> str:
+            return base64.b64encode(raw).decode()
+
+        # The secret is never sent: this side proves it knows it, and so must the server —
+        # over the public key it answers with, so the key cannot be swapped on the way.
+        nonce = os.urandom(32)
+        r = self._http.post(f"{self.server_url}/handshake",
+                            json={"nonce": b64(nonce), "proof": b64(proof(b"rixi-hs1", nonce)),
+                                  "rotate": rotate}, headers=self._headers(),
+                            verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"handshake failed: {r.status_code} {r.text}")
-        pub = serialization.load_pem_public_key(r.json()["public_key"].encode())
+        try:
+            answer = r.json()
+            pem = answer["public_key"].encode()
+            server_nonce = base64.b64decode(answer["nonce"])
+            server_proof = base64.b64decode(answer["proof"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise RixiError("handshake failed: the server did not prove it knows the secret "
+                            "(an older rixi server? update it to match this client)")
+        if not hmac.compare_digest(server_proof,
+                                   proof(b"rixi-hs2", nonce, server_nonce, pem)):
+            raise RixiError("handshake failed: the key offered is not from a server that knows "
+                            "the secret — something sits between this client and the box")
+        pub = serialization.load_pem_public_key(pem)
         new_key, rotation_secret = os.urandom(32), os.urandom(32)
         cipher = pub.encrypt(new_key + rotation_secret,
                              padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),
                                           algorithm=hashes.SHA256(), label=None))
-        r2 = requests.post(f"{self.server_url}/handshake/finish",
-                           json={"cipher": base64.b64encode(cipher).decode()},
-                           headers=self._headers(), verify=self.verify_ssl,
-                           timeout=self.timeout)
+        r2 = self._http.post(f"{self.server_url}/handshake/finish",
+                             json={"cipher": b64(cipher),
+                                   "proof": b64(proof(b"rixi-hs3", nonce, server_nonce, cipher))},
+                             headers=self._headers(), verify=self.verify_ssl,
+                             timeout=self.timeout)
         if r2.status_code != 200:
             raise RixiError(f"handshake failed: {r2.status_code} {r2.text}")
         self.aes_key = new_key
@@ -189,7 +315,7 @@ class Client:
             if v is not None:
                 body[k] = v
         data, headers = self._seal_json(body)
-        r = requests.post(f"{self.server_url}/exec", data=data, headers=headers,
+        r = self._http.post(f"{self.server_url}/exec", data=data, headers=headers,
                           verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"spawn failed: {r.status_code} {_detail(r)}")
@@ -212,7 +338,7 @@ class Client:
         """Follow a task's output until it ends: yields ``("stdout", text)`` /
         ``("stderr", text)``, then ``("exit", {...})``. ``history=False`` skips what it printed
         before you attached. Stop iterating to detach; the task keeps running."""
-        with requests.get(f"{self.server_url}/task/{task_id}/stream",
+        with self._http.get(f"{self.server_url}/task/{task_id}/stream",
                           params={"history": str(history).lower()}, headers=self._headers(),
                           stream=True, verify=self.verify_ssl, timeout=None) as r:
             if r.status_code != 200:
@@ -237,11 +363,11 @@ class Client:
             headers["Content-Type"] = "application/octet-stream"
         else:
             headers["Content-Type"] = "text/plain" if params else "application/json"
-        r = requests.post(f"{self.server_url}/task/{task_id}/input", params=params, data=body,
+        r = self._http.post(f"{self.server_url}/task/{task_id}/input", params=params, data=body,
                           headers=headers, verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"input failed: {r.status_code} {_detail(r)}")
-        return r.json()
+        return json.loads(self._unseal(r))
 
     def restart(self, task_id: str) -> dict:
         """Run a task again from the start (same code, or the same command)."""
@@ -252,11 +378,11 @@ class Client:
         """Replace a running task's code with this project and start it again, same id."""
         with self._post_package(project_dir, "", True, ignore,
                                 path=f"/task/{task_id}/redeploy") as r:
-            return r.json()
+            return json.loads(self._unseal(r))
 
     def kill(self, task_id: str) -> None:
         """Stop a task and forget it (its output goes with it)."""
-        r = requests.delete(f"{self.server_url}/task/{task_id}", headers=self._headers(),
+        r = self._http.delete(f"{self.server_url}/task/{task_id}", headers=self._headers(),
                             verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"kill failed: {r.status_code} {_detail(r)}")
@@ -268,38 +394,38 @@ class Client:
         Private by default: ``share_url`` carries a token, opening it once sets a cookie for
         that host; ``public=True`` lets anyone with the URL in. Hosted (named) boxes only."""
         data, headers = self._seal_json({"port": int(port), "public": bool(public)})
-        r = requests.post(f"{self.server_url}/previews", data=data, headers=headers,
+        r = self._http.post(f"{self.server_url}/previews", data=data, headers=headers,
                           verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"preview failed: {r.status_code} {_detail(r)}")
         return json.loads(self._unseal(r))
 
     def previews(self) -> List[dict]:
-        r = requests.get(f"{self.server_url}/previews", headers=self._headers(),
+        r = self._http.get(f"{self.server_url}/previews", headers=self._headers(),
                          verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"list previews failed: {r.status_code} {_detail(r)}")
         return json.loads(self._unseal(r))
 
     def close_preview(self, port: int) -> None:
-        r = requests.delete(f"{self.server_url}/previews/{int(port)}", headers=self._headers(),
+        r = self._http.delete(f"{self.server_url}/previews/{int(port)}", headers=self._headers(),
                             verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"close preview failed: {r.status_code} {_detail(r)}")
 
     def _get_json(self, path: str, what: str):
-        r = requests.get(f"{self.server_url}{path}", headers=self._headers(),
+        r = self._http.get(f"{self.server_url}{path}", headers=self._headers(),
                          verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"{what} failed: {r.status_code} {_detail(r)}")
-        return r.json()
+        return json.loads(self._unseal(r))
 
     def _post_json(self, path: str, what: str):
-        r = requests.post(f"{self.server_url}{path}", headers=self._headers(),
+        r = self._http.post(f"{self.server_url}{path}", headers=self._headers(),
                           verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"{what} failed: {r.status_code} {_detail(r)}")
-        return r.json()
+        return json.loads(self._unseal(r))
 
     # ── sandboxed environments: commands and files ─────────────────────────
     def exec(self, cmd: Union[str, List[str]], *, cwd: Optional[str] = None,
@@ -339,7 +465,7 @@ class Client:
         if stdin is not None:
             body["stdin"] = stdin
         data, headers = self._seal_json(body)
-        with requests.post(f"{self.server_url}/exec", data=data, headers=headers, stream=True,
+        with self._http.post(f"{self.server_url}/exec", data=data, headers=headers, stream=True,
                            verify=self.verify_ssl, timeout=None) as r:
             if r.status_code != 200:
                 raise RixiError(f"exec failed: {r.status_code} {_detail(r)}")
@@ -359,28 +485,28 @@ class Client:
         if self.aes_key:
             raw, headers["X-Rixi-Encrypted"] = encrypt(self.aes_key, raw), "1"
         headers["Content-Type"] = "application/octet-stream"
-        r = requests.put(f"{self.server_url}/files", params={"path": path}, data=raw,
+        r = self._http.put(f"{self.server_url}/files", params={"path": path}, data=raw,
                          headers=headers, verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"write {path} failed: {r.status_code} {_detail(r)}")
-        return r.json()
+        return json.loads(self._unseal(r))
 
     def read_file(self, path: str) -> bytes:
-        r = requests.get(f"{self.server_url}/files", params={"path": path},
+        r = self._http.get(f"{self.server_url}/files", params={"path": path},
                          headers=self._headers(), verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"read {path} failed: {r.status_code} {_detail(r)}")
         return self._unseal(r)
 
     def list_files(self, path: str = ".") -> List[dict]:
-        r = requests.get(f"{self.server_url}/files/list", params={"path": path},
+        r = self._http.get(f"{self.server_url}/files/list", params={"path": path},
                          headers=self._headers(), verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"list {path} failed: {r.status_code} {_detail(r)}")
         return json.loads(self._unseal(r))["entries"]
 
     def delete_file(self, path: str) -> None:
-        r = requests.delete(f"{self.server_url}/files", params={"path": path},
+        r = self._http.delete(f"{self.server_url}/files", params={"path": path},
                             headers=self._headers(), verify=self.verify_ssl, timeout=self.timeout)
         if r.status_code != 200:
             raise RixiError(f"delete {path} failed: {r.status_code} {_detail(r)}")
@@ -398,7 +524,14 @@ class Client:
         if r.headers.get("X-Rixi-Encrypted") == "1":
             if not self.aes_key:
                 raise RixiError("the server sealed its answer but this client has no key")
-            return decrypt(self.aes_key, r.content)
+            try:
+                return decrypt(self.aes_key, r.content)
+            except Exception:
+                raise RixiError("the answer was not sealed with this client's key")
+        if self.aes_key:
+            # with a key every answer is sealed: one in the clear did not come from the server
+            # that holds the key (or the server is older than this client)
+            raise RixiError("the server answered in the clear although this client has a key")
         return r.content
 
     def package(self, project_dir: str = ".", *,
@@ -416,18 +549,39 @@ class Client:
         root = Path(project_dir)
         if not root.is_dir():
             raise RixiError(f"not a directory: {project_dir}")
+        # An explicit `ignore` is the caller's whole say; otherwise the defaults, what looks
+        # like a credential, and the project's .rixiignore.
         skip = DEFAULT_IGNORES if ignore is None else ignore
+        extra, keep = _rixiignore(root) if ignore is None else ([], [])
+        secrets_out = SECRET_PATTERNS if ignore is None else ()
+        held_back: List[str] = []
+
+        def left_out(name: str, rel: str) -> bool:
+            if name in skip or _matches(name, rel, extra):
+                return True
+            if _matches(name, rel, secrets_out) and name not in _NOT_SECRET \
+                    and not _matches(name, rel, keep):
+                held_back.append(rel)
+                return True
+            return False
 
         tar_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tar")
         tar_tmp.close()
         try:
             with tarfile.open(tar_tmp.name, "w") as tar:
                 for dirpath, dirs, files in os.walk(root):
-                    dirs[:] = [d for d in dirs if d not in skip]
+                    here = Path(dirpath).relative_to(root)
+                    dirs[:] = [d for d in dirs if not left_out(d, (here / d).as_posix())]
                     for name in files:
                         fp = Path(dirpath) / name
                         arcname = str(fp.relative_to(root))
+                        if left_out(name, fp.relative_to(root).as_posix()):
+                            continue
                         tar.add(fp, arcname)
+            if held_back:
+                shown = ", ".join(sorted(held_back)[:8]) + (" …" if len(held_back) > 8 else "")
+                log.warning("not shipped (they look like credentials): %s — add a line like "
+                            "`!.env` to .rixiignore to send one", shown)
             lz4_path = tar_tmp.name + ".lz4"
             with open(tar_tmp.name, "rb") as src, lz4.frame.open(lz4_path, "wb") as dst:
                 dst.write(src.read())
@@ -469,7 +623,7 @@ class Client:
                 files = {"file": (os.path.basename(pkg), fh, "application/octet-stream")}
                 data = {"task_name": task, "keep_alive": str(keep_alive).lower(),
                         **(extra or {})}
-                with requests.post(f"{self.server_url}{path}", files=files, data=data,
+                with self._http.post(f"{self.server_url}{path}", files=files, data=data,
                                    headers=headers, stream=True,
                                    verify=self.verify_ssl, timeout=None) as r:
                     if r.status_code != 200:
@@ -484,7 +638,10 @@ class Client:
 
     def _headers(self) -> Dict[str, str]:
         token = self.token() if callable(self.token) else self.token
-        return {"Authorization": f"Bearer {token}"} if token else {}
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if self.aes_key:
+            headers["X-Rixi-Accept-Sealed"] = "1"      # plain JSON answers come sealed as well
+        return headers
 
 
 class RixiError(RuntimeError):

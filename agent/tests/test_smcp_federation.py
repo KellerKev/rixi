@@ -7,6 +7,7 @@ derivation, AES-GCM (session-id AAD) framing, PS256 proof verification, and RS25
 client-token verification byte-for-byte, plus a full sender↔receiver round-trip.
 """
 import asyncio
+import time
 import json
 from pathlib import Path
 
@@ -76,7 +77,8 @@ def test_validator_binding_and_replay():
     def signed(target, signer, nonce):
         proof = {
             "client_jwt": "CJWT", "forwarded_by": signer, "forwarded_at": 1700000000.0,
-            "task_hash": "abc", "forwarded_to": target, "nonce": nonce, "expires_at": 4102444800.0,
+            "task_hash": "abc", "forwarded_to": target, "nonce": nonce,
+            "expires_at": time.time() + 300,
         }
         sig = fed.hmac_sign_proof("sekret", fed.canonical_proof(proof))
         return {"proof": proof, "signature": sig, "sig_alg": "HS256"}
@@ -187,3 +189,87 @@ def test_server_rejects_federation_when_disabled():
         assert "federation not enabled" in (err.get("error") if isinstance(err, dict) else str(err))
 
     asyncio.run(run())
+
+
+# ── a proof is for one task, once, for a short while ─────────────────────────
+
+def _forward_params(receiver, task, proof_task=None, secret="shared-secret", **proof_over):
+    """What a sender puts on the wire for `task`, with a proof signed for `proof_task`."""
+    ephemeral, my_pub = fed.initiator_ecdh_start()
+    peer_pub = receiver.key_exchange({"peer_node": "nodeA", "peer_pub_hex": my_pub})["peer_pub_hex"]
+    key = fed.initiator_ecdh_finish(ephemeral, peer_pub, "nodeA", receiver.node_id)
+    signed = fed.build_signed_proof("unused", task if proof_task is None else proof_task,
+                                    receiver.node_id, "nodeA", hmac_secret=secret)
+    if proof_over:
+        signed["proof"].update(proof_over)
+        signed["signature"] = fed.hmac_sign_proof(secret, fed.canonical_proof(signed["proof"]))
+    payload = {"task": task, "auth_proof": signed, "forwarding_metadata": {}}
+    enc = fed.encrypt_request(key, fed.session_id_for("nodeA", receiver.node_id), payload)
+    return {"from_node": "nodeA", "encrypted_request": enc}, signed
+
+
+def test_a_proof_carries_only_the_task_it_was_signed_for():
+    ran = []
+    receiver = fed.FederationReceiver("nodeB", "shared-secret",
+                                      dispatch=lambda task, user, meta: ran.append(task) or "ok")
+    harmless, harmful = {"type": "harmless"}, {"type": "write_file", "path": "/etc/passwd"}
+    params, _ = _forward_params(receiver, harmful, proof_task=harmless)
+    with pytest.raises(ValueError, match="task_hash"):
+        receiver.forward(params)
+    assert ran == []
+    params, _ = _forward_params(receiver, harmless)
+    assert receiver.forward(params) == "ok" and ran == [harmless]
+    # a sender that hashes compact JSON (no spaces) is the same task
+    import hashlib
+    import json
+    compact = hashlib.sha256(json.dumps(harmless, sort_keys=True,
+                                        separators=(",", ":")).encode()).hexdigest()
+    params, _ = _forward_params(receiver, harmless, task_hash=compact)
+    assert receiver.forward(params) == "ok"
+
+
+def test_a_proof_used_on_one_connection_is_used_up_on_all():
+    shared = {}
+    first = fed.FederationReceiver("nodeB", "shared-secret", seen_nonces=shared)
+    second = fed.FederationReceiver("nodeB", "shared-secret", seen_nonces=shared)   # a new connection
+    task = {"type": "storage"}
+    params, signed = _forward_params(first, task)
+    assert first.forward(params)["status"] == "success"
+    # the same signed proof, sealed afresh for the new connection
+    ephemeral, my_pub = fed.initiator_ecdh_start()
+    peer_pub = second.key_exchange({"peer_node": "nodeA", "peer_pub_hex": my_pub})["peer_pub_hex"]
+    key = fed.initiator_ecdh_finish(ephemeral, peer_pub, "nodeA", "nodeB")
+    enc = fed.encrypt_request(key, fed.session_id_for("nodeA", "nodeB"),
+                              {"task": task, "auth_proof": signed, "forwarding_metadata": {}})
+    with pytest.raises(ValueError, match="replay"):
+        second.forward({"from_node": "nodeA", "encrypted_request": enc})
+
+
+def test_a_proof_cannot_be_made_to_last():
+    receiver = fed.FederationReceiver("nodeB", "shared-secret")
+    params, _ = _forward_params(receiver, {"type": "x"}, expires_at=time.time() + 10 * 365 * 86400)
+    with pytest.raises(ValueError, match="too far"):
+        receiver.forward(params)
+    # the nonce of a proof still valid is never forgotten to make room
+    v = fed.ProofValidator("nodeB", "sekret")
+    v._max_nonces = 2
+    v._seen_nonces.update({"a": time.time() + 100, "b": time.time() - 1})
+
+    def signed(nonce):
+        proof = {"client_jwt": "C", "forwarded_by": "nodeA", "forwarded_at": time.time(),
+                 "task_hash": "abc", "forwarded_to": "nodeB", "nonce": nonce,
+                 "expires_at": time.time() + 300}
+        return {"proof": proof, "sig_alg": "HS256",
+                "signature": fed.hmac_sign_proof("sekret", fed.canonical_proof(proof))}
+    assert v.verify(signed("c"), "nodeA") and "a" in v._seen_nonces and "b" not in v._seen_nonces
+    with pytest.raises(ValueError, match="too many"):
+        v.verify(signed("d"), "nodeA")
+
+
+def test_federation_needs_a_node_id_and_a_secret_of_its_own():
+    import smcp as rixi_smcp
+    with pytest.raises(RuntimeError, match="node_id"):
+        rixi_smcp.SMCPToolServer({}, secret_key="s" * 32, api_key="k", federation_enabled=True)
+    server = rixi_smcp.SMCPToolServer({}, secret_key="s" * 32, api_key="k", node_id="nodeB",
+                                      jwt_secret="session-token-key", federation_enabled=True)
+    assert server._fed_hmac_secret != "session-token-key"       # peers cannot sign session tokens

@@ -79,3 +79,10 @@ variable "jwt_public_key" {
   sensitive   = true
   description = "Alternative to jwt_jwks_url: a PEM public key the box uses for --public-key (air-gapped; multi-line is fragile in cloud-init — prefer jwt_jwks_url)."
 }
+
+variable "node_token" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "This box's own registration token (the gateway derives one per node id). The tunnel agent proves it when it dials in, so no other holder of the tunnel secret can register as this node. Reaches the box as RIXI_NODE_TOKEN."
+}

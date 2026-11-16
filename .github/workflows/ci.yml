@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# The jobs only read the repository: the token they get can do no more than that.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Ruff lint

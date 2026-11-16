@@ -30,3 +30,33 @@ deployment:
   CLI flags — flag values are visible in `ps` output and service definitions.
   The installer (`install-rixi.sh`) does this automatically, writing secrets to
   a `chmod 600` env file on the target.
+- Tokens are the only authentication. An AES key (or the key handshake) hides
+  what is sent; it does not say who may send it, and it does not stop a
+  recorded request from being sent again. Across a network you do not control,
+  use TLS: `rixi up` gives each box a certificate of its own and pins it in the
+  profile; for your own server pass `--tls-cert/--tls-key` or put it behind a
+  reverse proxy that terminates TLS.
+- When several servers trust one issuer, scope their tokens with `--audience`
+  (and `--required-claim`), and require `exp` (`--require-exp`). Without an
+  audience, a token issued for any of them works on all of them. The gateway
+  takes `--jwt-audience` and `--jwt-issuer` for the same reason.
+- The default mode (loopback, no tokens) refuses requests that a web page could
+  make from the operator's browser: any request naming another site in `Origin`,
+  and any request reaching the server under a name other than localhost. Keep it
+  on loopback; reach it through an SSH tunnel or the rixi tunnel.
+- The key handshake never sends the secret (both sides prove they know it), but
+  a short or guessable secret can still be tried offline by someone who records
+  a handshake. Use a long random one (`rixi up` generates 32 random bytes).
+- Brokered gateway: every box and client holds the tunnel secret, so it
+  authenticates membership, not identity. Boxes the gateway provisions prove a
+  per-box registration token; clients are told apart by their JWT (set
+  `require_jwt` in the policy) — without JWTs, a client is only as distinct as
+  the connection it holds. Dial the gateway over `wss://` when the network
+  between is not yours. The `dummy` provider runs boxes as processes on the
+  gateway's own host and is off unless the gateway listens on loopback.
+- The inference proxy forwards to its backend with its own token: give it an
+  API key or JWT (`authentication` in its config) before it listens anywhere
+  but loopback.
+- `rixi run` leaves files that look like credentials (`.env`, `*.pem`, keys,
+  cloud credential directories) out of what it ships; `.rixiignore` adds
+  patterns or, with `!`, sends one after all.

@@ -84,7 +84,9 @@ export class Client {
   // ── plumbing ────────────────────────────────────────────────────────────
   private async headers(extra: Record<string, string> = {}): Promise<Record<string, string>> {
     const t = typeof this.token === "function" ? await this.token() : this.token;
-    return t ? { Authorization: `Bearer ${t}`, ...extra } : { ...extra };
+    // with a key, plain JSON answers (task lists, status, output) come sealed as well
+    const sealed: Record<string, string> = (await this.keyPromise) ? { "X-Rixi-Accept-Sealed": "1" } : {};
+    return t ? { Authorization: `Bearer ${t}`, ...sealed, ...extra } : { ...sealed, ...extra };
   }
 
   private async request(method: string, path: string, init: {
@@ -122,6 +124,10 @@ export class Client {
       const key = await this.keyPromise;
       if (!key) throw new RixiError("the box sealed its answer but this client has no key");
       return unseal(key, data);
+    }
+    // with a key every answer is sealed: one in the clear did not come from the box that holds it
+    if (await this.keyPromise) {
+      throw new RixiError("the box answered in the clear although this client has a key");
     }
     return data;
   }
@@ -173,16 +179,17 @@ export class Client {
   }
 
   async tasks(): Promise<Record<string, TaskInfo>> {
-    return (await this.request("GET", "/tasks")).json();
+    return this.json(await this.request("GET", "/tasks"));
   }
 
   async task(id: string): Promise<Record<string, any>> {
-    return (await this.request("GET", `/task/${encodeURIComponent(id)}`)).json();
+    return this.json(await this.request("GET", `/task/${encodeURIComponent(id)}`));
   }
 
   /** Everything a task has printed so far. */
   async output(id: string): Promise<string> {
-    const r = await (await this.request("GET", `/task/${encodeURIComponent(id)}/output`)).json();
+    const r = await this.json<{ output_history?: { content: string }[] }>(
+      await this.request("GET", `/task/${encodeURIComponent(id)}/output`));
     return (r.output_history ?? []).map((e: { content: string }) => e.content + "\n").join("");
   }
 
@@ -227,7 +234,7 @@ export class Client {
     let body: Uint8Array = typeof data === "string" ? enc.encode(data) : data;
     const headers: Record<string, string> = { "Content-Type": "application/octet-stream" };
     if (key) { body = await seal(key, body); headers["X-Rixi-Encrypted"] = "1"; }
-    return (await this.request("PUT", "/files", { body, headers, query: { path } })).json();
+    return this.json(await this.request("PUT", "/files", { body, headers, query: { path } }));
   }
 
   async readFile(path: string): Promise<Uint8Array> {

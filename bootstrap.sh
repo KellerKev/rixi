@@ -8,6 +8,8 @@
 #   RIXI_NODE_ID        node id the agent presents at auth (e.g. a one-time   [required]
 #                       registration token, so the gateway wires the right client)
 #   RIXI_TUNNEL_SECRET  shared tunnel secret (channel encryption + auth)      [required]
+#   RIXI_NODE_TOKEN     this box's own registration token, from the gateway that provisioned it
+#                       (proves which node it is; boxes attached by hand have none)
 #   RIXI_TUNNEL_SALT    per-deployment tunnel KDF salt (v2); must match the gateway [default ""]
 #   RIXI_SERVER_PORT    loopback port the rixi server binds                   [default 9000]
 #   RIXI_REF            git ref of the public rixi to install                 [default main]
@@ -18,6 +20,10 @@
 #   RIXI_KEY_SECRET_USES  max successful handshakes (0 = unlimited; default 0 when a secret is set)
 #   RIXI_JWT_JWKS_URL   optional JWKS URL → server requires a valid JWT (--jwks-url; enforced auth)
 #   RIXI_JWT_PUBLIC_KEY optional PEM public key → server requires a valid JWT (--public-key)
+#   RIXI_JWT_AUDIENCE   optional: only tokens with this `aud` are accepted (--audience); set it
+#                       when several boxes trust one issuer, or any of its tokens works on all
+#   RIXI_JWT_REQUIRED_CLAIMS  optional NAME=VALUE[,NAME=VALUE…] a token must carry (--required-claim)
+#   RIXI_JWT_ALLOW_NO_EXP     1 = accept tokens that never expire (refused by default with JWT on)
 #
 set -euo pipefail
 
@@ -43,7 +49,7 @@ elif [ -x "$HOME/.pixi/bin/pixi" ]; then
   PIXI="$HOME/.pixi/bin/pixi"
 else
   log "installing pixi…"
-  curl -fsSL https://pixi.sh/install.sh | bash >/dev/null
+  curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION=v0.70.1 bash >/dev/null
   PIXI="$HOME/.pixi/bin/pixi"
 fi
 # The rixi server spawns tasks with a bare `pixi run …`, so pixi's bin dir must be on PATH for
@@ -76,6 +82,10 @@ ENV_FILE="$RIXI_DIR/rixi.env"
   # per-deployment KDF salt (v2 tunnel crypto); the tunnel service reads it as its --kdf-salt default.
   [ -z "${RIXI_TUNNEL_SALT:-}" ] || printf 'RIXI_TUNNEL_SALT=%s\n' "$RIXI_TUNNEL_SALT" >> "$ENV_FILE"
   [ -z "${RIXI_KEY_SECRET:-}" ] || printf 'RIXI_KEY_SECRET=%s\n' "$RIXI_KEY_SECRET" >> "$ENV_FILE"
+  # the node id is what reaches this box through the gateway, and the node token proves to the
+  # gateway that this box is that node: both by env-file, never on a command line
+  printf 'RIXI_NODE_ID=%s\n' "$NODE_ID" >> "$ENV_FILE"
+  [ -z "${RIXI_NODE_TOKEN:-}" ] || printf 'RIXI_NODE_TOKEN=%s\n' "$RIXI_NODE_TOKEN" >> "$ENV_FILE"
 )
 chmod 600 "$ENV_FILE"
 
@@ -96,7 +106,25 @@ elif [ -n "${RIXI_JWT_PUBLIC_KEY:-}" ]; then
   SERVER_EXEC="$SERVER_EXEC --public-key $RIXI_DIR/jwt_pub.pem"
   log "rixi server: JWT auth ENFORCED via public key"
 fi
-TUNNEL_EXEC="$PIXI run --manifest-path $RIXI_DIR/tunnel/pixi.toml python rixi_tunnel.py connect --to $GATEWAY_URL --node-id $NODE_ID --target 127.0.0.1:$SERVER_PORT"
+# Token scope: several boxes usually trust one issuer, so a box takes only tokens meant for it.
+# Values go into a systemd unit line, so they are checked first.
+scope_ok() { [[ "$1" =~ ^[A-Za-z0-9._:/@=-]+$ ]]; }
+if [ -n "${RIXI_JWT_AUDIENCE:-}" ]; then
+  scope_ok "$RIXI_JWT_AUDIENCE" || { log "RIXI_JWT_AUDIENCE has characters that are not allowed"; exit 1; }
+  SERVER_EXEC="$SERVER_EXEC --audience $RIXI_JWT_AUDIENCE"
+  log "rixi server: tokens must be for audience $RIXI_JWT_AUDIENCE"
+fi
+if [ -n "${RIXI_JWT_REQUIRED_CLAIMS:-}" ]; then            # NAME=VALUE[,NAME=VALUE…]
+  IFS=',' read -ra _claims <<< "$RIXI_JWT_REQUIRED_CLAIMS"
+  for _claim in "${_claims[@]}"; do
+    scope_ok "$_claim" || { log "RIXI_JWT_REQUIRED_CLAIMS has characters that are not allowed"; exit 1; }
+    SERVER_EXEC="$SERVER_EXEC --required-claim $_claim"
+  done
+fi
+if [ -n "${RIXI_JWT_JWKS_URL:-}${RIXI_JWT_PUBLIC_KEY:-}" ] && [ "${RIXI_JWT_ALLOW_NO_EXP:-}" != "1" ]; then
+  SERVER_EXEC="$SERVER_EXEC --require-exp"                 # a token that never expires is refused
+fi
+TUNNEL_EXEC="$PIXI run --manifest-path $RIXI_DIR/tunnel/pixi.toml python rixi_tunnel.py connect --to $GATEWAY_URL --target 127.0.0.1:$SERVER_PORT"
 
 if command -v systemctl >/dev/null 2>&1; then
   if [ "$(id -u)" = "0" ]; then

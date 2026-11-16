@@ -59,6 +59,13 @@ variable "key_secret_uses" {
   type    = number
   default = 0
 }
+variable "node_token" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "This box's own registration token (the gateway derives one per node id). The tunnel agent proves it when it dials in, so no other holder of the tunnel secret can register as this node. Reaches the box as RIXI_NODE_TOKEN."
+}
+
 variable "kdf_salt" {
   type    = string
   default = ""
@@ -87,6 +94,7 @@ locals {
     key_secret      = var.key_secret
     key_secret_uses = var.key_secret_uses
     kdf_salt        = var.kdf_salt
+    node_token      = var.node_token
     jwt_jwks_url    = var.jwt_jwks_url
     jwt_public_key  = var.jwt_public_key
   })

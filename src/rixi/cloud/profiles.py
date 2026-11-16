@@ -5,6 +5,7 @@ Layout (all files 0600, directories 0700), rooted at ~/.rixi or $RIXI_CONFIG_DIR
     profiles.json                     {"default": "<name>", "profiles": {"<name>": {...}}}
     profiles/<name>/jwt_private.pem   ES256 signing key — the box only ever sees the public half
     profiles/<name>/aes.key           base64 AES-256 key, negotiated with the box over RSA
+    profiles/<name>/tls_cert.pem      the box's own TLS certificate: the only one trusted for it
     credentials.json                  cloud API keys, only when `rixi up --save-credentials`
 
 The client signs a fresh, short-lived JWT for every request (aud = the box, exp = 2 minutes, a
@@ -81,6 +82,15 @@ class Profile:
     def save_aes_key(self, key_b64: str) -> None:
         _write_private(self.dir / "aes.key", key_b64 + "\n")
 
+    def tls_cert(self) -> Optional[str]:
+        """The certificate the box was created with (a box you run yourself has no name a
+        certificate authority could vouch for, so `rixi up` makes one and trusts only it)."""
+        p = self.dir / "tls_cert.pem"
+        return p.read_text() if p.exists() else None
+
+    def save_tls_cert(self, cert_pem: str) -> None:
+        _write_private(self.dir / "tls_cert.pem", cert_pem)
+
     def mint_token(self) -> str:
         """A fresh ES256 JWT scoped to this box, valid for TOKEN_TTL_SECONDS."""
         import jwt
@@ -96,7 +106,8 @@ class Profile:
             # A hosted box: a token for this box from the service, over TLS to the box itself.
             from . import hosted
             return Client(self.server_url, token=lambda: hosted.box_token(self), **kw)
-        return Client(self.server_url, token=self.mint_token, aes_key=self.aes_key(), **kw)
+        return Client(self.server_url, token=self.mint_token, aes_key=self.aes_key(),
+                      tls_cert=self.tls_cert(), **kw)
 
 
 def generate_keypair() -> tuple[str, str]:
@@ -109,6 +120,33 @@ def generate_keypair() -> tuple[str, str]:
     pub = key.public_key().public_bytes(serialization.Encoding.PEM,
                                         serialization.PublicFormat.SubjectPublicKeyInfo).decode()
     return priv, pub
+
+
+def generate_tls_cert(name: str) -> tuple[str, str]:
+    """Return (private_key_pem, certificate_pem): a self-signed P-256 certificate for one box.
+
+    Nobody signs it and it names no address (the box has none yet when this is made): the
+    client keeps the certificate and accepts exactly it."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"rixi-{name}")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(f"rixi-{name}")]),
+                           critical=False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .sign(key, hashes.SHA256()))
+    return (key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                              serialization.NoEncryption()).decode(),
+            cert.public_bytes(serialization.Encoding.PEM).decode())
 
 
 # ── store ────────────────────────────────────────────────────────────────────

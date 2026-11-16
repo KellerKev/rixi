@@ -54,6 +54,7 @@ log = logging.getLogger("rixi.direct.s3proxy")
 
 XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 CACHE_S = 15.0
+KEY_CACHE_S = 3.0           # how long a revoked key, or the key of a box that ended, still works
 WRITE_CACHE_S = 60.0
 FLUSH_S = 10.0
 MAX_REWRITE = 32 * 1024 * 1024
@@ -72,10 +73,17 @@ _HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgra
         "proxy-authenticate", "proxy-authorization", "server"}
 _STORAGE_CLASSES = ("STANDARD", "ONEZONE_IA")
 _BUCKET_ID = re.compile(r"[0-9a-f]{12}")
+_LENGTH = re.compile(r"[0-9]{1,19}")
+_CHUNKED_MODES = (sigv4.STREAMING_SIGNED, sigv4.STREAMING_UNSIGNED_TRAILER,
+                  sigv4.STREAMING_SIGNED_TRAILER)
 # What a download from another account's public bucket passes on: to the bucket, and back to the browser.
 _PUBLIC_IN = ("range", "if-match", "if-none-match", "if-modified-since", "if-unmodified-since")
 _PUBLIC_OUT = {"content-length", "content-range", "accept-ranges", "etag", "last-modified",
                "cache-control", "expires", "content-encoding"}
+# Sent with every object: a browser shows it, and never runs it as a page of the storage host.
+_NO_SCRIPT = [("x-content-type-options", "nosniff"),
+              ("content-security-policy", "default-src 'none'; img-src 'self'; "
+               "media-src 'self'; style-src 'unsafe-inline'; sandbox")]
 _PUBLIC_CODES = {304: None, 404: "NoSuchKey", 412: "PreconditionFailed", 416: "InvalidRange"}
 
 _LIST_Q = {"list-type", "prefix", "delimiter", "marker", "max-keys", "encoding-type",
@@ -188,6 +196,7 @@ class Proxy:
         self._by_id: Dict[str, Tuple[float, Optional[Bucket]]] = {}
         self._origins: Tuple[float, set] = (-1e9, set())
         self._public: Dict[str, float] = {}         # public downloads since the last flush
+        self._public_open: Dict[str, float] = {}    # bytes that downloads under way will still send
         self._traffic: Dict[str, List[float]] = {}
         self._key_seen: Dict[str, float] = {}       # access key → when it last signed a request
         # objects written with a box's key, and objects deleted, since the last flush
@@ -199,7 +208,7 @@ class Proxy:
     async def _key(self, access_key: str) -> Tuple[Optional[S3Key], str]:
         now = time.monotonic()
         hit = self._keys.get(access_key)
-        if hit and now - hit[0] < CACHE_S:
+        if hit and now - hit[0] < KEY_CACHE_S:
             return hit[1], hit[2]
         k = await asyncio.to_thread(self.store.get_s3_key, access_key) \
             if re.fullmatch(r"[A-Z0-9]{8,32}", access_key) else None
@@ -212,7 +221,7 @@ class Proxy:
     async def _box_live(self, box_id: str) -> bool:
         now = time.monotonic()
         hit = self._boxes.get(box_id)
-        if hit and now - hit[0] < CACHE_S:
+        if hit and now - hit[0] < KEY_CACHE_S:
             return hit[1]
         box = await asyncio.to_thread(self.store.get, box_id)
         live = box is not None and box.state in LIVE_STATES and box.state != "releasing"
@@ -297,6 +306,7 @@ class Proxy:
         for bid, n in public.items():
             try:
                 await asyncio.to_thread(self.store.add_public_traffic, bid, n, m)
+                self._by_id.pop(bid, None)      # the cached row no longer has these bytes
             except Exception:
                 log.exception("could not record public downloads for bucket %s", bid)
                 self._public[bid] = self._public.get(bid, 0.0) + n
@@ -420,6 +430,11 @@ class Proxy:
             prefix_raw = bucket_raw
         has_key = key_raw != ""
         resource = raw_path
+        if _dot_segments(key_raw):
+            # never forwarded: something on the way upstream could resolve them into another bucket
+            raise S3Error(400, "InvalidArgument", "Keys with . or .. segments are not supported")
+        if ";" in raw_query:
+            raise S3Error(400, "InvalidArgument", "';' is not allowed in the query")
 
         signed = sigv4.parse(raw_query, headers)
         if signed is None:
@@ -497,19 +512,35 @@ class Proxy:
 
         mode = signed.payload_hash
         length = headers.get("content-length")
+        if length is not None and not _LENGTH.fullmatch(length):
+            raise S3Error(400, "InvalidArgument", "bad content length")
+        room, copied_bytes = None, 0
         if op.adds_data:
-            declared = headers.get("x-amz-decoded-content-length") or length or "0"
-            try:
-                adding = float(declared)
-            except ValueError:
-                raise S3Error(400, "InvalidArgument", "bad content length")
             limit = self.storage.cfg.limits.max_storage_gb * 1e9
-            if await self._used(key.tenant) + adding > limit:
-                raise S3Error(403, "QuotaExceeded", f"Storage limit reached "
-                              f"({self.storage.cfg.limits.max_storage_gb:g} GB)")
+            full = S3Error(403, "QuotaExceeded", f"Storage limit reached "
+                           f"({self.storage.cfg.limits.max_storage_gb:g} GB)")
+            room = limit - await self._used(key.tenant)
+            if copy_src:
+                # a copy sends no body: what it adds is the size of what it copies
+                adding = copied_bytes = await self._copy_size(
+                    fwd["x-amz-copy-source"], headers.get("x-amz-copy-source-range"),
+                    bucket.region)
+            else:
+                # the decoded length only means something for an aws-chunked body, and the body
+                # is cut off at the room that is left whatever the request says about its size
+                declared = headers.get("x-amz-decoded-content-length") \
+                    if mode in _CHUNKED_MODES else None
+                declared = declared if declared is not None else length
+                if declared is not None and not _LENGTH.fullmatch(declared):
+                    raise S3Error(400, "InvalidArgument", "bad content length")
+                adding = int(declared or 0)
+            if room <= 0 or adding > room:
+                raise full
+            # aws-chunked framing and a checksum trailer make the body a little longer
+            room = room + 1024 * 1024 + room / 100
 
         body, upstream_hash, fwd_len = self._body(receive, method, mode, headers, signing_key,
-                                                  signed, bucket.id)
+                                                  signed, bucket.id, room)
         if fwd_len is not None:
             fwd["content-length"] = fwd_len
         if mode == sigv4.STREAMING_SIGNED:
@@ -523,10 +554,11 @@ class Proxy:
         path = f"/{bucket.real_name}" + (f"/{key_raw}" if has_key else "")
         if not has_key and raw_path.endswith("/") and prefix_raw:
             path = f"/{bucket.real_name}/"
-        auth_params = ("X-Amz-",) + (("AWSAccessKeyId=", "Signature=", "Expires=")
-                                     if signed.v2 else ())
-        upstream_query = "&".join(part for part in raw_query.split("&")
-                                  if part and not part.startswith(auth_params))
+        # what goes upstream is what was judged above: a parameter whose decoded name is one of
+        # the signature's own is left out however it was spelled (%58-Amz-…)
+        upstream_query = "&".join(
+            part for part in raw_query.split("&")
+            if part and unquote(part.partition("=")[0].replace("+", " ")) in q)
         endpoint = self.storage.client.endpoint(bucket.region)
         up_host = urlparse(endpoint).netloc
         signed_headers = sigv4.sign(method, up_host, path, upstream_query, fwd,
@@ -547,6 +579,8 @@ class Proxy:
         finally:
             await resp.aclose()
             self._count(bucket.id, requests=1)
+        if 200 <= resp.status_code < 300 and copied_bytes:
+            self._count(bucket.id, ingress=copied_bytes)     # so the estimate of what is stored grows
         if 200 <= resp.status_code < 300 and has_key:
             self._note(op, key, bucket, unquote(key_raw), headers, copy_src)
 
@@ -565,9 +599,15 @@ class Proxy:
         if not allow:
             raise S3Error(403, "AccessDenied", "This file is not available right now")
         cap = (b.public_cap_gb or self.st.public_cap_gb) * 1e9
-        if b.public_bytes_in(month(self.clock())) + self._public.get(b.id, 0.0) >= cap:
-            raise S3Error(403, "AccessDenied",
-                          "This bucket has reached its download limit for this month")
+        over = S3Error(403, "AccessDenied",
+                       "This bucket has reached its download limit for this month")
+
+        def served() -> float:
+            # recorded, not yet recorded, and what downloads under way will still send
+            return b.public_bytes_in(month(self.clock())) + self._public.get(b.id, 0.0) + \
+                self._public_open.get(b.id, 0.0)
+        if served() >= cap:
+            raise over
         name = unquote(key_raw).rsplit("/", 1)[-1]
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         ctype = INLINE_TYPES.get(ext)
@@ -585,12 +625,10 @@ class Proxy:
         except httpx.HTTPError as exc:
             log.warning("upstream public %s %s: %s", method, b.id, exc)
             raise S3Error(502, "ServiceUnavailable", "Storage is not reachable; try again")
+        reserved = 0.0
         try:
-            out = [("cross-origin-resource-policy", "cross-origin"),
-                   ("x-content-type-options", "nosniff"),
-                   ("content-security-policy", "default-src 'none'; img-src 'self'; "
-                    "media-src 'self'; style-src 'unsafe-inline'; sandbox"),
-                   ("x-amz-request-id", rid)]
+            out = [("cross-origin-resource-policy", "cross-origin")] + _NO_SCRIPT + \
+                  [("x-amz-request-id", rid)]
             st = resp.status_code
             if st >= 300 and st != 304:
                 await resp.aread()
@@ -606,6 +644,14 @@ class Proxy:
                 await self._send(send, status, body,
                                  out[1:-1] + [("content-type", "application/xml")], rid)
                 return
+            if st != 304 and method == "GET":
+                # a download is held against the limit before it starts, so many at once
+                # cannot take the bucket past it together
+                size = resp.headers.get("content-length", "")
+                reserved = float(size) if _LENGTH.fullmatch(size) else 0.0
+                if served() >= cap:
+                    raise over
+                self._public_open[b.id] = self._public_open.get(b.id, 0.0) + reserved
             out += [(k, v) for k, v in resp.headers.items() if k.lower() in _PUBLIC_OUT]
             if st != 304:
                 out += [("content-type", ctype or "application/octet-stream"),
@@ -616,8 +662,16 @@ class Proxy:
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
                 self._count(b.id, egress=len(chunk))
                 self._public[b.id] = self._public.get(b.id, 0.0) + len(chunk)
+                took = min(reserved, float(len(chunk)))
+                reserved -= took
+                self._public_open[b.id] = self._public_open.get(b.id, 0.0) - took
             await send({"type": "http.response.body", "body": b""})
         finally:
+            left = self._public_open.get(b.id, 0.0) - reserved
+            if left > 0:
+                self._public_open[b.id] = left
+            else:
+                self._public_open.pop(b.id, None)
             await resp.aclose()
             self._count(b.id, requests=1)
 
@@ -671,13 +725,46 @@ class Proxy:
         if b is None or b.state != "ready" or not rest or (allowed is not None and
                                                            b.id not in allowed):
             raise S3Error(404, "NoSuchBucket", "The copy source bucket does not exist")
+        src_key, _, src_query = rest.partition("?")
+        if _dot_segments(src_key) or ";" in src_query or (
+                src_query and not re.fullmatch(r"versionId=[A-Za-z0-9._~%-]{1,1024}", src_query)):
+            raise S3Error(400, "InvalidArgument", "x-amz-copy-source is not a key in a bucket")
         if b.region != region:
             raise S3Error(400, "InvalidRequest", f"Copying between regions ({b.region} → "
                           f"{region}) is not supported; download and upload instead")
         return f"/{b.real_name}/{rest}"
 
-    def _body(self, receive, method, mode, headers, signing_key, signed, bucket_id):
-        """(body stream, payload hash to sign upstream, content-length to send)."""
+    async def _copy_size(self, source: str, byte_range: Optional[str], region: str) -> int:
+        """How many bytes a copy adds: the range it names, or the size of the source object."""
+        if byte_range is not None:
+            m = re.fullmatch(r"bytes=(\d{1,19})-(\d{1,19})", byte_range.strip())
+            if not m or int(m.group(2)) < int(m.group(1)):
+                raise S3Error(400, "InvalidArgument", "bad x-amz-copy-source-range")
+            return int(m.group(2)) - int(m.group(1)) + 1
+        path, _, query = source.partition("?")
+        endpoint = self.storage.client.endpoint(region)
+        signed_headers = sigv4.sign("HEAD", urlparse(endpoint).netloc, path, query, {},
+                                    self.st.access_key, self.st.secret_key, region,
+                                    payload_hash=sigv4.EMPTY_SHA256)
+        url = httpx.URL(endpoint, raw_path=(path + ("?" + query if query else ""))
+                        .encode("latin-1"))
+        try:
+            resp = await self.http.send(self.http.build_request("HEAD", url,
+                                                                headers=signed_headers))
+        except httpx.HTTPError as exc:
+            log.warning("upstream HEAD of a copy source: %s", exc)
+            raise S3Error(502, "ServiceUnavailable", "Storage is not reachable; try again")
+        if resp.status_code == 404:
+            raise S3Error(404, "NoSuchKey", "The copy source does not exist")
+        size = resp.headers.get("content-length", "")
+        if resp.status_code != 200 or not _LENGTH.fullmatch(size):
+            raise S3Error(400, "InvalidRequest", "The copy source cannot be read")
+        return int(size)
+
+    def _body(self, receive, method, mode, headers, signing_key, signed, bucket_id,
+              room: Optional[float] = None):
+        """(body stream, payload hash to sign upstream, content-length to send). `room` is how
+        many bytes the body may be before the storage limit is reached (None: no limit)."""
         if method in ("GET", "HEAD", "DELETE") and not headers.get("content-length", "0") \
                 .strip("0"):
             return None, sigv4.EMPTY_SHA256 if mode != sigv4.UNSIGNED else sigv4.UNSIGNED, None
@@ -689,12 +776,16 @@ class Proxy:
                                                  "unsigned payload trailers over HTTPS")
 
         async def raw():
+            total = 0
             while True:
                 msg = await receive()
                 if msg["type"] == "http.disconnect":
                     raise _BodyError(400, "IncompleteBody", "the client went away")
                 chunk = msg.get("body", b"")
                 if chunk:
+                    total += len(chunk)
+                    if room is not None and total > room:
+                        raise _BodyError(403, "QuotaExceeded", "Storage limit reached")
                     self._count(bucket_id, ingress=len(chunk))
                     yield chunk
                 if not msg.get("more_body"):
@@ -741,8 +832,12 @@ class Proxy:
     async def _relay(self, send, resp: httpx.Response, op: Op, bucket: Bucket, endpoint: str,
                      rid: str) -> None:
         headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in _HOP
-                   and k.lower() != "content-length"]
+                   and k.lower() not in ("content-length",) + tuple(h for h, _ in _NO_SCRIPT)]
         headers.append(("x-amz-request-id", rid))
+        if op.name in ("GetObject", "HeadObject"):
+            # an object is a tenant's file, whatever type it says it is: a browser that opens
+            # one must not run it as a page of this host
+            headers += _NO_SCRIPT
         compressed = resp.headers.get("content-encoding", "identity") not in ("identity", "")
         if (op.rewrite or resp.status_code >= 300) and not compressed:
             data = b""
@@ -869,6 +964,11 @@ def _tracking(receive, unread: dict):
     return wrapped
 
 
+def _dot_segments(raw: str) -> bool:
+    """Whether a url-encoded key has a `.` or `..` segment."""
+    return any(seg in (".", "..") for seg in unquote(raw).split("/"))
+
+
 class _BodyError(Exception):
     """Raised inside a request body stream: the upstream request is abandoned unfinished."""
 
@@ -896,8 +996,9 @@ def main() -> None:
     storage = StorageService(cfg, Store(cfg.store), authorize=authorize)
     host, _, port = args.bind.rpartition(":")
     import uvicorn
+    from .accesslog import log_config
     uvicorn.run(Proxy(storage), host=host or "127.0.0.1", port=int(port), log_level="info",
-                proxy_headers=False)
+                proxy_headers=False, log_config=log_config())
 
 
 if __name__ == "__main__":

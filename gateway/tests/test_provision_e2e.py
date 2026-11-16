@@ -18,7 +18,8 @@ from gateway.provisioning.tofu import find_tofu  # noqa: E402
 from gateway.server import Gateway  # noqa: E402
 
 SECRET = "gw-e2e-secret"
-RIXI_DIR = os.getenv("RIXI_DIR", "/Users/kevin/DevelopmentStudio/rixi")
+RIXI_DIR = os.getenv("RIXI_DIR") or os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))                       # this checkout
 
 
 @pytest.mark.skipif(find_tofu() is None, reason="needs `tofu`/`terraform` on PATH")

@@ -173,6 +173,11 @@ def parse(raw_query: str, headers: Dict[str, str]) -> Optional[Signed]:
     return None
 
 
+# x-amz headers a presigned (Signature Version 4) request may carry without having signed them.
+PRESIGNED_UNSIGNED = {"x-amz-content-sha256", "x-amz-date", "x-amz-user-agent",
+                      "x-amz-sdk-checksum-algorithm", "x-amz-trailer",
+                      "x-amz-decoded-content-length"}
+
 # Query parameters that are part of what a Signature Version 2 request signs.
 _V2_SUBRESOURCES = {
     "acl", "cors", "delete", "lifecycle", "location", "logging", "notification", "partNumber",
@@ -230,7 +235,13 @@ def verify(s: Signed, secret: str, method: str, raw_path: str, headers: Dict[str
     if "host" not in s.signed_headers:
         raise SigError("AccessDenied", "the host header must be signed")
     unsigned_amz = [h for h in headers if h.startswith("x-amz-") and h not in s.signed_headers]
-    if not s.presigned and unsigned_amz:
+    if s.presigned:
+        # whoever is handed a presigned URL adds their own headers: only the ones that
+        # describe the body may go unsigned, never one that changes what the request does
+        # (x-amz-copy-source, storage class, metadata, tags, encryption keys)
+        unsigned_amz = [h for h in unsigned_amz if not (h in PRESIGNED_UNSIGNED or
+                                                        h.startswith("x-amz-checksum-"))]
+    if unsigned_amz:
         raise SigError("AccessDenied", f"headers must be signed: {', '.join(sorted(unsigned_amz))}")
     payload = s.payload_hash
     if not (payload in (UNSIGNED, STREAMING_SIGNED, STREAMING_UNSIGNED_TRAILER,

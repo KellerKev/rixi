@@ -2,10 +2,11 @@
 # rixi box bootstrap — rendered into cloud user-data by `rixi up` and run once at first boot.
 #
 # Installs pixi + the rixi server (pinned to the client's release), then runs it as a systemd
-# service on an open port. Nothing on this port answers without a valid JWT signed by the key
-# that `rixi up` generated on the client; request bodies must be AES-GCM sealed with a key the
-# client negotiates over RSA right after boot (one-use handshake secret). Progress is logged to
-# /var/log/rixi-bootstrap.log.
+# service on an open port, over TLS with the certificate `rixi up` made for this box (the client
+# trusts that certificate and no other, so nothing on the way can read or replay a request).
+# Nothing on this port answers without a valid JWT signed by the key that `rixi up` generated on
+# the client; request bodies are AES-GCM sealed as well, with a key the client negotiates right
+# after boot (one-use handshake secret). Progress is logged to /var/log/rixi-bootstrap.log.
 set -euo pipefail
 exec > >(tee -a /var/log/rixi-bootstrap.log) 2>&1
 echo "[rixi] bootstrap start $(date -u +%FT%TZ)"
@@ -21,6 +22,12 @@ install -d -m 700 /etc/rixi
 umask 077
 cat > /etc/rixi/jwt_pub.pem <<'RIXI_PEM_EOF'
 __RIXI_JWT_PUBLIC_KEY__
+RIXI_PEM_EOF
+cat > /etc/rixi/tls_cert.pem <<'RIXI_PEM_EOF'
+__RIXI_TLS_CERT__
+RIXI_PEM_EOF
+cat > /etc/rixi/tls_key.pem <<'RIXI_PEM_EOF'
+__RIXI_TLS_KEY__
 RIXI_PEM_EOF
 printf 'RIXI_KEY_SECRET=%s\n' '__RIXI_KEY_SECRET__' > /etc/rixi/rixi.env
 umask 022
@@ -45,7 +52,8 @@ fi
 
 # ── pixi ─────────────────────────────────────────────────────────────────
 export PIXI_HOME=/opt/pixi
-curl -fsSL https://pixi.sh/install.sh | PIXI_NO_PATH_UPDATE=1 bash
+# a pinned pixi release, not whatever is newest on the day the box boots
+curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION="${PIXI_VERSION:-v0.70.1}" PIXI_NO_PATH_UPDATE=1 bash
 PIXI=/opt/pixi/bin/pixi
 "$PIXI" --version
 
@@ -70,6 +78,7 @@ Environment=PIXI_HOME=/opt/pixi
 Environment=PATH=/opt/pixi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$PIXI run python rixi_server.py --host 0.0.0.0 --port $RIXI_PORT \
   --public-key /etc/rixi/jwt_pub.pem --audience $RIXI_AUDIENCE --require-exp \
+  --tls-cert /etc/rixi/tls_cert.pem --tls-key /etc/rixi/tls_key.pem \
   --key-secret-uses 1 --require-encryption --log-dir /var/log/rixi
 Restart=on-failure
 RestartSec=3

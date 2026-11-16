@@ -192,7 +192,7 @@ def test_share_links_open_until_they_expire_run_out_or_are_revoked():
     assert r.status_code == 302 and r.headers["cache-control"] == "no-store"
     loc = r.headers["location"]
     assert loc.startswith("https://s3.example.test/files/out/report.pdf?")
-    assert "X-Amz-Expires=300" in loc and "attachment" in loc
+    assert "X-Amz-Expires=60" in loc and "attachment" in loc      # short: it has a download limit
     assert tc.get(f"/s/{token}").status_code == 302
     r = tc.get(f"/s/{token}")
     assert r.status_code == 410 and "download limit" in r.text           # max_downloads: 2

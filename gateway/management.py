@@ -80,7 +80,7 @@ def build_app(gateway):
 
     @app.get("/api/nodes")
     async def nodes(identity=Depends(require_identity)):
-        return {"nodes": gateway.list_nodes()}
+        return {"nodes": gateway.list_nodes(identity=identity)}
 
     @app.get("/api/resources")
     async def resources(identity=Depends(require_identity)):

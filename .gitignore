@@ -70,3 +70,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Metaflow run state (local runs of the examples)
+.metaflow/

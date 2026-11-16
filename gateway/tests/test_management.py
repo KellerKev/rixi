@@ -81,3 +81,44 @@ def test_audit_admin_only_and_empty_without_store():
     assert tc.get("/api/audit", headers=user_h).status_code == 403
     r = tc.get("/api/audit", headers=admin_h)
     assert r.status_code == 200 and r.json()["events"] == []
+
+
+def test_a_policy_sent_over_the_api_is_taken_as_written(monkeypatch, tmp_path):
+    """${env:…} and ${file:…} are for the operator's config file. Expanded in a policy that
+    arrives over the API, they would hand whoever may edit the policy the gateway's environment
+    and files, and show them to every signed-in user afterwards."""
+    monkeypatch.setenv("RIXI_GATEWAY_SECRET", "the-tunnel-secret")
+    secret_file = tmp_path / "state.key"
+    secret_file.write_text("state-passphrase")
+    tc, priv = _client()
+    admin_h = {"Authorization": f"Bearer {_tok(priv, ['admin'])}"}
+    r = tc.put("/api/policy", headers=admin_h, json={"global": {
+        "default_role": "${env:RIXI_GATEWAY_SECRET}", "admin_role": f"${{file:{secret_file}}}"}})
+    assert r.status_code == 200
+    for text in (r.text, tc.get("/api/policy", headers=admin_h).text):
+        assert "the-tunnel-secret" not in text and "state-passphrase" not in text
+    # the config file still gets its placeholders
+    from gateway.config import parse_global_policy
+    assert parse_global_policy({"default_role": "${env:RIXI_GATEWAY_SECRET}"}).default_role == \
+        "the-tunnel-secret"
+
+
+def test_nodes_are_listed_to_those_who_may_know_them():
+    from gateway.registry import RegisteredNode
+    tc, priv = _client()
+    gw = tc.app.state.gateway if hasattr(tc.app.state, "gateway") else None
+    # the app closes over its gateway: reach it through a route's closure instead
+    for route in tc.app.routes:
+        if getattr(route, "path", "") == "/api/nodes":
+            gw = route.endpoint.__closure__[0].cell_contents
+    claim = gw.claims.create("alice-client", "dummy", {}, owner="alice")
+    gw.registry.register(RegisteredNode(node_id=claim.token, kind="server", identity=claim.token))
+    gw.registry.register(RegisteredNode(node_id="shared-box", kind="server", identity="shared-box"))
+
+    def ids(sub, roles):
+        tok = jwt.encode({"sub": sub, "roles": roles, "exp": int(time.time()) + 600}, priv, "RS256")
+        return {n["node_id"] for n in tc.get(
+            "/api/nodes", headers={"Authorization": f"Bearer {tok}"}).json()["nodes"]}
+    assert ids("bob", ["user"]) == {"shared-box"}
+    assert ids("alice", ["user"]) == {"shared-box", claim.token}
+    assert ids("op", ["admin"]) == {"shared-box", claim.token}

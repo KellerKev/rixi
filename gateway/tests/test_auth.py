@@ -121,3 +121,27 @@ def test_jwks_path():
         assert asyncio.run(v.verify(_mint(priv, {}, kid="unknown"))) is None
     finally:
         srv.shutdown()
+
+
+def test_a_token_must_expire_and_be_meant_for_this_service():
+    import jwt as pyjwt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                             serialization.NoEncryption()).decode()
+    pub = key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+
+    def tok(**claims):
+        return pyjwt.encode({"sub": "alice", **claims}, priv, "RS256")
+    soon = int(time.time()) + 600
+    v = JwtVerifier(public_key_pem=pub)
+    assert asyncio.run(v.verify(tok(exp=soon))) is not None
+    assert asyncio.run(v.verify(tok())) is None                      # never expires: refused
+    scoped = JwtVerifier(public_key_pem=pub, audience="rixi-gateway", issuer="https://idp.example")
+    good = dict(exp=soon, aud="rixi-gateway", iss="https://idp.example")
+    assert asyncio.run(scoped.verify(tok(**good))) is not None
+    assert asyncio.run(scoped.verify(tok(**{**good, "aud": "box-123"}))) is None     # a box's token
+    assert asyncio.run(scoped.verify(tok(**{**good, "iss": "https://other.example"}))) is None
+    assert asyncio.run(scoped.verify(tok(exp=soon))) is None

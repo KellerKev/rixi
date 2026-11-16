@@ -190,6 +190,17 @@ def verify_rs256_token(public_key_pem, token: str, issuer: str = FEDERATION_ISSU
     )
 
 
+MAX_PROOF_LIFETIME = 900.0      # seconds from now a proof may still be valid (senders use 300)
+
+
+def task_hashes(task) -> set:
+    """The hashes a proof may carry for `task`: SHA-256 over its JSON with sorted keys, in the
+    spaced form Python writes and the compact form other implementations write."""
+    return {hashlib.sha256(json.dumps(task, sort_keys=True).encode()).hexdigest(),
+            hashlib.sha256(json.dumps(task, sort_keys=True,
+                                      separators=(",", ":")).encode()).hexdigest()}
+
+
 # ───────────────────────── stateful proof validator ────────────────────────
 class ProofValidator:
     """Stateful forwarding-proof verifier — the counterpart to SMCP's
@@ -198,12 +209,15 @@ class ProofValidator:
     bound to this node, ``from_node == forwarded_by``, expiry, and single-use
     nonces."""
 
-    def __init__(self, node_id: str, hmac_secret: str, strict_asymmetric: bool = False) -> None:
+    def __init__(self, node_id: str, hmac_secret: str, strict_asymmetric: bool = False,
+                 seen_nonces: Optional[dict] = None) -> None:
         self.node_id = node_id
         self.hmac_secret = hmac_secret
         self.strict_asymmetric = strict_asymmetric
         self.peer_public_keys: dict[str, Any] = {}   # node_id -> PEM (str/bytes)
-        self._seen_nonces: dict[str, float] = {}
+        # nonce -> when its proof expires. Pass one dict to every validator of a server, so a
+        # proof used on one connection is used up on all of them.
+        self._seen_nonces: dict[str, float] = seen_nonces if seen_nonces is not None else {}
         self._max_nonces = 100_000
 
     def register_peer_public_key(self, node_id: str, pem) -> None:
@@ -244,16 +258,24 @@ class ProofValidator:
         # Transport sender must match the signature-verified signer.
         if from_node != signer:
             raise ValueError(f"from_node {from_node!r} != forwarded_by {signer!r}")
-        # Expiry.
-        if float(proof.get("expires_at", 0)) < now:
+        # Expiry — and not further off than a proof has reason to be: the signer picks it, and
+        # the nonce has to be remembered until then.
+        expires_at = float(proof.get("expires_at", 0))
+        if expires_at < now:
             raise ValueError("proof expired")
-        # Replay: single-use nonce.
+        if expires_at - now > MAX_PROOF_LIFETIME:
+            raise ValueError("proof expires too far in the future")
+        # Replay: single-use nonce, remembered until its proof has expired (never forgotten
+        # while the proof could still be used).
         nonce = proof.get("nonce", "")
         if not nonce or nonce in self._seen_nonces:
             raise ValueError("nonce replay or missing")
         if len(self._seen_nonces) >= self._max_nonces:
-            self._seen_nonces.clear()
-        self._seen_nonces[nonce] = now
+            for old in [n for n, until in self._seen_nonces.items() if until < now]:
+                del self._seen_nonces[old]
+            if len(self._seen_nonces) >= self._max_nonces:
+                raise ValueError("too many proofs in flight")
+        self._seen_nonces[nonce] = expires_at
         return proof
 
 
@@ -269,10 +291,12 @@ class FederationReceiver:
 
     def __init__(self, node_id: str, hmac_secret: str, *, issuer_pem=None,
                  strict_asymmetric: bool = False,
-                 dispatch: Optional[Callable[[dict, Optional[str], dict], Any]] = None) -> None:
+                 dispatch: Optional[Callable[[dict, Optional[str], dict], Any]] = None,
+                 seen_nonces: Optional[dict] = None) -> None:
         self.node_id = node_id
         self.issuer_pem = issuer_pem
-        self.validator = ProofValidator(node_id, hmac_secret, strict_asymmetric)
+        self.validator = ProofValidator(node_id, hmac_secret, strict_asymmetric,
+                                        seen_nonces=seen_nonces)
         self.sessions: dict[str, bytes] = {}   # from_node -> session key
         # Optional hook to run the forwarded task against this node's real tools.
         # dispatch(task, client_user, forwarding_metadata) -> result (sync). When
@@ -318,6 +342,11 @@ class FederationReceiver:
         # Forwarding proof: signature/pinning, target + from_node binding, expiry,
         # single-use nonce (the validator's cache persists for this connection).
         proof = self.validator.verify(request["auth_proof"], from_node, now=now)
+        # The proof is for one task: the one whose hash it carries. Without this check, a proof
+        # signed for a harmless task would carry any other.
+        if not isinstance(request.get("task"), dict) or \
+                proof.get("task_hash") not in task_hashes(request["task"]):
+            raise ValueError("proof is not for this task (task_hash mismatch)")
 
         # Forwarded client token (RS256), when an issuer key is configured.
         client_user = None

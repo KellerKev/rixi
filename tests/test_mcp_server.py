@@ -133,8 +133,44 @@ def test_create_and_destroy_go_through_rixi_up(monkeypatch):
     assert kw["model_access"] == "governed" and kw["make_default"] is False
     call(s, "create_box", provider="hetzner")
     assert made[1]["size"] == "sample-cpu" and "ttl_hours" not in made[1]
+    # a box the agent did not make is not the agent's to destroy, unless the operator says so
+    text, err = call(s, "destroy_box", box="old")
+    assert err and "not created through these tools" in text and gone == []
+    monkeypatch.setenv("RIXI_MCP_ALL_BOXES", "1")
     assert call(s, "destroy_box", box="old")[0] == "box 'old' destroyed" and gone == ["old"]
+    monkeypatch.delenv("RIXI_MCP_ALL_BOXES")
+    store.put(Profile(name=made[0]["name"], provider="eutonomous", server_url="https://b", ip="",
+                      region="fr-par-2", instance_type="DEV1-M", box_id="x", audience="",
+                      rixi_ref="", created_at=0, status="ready"), make_default=False)
+    assert not call(s, "destroy_box", box=made[0]["name"])[1]        # its own: yes
     assert call(s, "destroy_box", box="ghost")[1] is True
+
+
+def test_run_project_ships_only_from_the_project_directory(tmp_path, monkeypatch):
+    ran = []
+
+    class Runner(Box):
+        def run(self, project, task=None):
+            ran.append(project)
+
+            class R:
+                exit_code, output, error = 0, "ok", None
+            return R()
+    here, elsewhere = tmp_path / "work" / "proj", tmp_path / "home" / "secrets"
+    for d in (here, elsewhere):
+        d.mkdir(parents=True)
+        (d / "pixi.toml").write_text("[project]\n")
+    (tmp_path / "work" / "link").symlink_to(elsewhere)
+    monkeypatch.chdir(tmp_path / "work")
+    monkeypatch.delenv("RIXI_MCP_PROJECT_ROOT", raising=False)
+    s, _ = _server(box=Runner())
+    assert not call(s, "run_project", box="b1", project_dir="proj", task="t")[1]
+    for outside in (str(elsewhere), "../home/secrets", "link", "/"):
+        text, err = call(s, "run_project", box="b1", project_dir=outside, task="t")
+        assert err and "outside the project directory" in text, outside
+    assert ran == [str(here.resolve())]
+    monkeypatch.setenv("RIXI_MCP_PROJECT_ROOT", str(elsewhere))
+    assert not call(s, "run_project", box="b1", project_dir=str(elsewhere), task="t")[1]
 
 
 def test_failures_are_results_not_crashes():

@@ -194,6 +194,20 @@ class Tools:
         self.store = store or ProfileStore()
         self._sandbox_for = sandbox_for
         self._up, self._down, self._sleep, self._api = up, down, sleep, api
+        self._created: set = set()          # boxes this server made, by name
+
+    @staticmethod
+    def project_roots() -> list:
+        """Where `run_project` may take a project from: the directory this server was started
+        in, or the ones named in RIXI_MCP_PROJECT_ROOT (separated like PATH). What an agent is
+        told to ship goes to a remote machine, so it is not free to name any directory."""
+        named = [p for p in os.environ.get("RIXI_MCP_PROJECT_ROOT", "").split(os.pathsep) if p]
+        return [os.path.realpath(p) for p in (named or [os.getcwd()])]
+
+    def _may_destroy(self, name: str) -> bool:
+        """An agent takes down the boxes it made; any other only when the operator said so."""
+        return (name in self._created or name.startswith("mcp-")
+                or os.environ.get("RIXI_MCP_ALL_BOXES") == "1")
 
     def sandbox(self, name: str):
         if self._sandbox_for:
@@ -237,6 +251,7 @@ class Tools:
             profile = up(**kw)
         except Exception as exc:
             raise ToolError(f"could not create the box: {exc}")
+        self._created.add(profile.name)
         life = f", shuts down after {kw['ttl_hours']:g} h" if "ttl_hours" in kw else \
             " — in your own cloud account it runs until destroy_box"
         return (f"box {profile.name!r} is ready ({profile.instance_type} in {profile.region}"
@@ -259,6 +274,10 @@ class Tools:
         name = _str(a, "box")
         if not self.store.exists(name):
             raise ToolError(f"no box named {name!r}")
+        if not self._may_destroy(name):
+            raise ToolError(f"box {name!r} was not created through these tools, so it is not "
+                            f"theirs to destroy (`rixi down {name}`, or start this server "
+                            f"with RIXI_MCP_ALL_BOXES=1)")
         down = self._down or up_mod.down
         provider = self.store.get(name).provider
         down(name, up_mod.resolve_credentials(provider, {}), store=self.store,
@@ -374,8 +393,14 @@ class Tools:
     def run_project(self, a: dict) -> str:
         sb = self.sandbox(_str(a, "box"))
         project, task = _str(a, "project_dir"), _str(a, "task")
-        if not os.path.isfile(os.path.join(project, "pixi.toml")):
+        real = os.path.realpath(project)
+        roots = self.project_roots()
+        if not any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+            raise ToolError(f"{project} is outside the project directory this server may ship "
+                            f"from ({', '.join(roots)}); set RIXI_MCP_PROJECT_ROOT to allow more")
+        if not os.path.isfile(os.path.join(real, "pixi.toml")):
             raise ToolError(f"{project} has no pixi.toml")
+        project = real
         if a.get("background"):
             return f"started; task id: {sb.start(project, task=task)}"
         r = sb.run(project, task=task)

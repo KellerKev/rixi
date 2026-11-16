@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 pytest.importorskip("websockets")
 import websockets  # noqa: E402
-from gateway.protocol import dec, derive_keys, enc, proof  # noqa: E402
+from gateway.protocol import (TO_LISTENER, AgentConn, dec, derive_keys, enc,  # noqa: E402
+                              node_proof, proof, session_key)
 from gateway.server import Gateway  # noqa: E402
 
 SECRET = "gw-secret"
@@ -32,12 +33,20 @@ async def _echo_server(tag: bytes):
     return s, s.sockets[0].getsockname()[1]
 
 
-async def _connect_agent(ws_url: str, target_port: int, node_id: str, secret=SECRET):
+async def _connect_agent(ws_url: str, target_port: int, node_id: str, secret=SECRET,
+                         node_token: str = "", nonce: bool = True):
     """Minimal open-tunnel `connect`: auth with node_id, bridge sessions to a local target."""
     key, _pk = derive_keys(secret)
     ws = await websockets.connect(ws_url)
     ch = dec(await ws.recv(), key)
-    await ws.send(enc({"type": "auth", "proof": proof(_pk, ch["nonce"]), "node_id": node_id}, key))
+    mine = os.urandom(16).hex()
+    auth = {"type": "auth", "proof": proof(_pk, ch["nonce"]), "node_id": node_id}
+    if nonce:
+        auth["nonce"] = mine
+    if node_token:
+        auth["node_proof"] = node_proof(node_token, ch["nonce"], mine)
+    await ws.send(enc(auth, key))
+    conn = AgentConn(ws, session_key(key, ch["nonce"], mine, node_token), sends=TO_LISTENER)
     sessions: dict[str, asyncio.StreamWriter] = {}
 
     async def pump(sid, reader):
@@ -46,14 +55,14 @@ async def _connect_agent(ws_url: str, target_port: int, node_id: str, secret=SEC
                 d = await reader.read(65536)
                 if not d:
                     break
-                await ws.send(enc({"type": "session_data", "sid": sid,
-                                   "data": base64.b64encode(d).decode()}, key))
+                await conn.send({"type": "session_data", "sid": sid,
+                                 "data": base64.b64encode(d).decode()})
         finally:
             sessions.pop(sid, None)
 
     async def loop():
         async for raw in ws:
-            o = dec(raw, key)
+            o = conn.open(raw)
             if o["type"] == "session_open":
                 r, w = await asyncio.open_connection("127.0.0.1", target_port)
                 sessions[o["sid"]] = w
