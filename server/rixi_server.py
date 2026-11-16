@@ -258,6 +258,10 @@ class AuthSettings:
         self.audience: Optional[str] = None
         self.required_claims: Dict[str, str] = {}
         self.require_exp: bool = False
+        # --single-use-tokens: each token (by its jti) is accepted once. For a client that signs
+        # a fresh token per request, a token seen on the wire is then worth nothing.
+        self.single_use: bool = False
+        self._used_jti: Dict[str, float] = {}
         self.revoked_jti_path: Optional[str] = None
         self._revoked_jti: set[str] = set()
         self._revoked_mtime: Optional[float] = None
@@ -408,6 +412,17 @@ def _decode(token: str, key: Any) -> dict:
             raise jwt.InvalidTokenError("token has no jti but revocation is enabled")
         if jti in _revoked_jtis():
             raise jwt.InvalidTokenError("token has been revoked")
+    if auth_settings.single_use:
+        jti, exp = payload.get("jti"), payload.get("exp")
+        if not jti or not exp:
+            raise jwt.InvalidTokenError("single-use tokens need a jti and an exp")
+        used, now = auth_settings._used_jti, time.time()
+        if len(used) > 50_000:                      # forget the ones that have expired anyway
+            for old in [j for j, until in used.items() if until < now]:
+                del used[old]
+        if jti in used:
+            raise jwt.InvalidTokenError("token was already used")
+        used[str(jti)] = float(exp)
     return payload
 
 async def validate_token(token: str) -> tuple[bool, Optional[dict]]:
@@ -473,6 +488,7 @@ async def verify_authentication(
     raise HTTPException(status_code=401, detail="Invalid or missing authentication token.")
 
 async def verify_logs_access(
+    request: Request,
     authorization: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Special authentication for log retrieval - requires logs_retrieval:enabled claim"""
@@ -481,7 +497,11 @@ async def verify_logs_access(
 
     bearer = authorization.credentials if authorization and authorization.scheme.lower() == "bearer" else None
     for tok in filter(None, (bearer,)):
-        is_valid, payload = await validate_token(tok)
+        checked = request.scope.get("rixi_auth")    # the guard verified this request's token
+        if isinstance(checked, dict):
+            is_valid, payload = True, checked
+        else:
+            is_valid, payload = await validate_token(tok)
         if is_valid and payload:
             # Check for logs_retrieval claim
             if payload.get("logs_retrieval") == "enabled":
@@ -3274,6 +3294,11 @@ if __name__ == "__main__":
                     help="Require a JWT claim to equal VALUE (repeatable), e.g. tenant=42")
     p.add_argument("--require-exp", action="store_true",
                     help="Refuse tokens without an 'exp' claim")
+    p.add_argument("--single-use-tokens", action="store_true",
+                    help="Accept each token once (by its jti; needs jti and exp). For clients "
+                         "that sign a fresh token per request: one seen on the wire cannot be "
+                         "used again. Without TLS this is what keeps a recorded request from "
+                         "being repeated")
     p.add_argument("--revoked-jti-file",
                     help="File of revoked token ids (one jti per line, re-read on change). "
                          "When set, tokens without a jti are refused")
@@ -3350,6 +3375,11 @@ if __name__ == "__main__":
                           args.revoked_jti_file)
     except ValueError as exc:
         raise SystemExit(f"ERROR: {exc}")
+    if args.single_use_tokens:
+        if not auth_settings.enabled:
+            raise SystemExit("ERROR: --single-use-tokens needs JWT auth (--public-key or --jwks-url)")
+        auth_settings.single_use = True
+        print("🎟️  Tokens are single-use")
     key_secret = args.key_secret or os.environ.get("RIXI_KEY_SECRET")
     setup_handshake(key_secret, args.key_secret_uses)
     if args.require_encryption:

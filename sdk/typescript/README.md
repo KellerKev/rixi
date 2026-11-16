@@ -25,7 +25,7 @@ const { share_url } = await sb.preview(5173);                // https://5173.b-<
 |---|---|
 | `Sandbox` | a hosted box as one object: `create({size, ttlHours, policy, modelAccess, volumes, onIdle, storage})`, `exec`, `execStream`, `spawn`, `attach`, `tasks`, `output`, `sendInput`, `kill`, files, `preview`, `stop`, `resume`, `destroy` |
 | `Eutonomous` | the hosted API with your key: `launch`, `waitReady`, `box`, `release`, `stop`, `start`, `volumes`, `createVolume`, `deleteVolume`, `buckets`, `createBucket`, `setBucketExpiry`, `deleteBucket`, `s3Keys`, `createS3Key`, `revokeS3Key`, `storageInfo`, `clientFor(box)` |
-| `Client` | any rixi server: `new Client({serverUrl, token, aesKey})` — the same commands, files, tasks and previews; with `aesKey` every body is sealed (AES-256-GCM), as on `rixi up` boxes |
+| `Client` | any rixi server: `new Client({serverUrl, token, aesKey})` — the same commands, files, tasks and previews; with `aesKey` every body is sealed (AES-256-GCM), and with `tlsCert` (the PEM in the profile's `tls_cert.pem`) the connection trusts that one certificate, as `rixi up` boxes need (Node only) |
 
 The data plane is direct: your code talks to the box over TLS with a token for that box only.
 The API key never leaves your process.

@@ -220,9 +220,14 @@ def test_a_policed_box_gets_its_own_bootstrap_permissive_group():
     server = next(kw["json"] for m, path, kw in s.calls if m == "POST" and path == f"{Z}/servers")
     assert server["security_group"] == "sg-box"
     rules = next(kw["json"]["rules"] for m, path, kw in s.calls if m == "PUT")
+    # … which is why nobody gets a shell on it yet: SSH opens with the policy, not before
     assert {(r["direction"], r["dest_port_from"]) for r in rules} == {
-        ("inbound", 80), ("inbound", 443), ("inbound", 22),
+        ("inbound", 80), ("inbound", 443),
         ("outbound", 25), ("outbound", 465), ("outbound", 587)}
+    from rixi.policy import compile_rules, parse
+    later = compile_rules(parse({"egress": {"mode": "block"}}), own_ip="51.0.0.7",
+                          resolvers=["51.159.47.28"])
+    assert any(r.direction == "inbound" and r.port_from == 22 for r in later.rules)
 
 
 def test_apply_firewall_replaces_rules_then_sets_defaults():

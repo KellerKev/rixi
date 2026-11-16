@@ -75,6 +75,26 @@ def _proof(proof_key: bytes, nonce_hex: str) -> str:
     return hmac.new(proof_key, nonce_hex.encode(), hashlib.sha256).hexdigest()
 
 
+def server_tls(cert: str | None, key: str | None):
+    """An SSL context for a listener given a certificate and key (PEM files), else None."""
+    if not cert and not key:
+        return None
+    if not (cert and key):
+        raise SystemExit("--tls-cert and --tls-key go together")
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    return ctx
+
+
+def client_tls(url: str, ca_cert: str | None):
+    """For a wss:// URL: trust `ca_cert` (a PEM file) instead of the system's authorities."""
+    if not url.startswith("wss://") or not ca_cert:
+        return None                     # ws://, or wss:// with the usual authorities
+    import ssl
+    return ssl.create_default_context(cafile=ca_cert)
+
+
 # Which way a frame travels: bound into it, so one side's frames cannot be fed back to it.
 TO_DIALER, TO_LISTENER = b"L", b"D"
 
@@ -173,7 +193,7 @@ class Conn:
 
 
 # ───────────────────────────── listen role ────────────────────────────────
-async def run_listen(bind: str, ws_bind: str, secret: str, kdf_salt: str = ""):
+async def run_listen(bind: str, ws_bind: str, secret: str, kdf_salt: str = "", tls=None):
     key, proof_key = derive_keys(secret, kdf_salt)
     bind_host, bind_port = _split_hostport(bind, 9100)
     ws_host, ws_port = _split_hostport(ws_bind, 7000)
@@ -235,22 +255,28 @@ async def run_listen(bind: str, ws_bind: str, secret: str, kdf_salt: str = ""):
             return
         await conn.pump_tcp_to_ws(sid, reader)
 
-    ws_server = await websockets.serve(on_agent, ws_host, ws_port, ping_interval=20, ping_timeout=20)
+    ws_server = await websockets.serve(on_agent, ws_host, ws_port, ping_interval=20, ping_timeout=20,
+                                       ssl=tls)
     tcp_server = await asyncio.start_server(on_local, bind_host, bind_port)
-    log.info("listen: ws-bind ws://%s:%d  |  local TCP %s:%d", ws_host, ws_port, bind_host, bind_port)
+    log.info("listen: ws-bind %s://%s:%d  |  local TCP %s:%d", "wss" if tls else "ws", ws_host,
+             ws_port, bind_host, bind_port)
     async with ws_server, tcp_server:
         await asyncio.gather(ws_server.wait_closed(), tcp_server.serve_forever())
 
 
 # ──────────────────────────── connect role ────────────────────────────────
 async def run_connect(to_url: str, target: str, secret: str, node_id: str = "rixi", kdf_salt: str = "",
-                      node_token: str = ""):
+                      node_token: str = "", ca_cert: str = ""):
     key, proof_key = derive_keys(secret, kdf_salt)
+    tls = client_tls(to_url, ca_cert)
+    if to_url.startswith("ws://") and not _is_local(to_url):
+        log.warning("dialing %s without TLS: whoever holds the shared secret and sits on the way "
+                    "can read this tunnel — use a wss:// URL", to_url)
     t_host, t_port = _split_hostport(target, 9000)
     delay = 2
     while True:
         try:
-            await _connect_once(to_url, t_host, t_port, key, proof_key, node_id, node_token)
+            await _connect_once(to_url, t_host, t_port, key, proof_key, node_id, node_token, tls)
             delay = 2
         except asyncio.CancelledError:
             raise
@@ -260,8 +286,14 @@ async def run_connect(to_url: str, target: str, secret: str, node_id: str = "rix
         delay = min(delay * 2, 60)
 
 
-async def _connect_once(to_url, t_host, t_port, key, proof_key, node_id, node_token=""):
-    async with websockets.connect(to_url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+def _is_local(url: str) -> bool:
+    host = url.split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[0].strip("[]")
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+async def _connect_once(to_url, t_host, t_port, key, proof_key, node_id, node_token="", tls=None):
+    async with websockets.connect(to_url, ping_interval=20, ping_timeout=20, max_size=None,
+                                  **({"ssl": tls} if tls is not None else {})) as ws:
         # Auth: decrypt the challenge (proves we hold the key), return the proof.
         ch = dec(await asyncio.wait_for(ws.recv(), timeout=10), key)
         if ch.get("type") != "challenge":
@@ -316,6 +348,8 @@ def main():
     pl.add_argument("--ws-bind", default="0.0.0.0:7000", help="address the firewalled server dials into")
     pl.add_argument("--secret", default=os.getenv("RIXI_TUNNEL_SECRET"), help="shared secret (or RIXI_TUNNEL_SECRET)")
     pl.add_argument("--kdf-salt", default=os.getenv("RIXI_TUNNEL_SALT", ""), help="per-deployment KDF salt (or RIXI_TUNNEL_SALT); must match the peer")
+    pl.add_argument("--tls-cert", help="serve wss:// with this certificate (PEM file)")
+    pl.add_argument("--tls-key", help="the private key for --tls-cert (PEM file)")
 
     pc = sub.add_parser("connect", help="firewalled side: dial out and forward to a local target")
     pc.add_argument("--to", required=True, help="listener ws URL, e.g. ws://client-host:7000")
@@ -324,6 +358,9 @@ def main():
     pc.add_argument("--kdf-salt", default=os.getenv("RIXI_TUNNEL_SALT", ""), help="per-deployment KDF salt (or RIXI_TUNNEL_SALT); must match the peer")
     pc.add_argument("--node-id", default=os.getenv("RIXI_NODE_ID", "rixi"),
                     help="identifier sent at auth (or RIXI_NODE_ID)")
+    pc.add_argument("--ca-cert", default=os.getenv("RIXI_TUNNEL_CA", ""),
+                    help="for a wss:// URL: trust this CA or certificate (PEM file, or "
+                         "RIXI_TUNNEL_CA) instead of the system's authorities")
     pc.add_argument("--node-token", default=os.getenv("RIXI_NODE_TOKEN", ""),
                     help="this node's own registration token, if a gateway issued one (or "
                          "RIXI_NODE_TOKEN — prefer the environment: flags show in `ps`)")
@@ -334,10 +371,11 @@ def main():
 
     try:
         if args.role == "listen":
-            asyncio.run(run_listen(args.bind, args.ws_bind, args.secret, args.kdf_salt))
+            asyncio.run(run_listen(args.bind, args.ws_bind, args.secret, args.kdf_salt,
+                                   server_tls(args.tls_cert, args.tls_key)))
         else:
             asyncio.run(run_connect(args.to, args.target, args.secret, args.node_id, args.kdf_salt,
-                                    args.node_token))
+                                    args.node_token, args.ca_cert))
     except KeyboardInterrupt:
         pass
 

@@ -83,7 +83,7 @@ jobs:
     timeout-minutes: 15     # the suite takes ~30s; a hang should fail fast, not run for 6 hours
     steps:
       - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.0
+      - uses: prefix-dev/setup-pixi@2058dcd92f5dbe3befd7379ec6a3022bb746bdfd   # v0.8.0, by commit: a tag can be moved
         with:
           manifest-path: gateway/pixi.toml
       - name: Run gateway tests
@@ -110,12 +110,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.0
+      - uses: prefix-dev/setup-pixi@2058dcd92f5dbe3befd7379ec6a3022bb746bdfd   # v0.8.0, by commit: a tag can be moved
         with:
           manifest-path: agent/pixi.toml
       - name: Run agent tests
         run: pixi run test
         working-directory: agent
+
+  components:
+    name: Client, proxy and tunnel tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install what the components need
+        run: pip install -e '.[server,dev]' pyyaml aiohttp websockets tomli
+      - name: The command-line client, the inference proxy and the tunnel
+        run: pytest clients/tests proxy/tests tunnel/tests -q
 
   install-from-git:
     name: Install the way users do

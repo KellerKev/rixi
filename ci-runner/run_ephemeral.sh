@@ -35,6 +35,14 @@ TARBALL="actions-runner-linux-${ARCH}-${VERSION}.tar.gz"
 echo "[ci-runner] downloading $TARBALL"
 curl -fsSL -o "$TARBALL" \
   "https://github.com/actions/runner/releases/download/v${VERSION}/${TARBALL}"
+# The release page lists a SHA-256 for each tarball: give it as RUNNER_SHA256 and the download is
+# checked against it before anything in it runs (as root).
+if [ -n "${RUNNER_SHA256:-}" ]; then
+  echo "${RUNNER_SHA256}  ${TARBALL}" | sha256sum -c - >/dev/null \
+    || { echo "[ci-runner] $TARBALL does not match RUNNER_SHA256 — not running it" >&2; exit 3; }
+else
+  echo "[ci-runner] RUNNER_SHA256 not set: the runner download is not verified" >&2
+fi
 tar xzf "$TARBALL"
 
 # The runner refuses to configure/run as root unless this is set; pods and cloud-init boxes are root.

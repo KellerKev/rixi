@@ -121,8 +121,13 @@ def _staged_project(flow_file, step_cli, task):
     exports = "export METAFLOW_USER=%s\n" % shlex.quote(user) + "\n".join(
         "export %s=%s" % (k, shlex.quote(os.environ[k]))
         for k in _S3_ENV_PASSTHROUGH if os.environ.get(k))
-    script = "#!/usr/bin/env bash\nset -e\n%s\nexec %s\n" % (exports, step_cli)
-    with open(os.path.join(dst, "rixi_step.sh"), "w") as f:
+    # The script holds the storage credentials the step needs. It is readable by its owner only,
+    # and removes itself on the box before the step starts, so they do not stay in the workspace
+    # for whatever runs there next.
+    script = "#!/usr/bin/env bash\nset -e\n%s\nrm -f -- \"$0\"\nexec %s\n" % (exports, step_cli)
+    step_path = os.path.join(dst, "rixi_step.sh")
+    fd = os.open(step_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(script)
 
     # Ensure the pixi project (a) supports the box's Linux arches so the env resolves there

@@ -1,5 +1,6 @@
 // A rixi box over HTTP: commands, files, long-running tasks and preview URLs.
 import { frames, importKey, Key, objects, seal, unseal } from "./crypto.js";
+import { pinnedFetch } from "./pinned.js";
 
 export type Token = string | (() => string | Promise<string>);
 
@@ -10,6 +11,9 @@ export interface ClientOptions {
   token?: Token;
   /** base64 of the 32-byte AES key, for boxes that seal their traffic (rixi up) */
   aesKey?: string;
+  /** PEM of the one certificate to trust, for a box that was given a certificate of its own
+   *  (`rixi up` keeps it in the profile as tls_cert.pem). Node only. */
+  tlsCert?: string;
   /** per-request timeout in ms for calls that are not streams (default 30 s) */
   timeoutMs?: number;
 }
@@ -73,12 +77,17 @@ export class Client {
   private readonly token?: Token;
   private readonly keyPromise: Promise<Key>;
   private readonly timeoutMs: number;
+  private readonly tlsCert?: string;
 
   constructor(opts: ClientOptions) {
     this.serverUrl = opts.serverUrl.replace(/\/+$/, "");
     this.token = opts.token;
     this.keyPromise = importKey(opts.aesKey);
     this.timeoutMs = opts.timeoutMs ?? 30_000;
+    this.tlsCert = opts.tlsCert;
+    if (this.tlsCert && !this.serverUrl.startsWith("https://")) {
+      throw new RixiError("tlsCert needs an https:// serverUrl");
+    }
   }
 
   // ── plumbing ────────────────────────────────────────────────────────────
@@ -95,10 +104,11 @@ export class Client {
   } = {}): Promise<Response> {
     const url = new URL(this.serverUrl + path);
     for (const [k, v] of Object.entries(init.query ?? {})) url.searchParams.set(k, v);
-    const r = await fetch(url, {
-      method, body: init.body as BodyInit | undefined, headers: await this.headers(init.headers),
-      signal: init.stream ? undefined : AbortSignal.timeout(this.timeoutMs),
-    });
+    const headers = await this.headers(init.headers);
+    const signal = init.stream ? undefined : AbortSignal.timeout(this.timeoutMs);
+    const r = this.tlsCert
+      ? await pinnedFetch(this.tlsCert, url, { method, headers, body: init.body, signal })
+      : await fetch(url, { method, body: init.body as BodyInit | undefined, headers, signal });
     if (!r.ok) {
       let detail = await r.text();
       try { const j = JSON.parse(detail); detail = j.detail ?? j.error ?? detail; } catch { /* text */ }

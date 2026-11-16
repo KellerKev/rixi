@@ -94,7 +94,7 @@ def test_a_name_rebound_to_localhost_is_not_localhost(server, monkeypatch):
 def test_with_tokens_the_token_is_the_check(server, token):
     # tokens are not something a browser sends by itself, so Origin does not matter
     assert server.get("/tasks", headers={**token, "Origin": "https://app.example"},
-                      ).status_code == 200
+                      ).status_code not in (401, 403)   # past the token check
 
 
 # ── nothing of a request is read before its token ────────────────────────────
@@ -271,6 +271,34 @@ def test_an_sdk_with_a_key_refuses_an_answer_in_the_clear(server, monkeypatch):
         url, **{k: v for k, v in kw.items() if k not in ("verify", "timeout")}))
     with pytest.raises(RixiError, match="in the clear"):
         client.tasks()                           # this server has no key: it answers plainly
+
+
+# ── a token seen on the wire ─────────────────────────────────────────────────
+
+def test_single_use_tokens_cannot_be_sent_again(server, monkeypatch):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                             serialization.NoEncryption()).decode()
+    s = rixi_server.auth_settings
+    monkeypatch.setattr(s, "public_key", key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode())
+    monkeypatch.setattr(s, "enabled", True)
+    monkeypatch.setattr(s, "single_use", True)
+    monkeypatch.setattr(s, "_used_jti", {})
+
+    def bearer(**claims):
+        claims.setdefault("exp", int(time.time()) + 120)
+        return {"Authorization": "Bearer " + jwt.encode({"sub": "u", **claims}, priv, "RS256")}
+    fresh = bearer(jti="a1")
+    assert server.get("/tasks", headers=fresh).status_code == 200
+    # somebody who saw that request go by: a body-less call needs nothing but the token
+    assert server.delete("/task/whatever", headers=fresh).status_code == 401
+    assert server.get("/tasks", headers=fresh).status_code == 401
+    assert server.get("/tasks", headers=bearer(jti="a2")).status_code == 200       # a new one
+    assert server.get("/tasks", headers=bearer()).status_code == 401               # no jti
+    # routes with a check of their own count the token once, not twice
+    assert server.get("/logs/tasks", headers=bearer(jti="a3", logs_retrieval="enabled")
+                      ).status_code not in (401, 403)   # past the token check
 
 
 # ── JWKS ─────────────────────────────────────────────────────────────────────

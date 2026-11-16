@@ -18,6 +18,16 @@ from pathlib import Path
 from crewai import Agent, Task, Crew, Process, LLM
 import ollama
 
+
+def _backchannel_token() -> str:
+    """The token the rixi client shipped with this run (.rixi_backchannel in the working
+    directory), or RIXI_BACKCHANNEL_TOKEN."""
+    try:
+        with open(".rixi_backchannel") as fh:
+            return fh.read().strip()
+    except OSError:
+        return os.environ.get("RIXI_BACKCHANNEL_TOKEN", "")
+
 class LocalMCPClient:
     """Client for accessing local MCP servers via encrypted back-channel"""
     
@@ -75,8 +85,11 @@ class LocalMCPClient:
         }
         
         try:
-            # Write request to stdout (will be captured by Pixi task and sent via channel)
-            print(f"MCP_REQUEST:{json.dumps(request)}")
+            # Write request to stdout (will be captured by Pixi task and sent via channel).
+            # It carries this run's back-channel token, which the client put in the package:
+            # the client acts only on lines that have it, so nothing this task merely prints
+            # (a model's answer, say) can pose as a request.
+            print(f"MCP_REQUEST:{_backchannel_token()}:{json.dumps(request)}")
             
             # In a real implementation, we'd wait for the response via stdin or a response file
             # For now, we'll simulate a successful response

@@ -281,7 +281,10 @@ def main(argv=None) -> int:
 
 
 def _cred_flags(sp) -> None:
-    g = sp.add_argument_group("cloud credentials (or env vars)")
+    g = sp.add_argument_group(
+        "cloud credentials (or env vars)",
+        "Prefer the environment variables for the secret ones: a flag's value shows in the "
+        "process list and in shell history.")
     g.add_argument("--hetzner-token", help="Hetzner Cloud API token (HCLOUD_TOKEN)")
     g.add_argument("--scw-secret-key", help="Scaleway secret key (SCW_SECRET_KEY)")
     g.add_argument("--scw-access-key", help="Scaleway access key (SCW_ACCESS_KEY)")

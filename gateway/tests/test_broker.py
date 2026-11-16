@@ -432,3 +432,35 @@ def test_a_recorded_connection_cannot_be_played_back():
             assert t.gw.registry.get("old") is None
             await ws.close()
     asyncio.run(run())
+
+
+def test_the_gateway_serves_tls_when_given_a_certificate(tmp_path):
+    import ssl
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "tunnel", "tests"))
+    from test_tunnel import _localhost_cert
+    cert, key = _localhost_cert(str(tmp_path))
+
+    async def run():
+        echo, ep = await _echo(b"S:")
+        gw = Gateway(SECRET, "127.0.0.1", 0, node_secret="n", tls_cert=cert, tls_key=key)
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(cert, key)
+        ws_server = await websockets.serve(gw._on_agent, "127.0.0.1", 0, ping_interval=20, ssl=tls)
+        url = f"wss://127.0.0.1:{ws_server.sockets[0].getsockname()[1]}"
+        client = GatewayClient(url, SECRET, "alice", ca_cert=cert)
+        try:
+            await client.connect()
+            assert await _wait(lambda: gw.registry.get("alice") is not None)
+            assert "alice" in {n["node_id"] for n in await client.list_nodes()}
+            with pytest.raises(Exception):                  # the certificate is not trusted as such
+                await GatewayClient(url, SECRET, "bob").connect()
+            from gateway.actions.provision import _gateway_url
+            assert _gateway_url(gw).startswith("wss://")    # boxes are told to dial TLS
+        finally:
+            if client._loop_task:
+                client._loop_task.cancel()
+            ws_server.close()
+            await ws_server.wait_closed()
+            await _stop_echo(echo)
+    asyncio.run(run())

@@ -36,6 +36,7 @@ import socket
 import urllib.parse
 import re
 import hashlib
+import hmac
 from collections import OrderedDict
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
@@ -222,7 +223,11 @@ def _quick_check_server_online(url: str, timeout: float = 1.5) -> (bool, str):
 
 
 
-def _package_dir(path=".", env_handler=None, env_profile=None, offline_mode=False, auto_approve=False) -> str:
+BACKCHANNEL_FILE = ".rixi_backchannel"
+
+
+def _package_dir(path=".", env_handler=None, env_profile=None, offline_mode=False, auto_approve=False,
+                 backchannel_token=None) -> str:
     """ENHANCED: Package directory with optional offline dependencies support + environment injection + auto-approve"""
     
     # Pre-flight checks for offline mode
@@ -307,6 +312,16 @@ def _package_dir(path=".", env_handler=None, env_profile=None, offline_mode=Fals
                             tar.add(fp, arcname)
                         except OSError as e:
                             print(f"⚠️ Warning: Could not add {fp}: {e}")
+
+            # This run's back-channel token: the task reads it from its working directory and
+            # puts it on every request it makes of this client. Text the task merely prints
+            # (a model's answer, a scraped page) does not know it, so it cannot pose as a request.
+            if backchannel_token:
+                import io
+                blob = (backchannel_token + "\n").encode()
+                member = tarfile.TarInfo(BACKCHANNEL_FILE)
+                member.size, member.mode, member.mtime = len(blob), 0o600, int(time.time())
+                tar.addfile(member, io.BytesIO(blob))
 
             # Add generated environment files from the temp dir with explicit arcnames
             if env_tmp_dir is not None:
@@ -2142,8 +2157,32 @@ class OneStepPixiClient:
         self._processed_mcp_requests = OrderedDict()  # LRU of processed MCP request IDs
         self._processed_proxy_requests = OrderedDict()  # LRU of processed proxy request IDs
         self._should_auto_exit = False  # Flag for auto-exit signaling
+        # What a task must put on a back-channel request (MCP_REQUEST:<token>:{…}) for it to be
+        # acted on. Made for each run and shipped inside the package; set it yourself to attach
+        # to a task started earlier.
+        import secrets as _secrets
+        self.backchannel_token = os.environ.get("RIXI_BACKCHANNEL_TOKEN") or _secrets.token_urlsafe(18)
+        self.allow_untagged_backchannel = False
+        self._untagged_warned = False
 
     _DEDUP_CACHE_SIZE = 1024
+
+    def _backchannel_json(self, line: str, prefix: str) -> Optional[str]:
+        """The JSON of a back-channel request line, if it carries this run's token."""
+        rest = line.strip()[len(prefix):]
+        tagged = self.backchannel_token + ":"
+        if len(rest) >= len(tagged) and hmac.compare_digest(rest[:len(tagged)].encode(),
+                                                            tagged.encode()):
+            return rest[len(tagged):]
+        if self.allow_untagged_backchannel and rest.lstrip().startswith("{"):
+            return rest
+        if not self._untagged_warned:
+            self._untagged_warned = True
+            print(f"⚠️ Ignored a {prefix} line without this run's back-channel token: anything a "
+                  f"task prints could look like one. The task finds the token in "
+                  f"{BACKCHANNEL_FILE} in its working directory and writes "
+                  f"{prefix}<token>:{{…}} (or pass --allow-untagged-backchannel).")
+        return None
 
     def _is_duplicate_request(self, cache: OrderedDict, request_id: Optional[str]) -> bool:
         """Dedup by request_id with a bounded LRU; requests without an ID are never deduped."""
@@ -2345,7 +2384,8 @@ class OneStepPixiClient:
             _handle_obj(obj)
 
         # ENHANCED: Pass offline mode and auto-approve to packaging function
-        pkg = _package_dir(env_handler=self.environment_handler,
+        pkg = _package_dir(backchannel_token=self.backchannel_token,
+                          env_handler=self.environment_handler,
                           env_profile=self.env_profile,
                           offline_mode=offline_mode,
                           auto_approve=self.auto_approve)
@@ -2401,7 +2441,8 @@ class OneStepPixiClient:
             print(f"✅ Will package {len(env_vars)} environment variables")
         
         # Deploy task using enhanced logic with offline mode and auto-approve support
-        pkg = _package_dir(env_handler=self.environment_handler, 
+        pkg = _package_dir(backchannel_token=self.backchannel_token,
+                          env_handler=self.environment_handler, 
                           env_profile=self.env_profile,
                           offline_mode=offline_mode,
                           auto_approve=self.auto_approve)
@@ -2567,8 +2608,10 @@ class OneStepPixiClient:
             return
             
         try:
-            # Extract JSON from MCP_REQUEST: prefix
-            json_str = line.strip()[12:]  # Remove "MCP_REQUEST:" prefix
+            # Extract JSON from MCP_REQUEST:<token>: prefix
+            json_str = self._backchannel_json(line, "MCP_REQUEST:")
+            if json_str is None:
+                return
             request = json.loads(json_str)
             
             encryption_status = "🔐 encrypted" if self.aes_key_bytes else "⚠️ unencrypted"
@@ -2605,8 +2648,10 @@ class OneStepPixiClient:
             return
             
         try:
-            # Extract JSON from HTTP_PROXY: prefix
-            json_str = line.strip()[11:]  # Remove "HTTP_PROXY:" prefix
+            # Extract JSON from HTTP_PROXY:<token>: prefix
+            json_str = self._backchannel_json(line, "HTTP_PROXY:")
+            if json_str is None:
+                return
             request = json.loads(json_str)
             
             encryption_status = "🔐 encrypted" if self.aes_key_bytes else "⚠️ unencrypted"
@@ -2919,6 +2964,12 @@ def main():
     # MCP configuration (enhanced features with external server support)
     parser.add_argument("--with-mcp", action="store_true", help="Enable MCP back-channel")
     parser.add_argument("--mcp-filesystem", action="store_true", help="Enable built-in MCP filesystem")
+    parser.add_argument("--backchannel-token", default=os.environ.get("RIXI_BACKCHANNEL_TOKEN"),
+                        help="Token a task's back-channel requests must carry (made per run and "
+                             "shipped in the package; set it to attach to a task started earlier)")
+    parser.add_argument("--allow-untagged-backchannel", action="store_true",
+                        help="Also act on MCP_REQUEST:/HTTP_PROXY: lines without the token "
+                             "(anything the task prints could then pose as a request)")
     parser.add_argument("--mcp-root", help="Root path for built-in MCP filesystem")
     parser.add_argument("--with-external-mcp", action="store_true", help="Enable external MCP server routing")
     parser.add_argument("--show-mcp", action="store_true", help="Show MCP server configuration and exit")
@@ -3710,6 +3761,9 @@ actions = ["sql_*", "schema_*"]
                         print("⚠️ Non-interactive mode: continuing without encryption")
             
             client = OneStepPixiClient(server_url, args.aes_key, _auth_headers, args.handshake_secret, args.env_profile, auto_approve)
+            client.allow_untagged_backchannel = args.allow_untagged_backchannel
+            if args.backchannel_token:
+                client.backchannel_token = args.backchannel_token
             
             try:
                 task_id = client.deploy_task_with_full_features(args.task, enhanced_config, offline_mode)
@@ -3756,6 +3810,9 @@ actions = ["sql_*", "schema_*"]
         else:
             # ENHANCED: Standard deployment with environment injection, offline support, and auto-approve
             client = OneStepPixiClient(server_url, args.aes_key, _auth_headers, args.handshake_secret, args.env_profile, auto_approve)
+            client.allow_untagged_backchannel = args.allow_untagged_backchannel
+            if args.backchannel_token:
+                client.backchannel_token = args.backchannel_token
             task_id = client.deploy_task_standard(args.task, enhanced_config, offline_mode)
             deployment_type = "offline" if offline_mode else "online"
             auto_approve_note = " (auto-approved)" if auto_approve else ""

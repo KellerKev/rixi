@@ -258,8 +258,11 @@ class ScalewayProvider:
             "inbound_default_policy": "drop", "outbound_default_policy": "accept",
             "description": "rixi: this box's own firewall; its policy is applied when it is ready",
             "tags": box_tags(spec.box_id, spec.tenant)})["security_group"]["id"]
+        # While it installs itself the box needs the internet, so outbound is still open — and
+        # for exactly that reason nobody gets a shell on it yet: SSH opens with the policy
+        # (which also says who may reach it), not before.
         rules = [{"protocol": "TCP", "direction": "inbound", "action": "accept",
-                  "ip_range": "0.0.0.0/0", "dest_port_from": p} for p in (80, 443, 22)]
+                  "ip_range": "0.0.0.0/0", "dest_port_from": p} for p in (80, 443)]
         rules += [{"protocol": "TCP", "direction": "outbound", "action": "drop",
                    "ip_range": "0.0.0.0/0", "dest_port_from": p} for p in (25, 465, 587)]
         self._set_rules(spec.zone, sg, rules)

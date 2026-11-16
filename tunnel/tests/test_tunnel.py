@@ -156,3 +156,89 @@ def test_wrong_secret_is_rejected():
             await target_server.wait_closed()
 
     asyncio.run(run())
+
+
+# ── over TLS, and never the same key twice ────────────────────────────────────
+
+def _localhost_cert(folder):
+    """A self-signed certificate for 127.0.0.1; returns (cert path, key path)."""
+    import datetime
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=2))
+            .add_extension(x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.ip_address("127.0.0.1")), x509.DNSName("localhost")]),
+                critical=False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .sign(key, hashes.SHA256()))
+    cp, kp = os.path.join(folder, "c.pem"), os.path.join(folder, "k.pem")
+    with open(cp, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(kp, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()))
+    return cp, kp
+
+
+def test_the_tunnel_runs_over_tls_when_given_a_certificate(tmp_path):
+    from rixi_tunnel import client_tls, server_tls
+    cert, key = _localhost_cert(str(tmp_path))
+
+    async def run():
+        target_server, target_port = await _echo_target()
+        local_port, ws_port = await _free_port(), await _free_port()
+        listen_task = asyncio.create_task(run_listen(
+            f"127.0.0.1:{local_port}", f"127.0.0.1:{ws_port}", SECRET, tls=server_tls(cert, key)))
+        connect_task = asyncio.create_task(run_connect(
+            f"wss://127.0.0.1:{ws_port}", f"127.0.0.1:{target_port}", SECRET, ca_cert=cert))
+        try:
+            assert await _wait_port("127.0.0.1", local_port)
+            loop = asyncio.get_event_loop()
+            end = loop.time() + 8
+            got = b""
+            while loop.time() < end and got != b"OVER TLS":
+                try:
+                    r, w = await asyncio.open_connection("127.0.0.1", local_port)
+                    w.write(b"over tls")
+                    await w.drain()
+                    got = await asyncio.wait_for(r.read(8), timeout=2)
+                    w.close()
+                except Exception:
+                    await asyncio.sleep(0.1)
+            assert got == b"OVER TLS"
+            # a dialer that does not trust the certificate does not connect
+            import websockets
+            with pytest.raises(Exception):
+                async with websockets.connect(f"wss://127.0.0.1:{ws_port}"):
+                    pass
+        finally:
+            connect_task.cancel()
+            listen_task.cancel()
+            target_server.close()
+    asyncio.run(run())
+    assert client_tls("ws://x:1", cert) is None and client_tls("wss://x:1", "") is None
+    with pytest.raises(SystemExit):
+        server_tls(cert, None)
+
+
+def test_every_connection_has_a_key_of_its_own():
+    from rixi_tunnel import TO_DIALER, TO_LISTENER, seal, session_key, unseal
+    static = derive_keys(SECRET)[0]
+    first, later = session_key(static, "a" * 32, "b" * 32), session_key(static, "c" * 32, "b" * 32)
+    frame = seal({"type": "session_open", "sid": "s"}, first, TO_DIALER, 0)
+    assert unseal(frame, first, TO_DIALER, 0)["sid"] == "s"
+    for key, direction, counter in ((later, TO_DIALER, 0),      # a recording, on a new connection
+                                    (first, TO_DIALER, 1),      # played again
+                                    (first, TO_LISTENER, 0)):   # sent back where it came from
+        with pytest.raises(Exception):
+            unseal(frame, key, direction, counter)

@@ -1,8 +1,8 @@
 // The SDK against a real rixi server process — plain, and with an AES key.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,15 +20,32 @@ const freePort = () => new Promise((resolve) => {
   });
 });
 
-async function startServer(extra = []) {
+/** A certificate as `rixi up` makes one for a box: [key path, cert path, cert PEM]. */
+function boxCertificate() {
+  const dir = mkdtempSync(join(tmpdir(), "rixi-tls-"));
+  const out = spawnSync(SERVER_PY, ["-c", `
+import sys
+sys.path.insert(0, ${JSON.stringify(join(ROOT, "src"))})
+from rixi.cloud.profiles import generate_tls_cert
+key, cert = generate_tls_cert("box1")
+open(sys.argv[1] + "/k.pem", "w").write(key)
+open(sys.argv[1] + "/c.pem", "w").write(cert)
+`, dir]);
+  assert.equal(out.status, 0, String(out.stderr));
+  return [join(dir, "k.pem"), join(dir, "c.pem"), readFileSync(join(dir, "c.pem"), "utf8")];
+}
+
+async function startServer(extra = [], tls = null) {
   const port = await freePort();
   const ws = mkdtempSync(join(tmpdir(), "rixi-ws-"));
   const proc = spawn(SERVER_PY, [join(ROOT, "server", "rixi_server.py"), "--port", String(port),
-    "--workspace", ws, "--log-dir", mkdtempSync(join(tmpdir(), "rixi-log-")), ...extra],
+    "--workspace", ws, "--log-dir", mkdtempSync(join(tmpdir(), "rixi-log-")), ...extra,
+    ...(tls ? ["--tls-cert", tls[1], "--tls-key", tls[0]] : [])],
     { cwd: join(ROOT, "server"), stdio: "ignore" });
-  const url = `http://127.0.0.1:${port}`;
+  const url = `${tls ? "https" : "http"}://127.0.0.1:${port}`;
+  const probe = new Client({ serverUrl: url, tlsCert: tls ? tls[2] : undefined });
   for (let i = 0; i < 100; i++) {
-    try { if ((await fetch(`${url}/health`)).ok) return { proc, url, ws }; } catch { /* booting */ }
+    try { await probe.health(); return { proc, url, ws }; } catch { /* booting */ }
     await new Promise((r) => setTimeout(r, 100));
   }
   proc.kill();
@@ -99,4 +116,20 @@ test("a sealed box refuses a client without the key", async () => {
 test("previews need a named box", async () => {
   const c = new Client({ serverUrl: plain.url });
   await assert.rejects(c.openPreview(8000), (e) => e instanceof RixiError && e.status === 404);
+});
+
+
+test("a box with a certificate of its own is reached with that certificate and no other", async () => {
+  const [key, certPath, cert] = boxCertificate();
+  const [, , otherCert] = boxCertificate();              // same name, another key
+  const kf = join(mkdtempSync(join(tmpdir(), "rixi-key-")), "aes.key");
+  const aes = randomBytes(32).toString("base64");
+  writeFileSync(kf, aes);
+  const box = await startServer(["--aes-key", kf, "--require-encryption"], [key, certPath, cert]);
+  servers.push(box.proc);
+  const c = new Client({ serverUrl: box.url, aesKey: aes, tlsCert: cert });
+  await agentLoop(c);                                    // everything, over the pinned connection
+  await assert.rejects(() => new Client({ serverUrl: box.url, aesKey: aes, tlsCert: otherCert }).health());
+  await assert.rejects(() => new Client({ serverUrl: box.url, aesKey: aes }).health());   // nobody signed it
+  assert.throws(() => new Client({ serverUrl: "http://127.0.0.1:9000", tlsCert: cert }), RixiError);
 });

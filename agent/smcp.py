@@ -178,6 +178,7 @@ class SMCPConfig:
         self.jwt_secret: str = ""   # server-side only; accepted but unused by the client
         self.node_id: str = ""
         self.mode: str = ""
+        self.ca_cert: str = ""      # for a wss:// server: trust this CA/certificate (PEM file)
 
 
 class SMCPClient:
@@ -218,7 +219,12 @@ class SMCPClient:
         self._fernet, self._mac_key = _derive_keys(secret, getattr(self.config, "kdf_salt", ""))
         f, mk = self._fernet, lambda t, p, e: _envelope(self._mac_key, self._fernet, t, p, e)
 
-        self._ws = await websockets.connect(url)
+        tls = {}
+        ca = getattr(self.config, "ca_cert", "")
+        if url.startswith("wss://") and ca:
+            import ssl
+            tls = {"ssl": ssl.create_default_context(cafile=ca)}
+        self._ws = await websockets.connect(url, **tls)
 
         # malgra's v3 server requires a non-empty handshake nonce (mutual-auth challenge it echoes back).
         nonce = uuid.uuid4().hex
@@ -521,7 +527,10 @@ class SMCPToolServer:
             if resp is not None:
                 await ws.send(json.dumps(resp))
 
-    async def serve(self, host: str = "127.0.0.1", port: int = 8770):
-        """Start the WebSocket server (returns the server object; caller awaits it)."""
-        log.info("SMCP server listening on ws://%s:%d with %d tools", host, port, len(self.tools))
-        return await websockets.serve(self._conn_handler, host, port)
+    async def serve(self, host: str = "127.0.0.1", port: int = 8770, ssl=None):
+        """Start the WebSocket server (returns the server object; caller awaits it). With an
+        `ssl` context it serves wss://: the envelope proves who sent a message and hides its
+        payload, TLS keeps the connection itself from being read or steered."""
+        log.info("SMCP server listening on %s://%s:%d with %d tools", "wss" if ssl else "ws",
+                 host, port, len(self.tools))
+        return await websockets.serve(self._conn_handler, host, port, ssl=ssl)

@@ -68,7 +68,8 @@ if [ ! -x "$HOME/.pixi/bin/pixi" ]; then
 fi
 PIXI="$HOME/.pixi/bin/pixi"
 export PATH="$HOME/.pixi/bin:$PATH"
-"$PIXI" global install caddy >/dev/null
+# Caddy 2 (the Caddyfile below is written for it), not whatever the next major turns out to be
+"$PIXI" global install "caddy>=2.8,<3" >/dev/null
 CADDY="$HOME/.pixi/bin/caddy"
 
 # 2. rixi at the pinned ref ----------------------------------------------------
@@ -157,9 +158,21 @@ mkdir -p /var/lib/caddy
   if [ -n "${RIXI_SERVE_KIND:-}" ]; then
     # One line per request, so the agent can count them and tell the gateway when the
     # endpoint last did any work (an idle endpoint should stop costing money).
+    # The log is for counting: what works as a credential is taken out of each line (the
+    # terminal's ?token=, a preview's share token, and the Authorization and Cookie headers).
     echo "  log {"
     echo "    output file /var/log/rixi/access.log"
-    echo "    format json"
+    echo "    format filter {"
+    echo "      wrap json"
+    echo "      fields {"
+    echo "        request>uri query {"
+    echo "          delete token"
+    echo "          delete rixi_preview"
+    echo "        }"
+    echo "        request>headers>Authorization delete"
+    echo "        request>headers>Cookie delete"
+    echo "      }"
+    echo "    }"
     echo "  }"
     # Two mutually exclusive handle blocks, NOT one block with a matcher and a fallback:
     # inside a single handle, Caddy runs directives in its own order and `respond` comes

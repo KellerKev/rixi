@@ -55,8 +55,12 @@ class Gateway:
                  config_path: str | None = None, reap_interval: float = 60.0,
                  verifier=None, policy=None, auditor=None,
                  admin_host: str = "127.0.0.1", admin_port: int = 0, kdf_salt: str = "",
-                 node_secret: str | None = None, allow_dummy: bool | None = None):
+                 node_secret: str | None = None, allow_dummy: bool | None = None,
+                 tls_cert: str | None = None, tls_key: str | None = None):
         self.secret = secret
+        # With a certificate the gateway serves wss://: the shared secret keeps strangers out,
+        # TLS keeps what crosses the network from others who hold that secret.
+        self.tls_cert, self.tls_key = tls_cert, tls_key
         # Known to the gateway only: each provisioned box gets a token derived from it, so a box
         # proves which node it is. (The tunnel secret cannot do that: every box holds it.)
         self._node_secret = node_secret
@@ -772,9 +776,22 @@ class Gateway:
             await self.verifier.start()
         if self.auditor is not None:
             await self.auditor.start()
+        tls = None
+        if self.tls_cert or self.tls_key:
+            import ssl
+            if not (self.tls_cert and self.tls_key):
+                raise SystemExit("--tls-cert and --tls-key go together")
+            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls.load_cert_chain(self.tls_cert, self.tls_key)
         ws_server = await websockets.serve(self._on_agent, self.ws_host, self.ws_port,
-                                           ping_interval=20, ping_timeout=20)
-        print(f"🛰️  rixi gateway on ws://{self.ws_host}:{self.ws_port}", flush=True)
+                                           ping_interval=20, ping_timeout=20, ssl=tls)
+        print(f"🛰️  rixi gateway on {'wss' if tls else 'ws'}://{self.ws_host}:{self.ws_port}",
+              flush=True)
+        if tls is None and self.ws_host not in ("127.0.0.1", "localhost", "::1"):
+            print("⚠️  no TLS on a public address: boxes and clients all hold the tunnel secret, "
+                  "so any of them on the way can read the others' traffic (and clients' JWTs). "
+                  "Pass --tls-cert/--tls-key, or put the gateway behind a TLS proxy and set "
+                  "--public-ws-url to its wss:// address.", flush=True)
         self._prewarm_all()   # provision any prewarm resources proactively (no cold start)
         reaper = asyncio.create_task(self._reaper())
         api_server = api_task = None
@@ -852,6 +869,10 @@ def main():
     ap.add_argument("--allow-dummy-provider", action="store_true",
                     help="let clients ask for 'dummy' boxes, which run as processes on this host "
                          "(default: only when --ws-bind is loopback)")
+    ap.add_argument("--tls-cert", default=os.getenv("RIXI_GATEWAY_TLS_CERT"),
+                    help="serve wss:// with this certificate (PEM file)")
+    ap.add_argument("--tls-key", default=os.getenv("RIXI_GATEWAY_TLS_KEY"),
+                    help="the private key for --tls-cert (PEM file)")
     ap.add_argument("--admin-bind", default=os.getenv("RIXI_ADMIN_BIND", ""),
                     help="management API host:port (e.g. 127.0.0.1:7101); empty = off")
     ap.add_argument("--audit-db", default=os.getenv("RIXI_AUDIT_DB"), help="DuckDB audit file")
@@ -888,7 +909,8 @@ def main():
                  public_ws_url=args.public_ws_url,
                  verifier=verifier, auditor=auditor, admin_host=admin_host, admin_port=admin_port,
                  node_secret=args.node_secret,
-                 allow_dummy=True if args.allow_dummy_provider else None)
+                 allow_dummy=True if args.allow_dummy_provider else None,
+                 tls_cert=args.tls_cert, tls_key=args.tls_key)
     try:
         asyncio.run(gw.serve())
     except KeyboardInterrupt:

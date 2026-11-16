@@ -61,9 +61,10 @@ def _parse_bind(bind: str):
     return host or "127.0.0.1", int(port or "8770")
 
 
-async def _run(server: SMCPToolServer, host: str, port: int):
-    await server.serve(host, port)
-    print(f"🔐 rixi SMCP server on ws://{host}:{port} — tools: {list(server.tools)}")
+async def _run(server: SMCPToolServer, host: str, port: int, tls=None):
+    await server.serve(host, port, ssl=tls)
+    print(f"🔐 rixi SMCP server on {'wss' if tls else 'ws'}://{host}:{port} — "
+          f"tools: {list(server.tools)}")
     await asyncio.Future()  # run forever
 
 
@@ -84,6 +85,10 @@ def main():
     ap.add_argument("--allow-open", action="store_true",
                     default=os.getenv("RIXI_SMCP_ALLOW_OPEN", "").lower() in ("1", "true", "yes"),
                     help="accept any client when no api-key is set (dev only; refuses to run open otherwise)")
+    ap.add_argument("--tls-cert", default=os.getenv("RIXI_SMCP_TLS_CERT"),
+                    help="serve wss:// with this certificate (PEM file)")
+    ap.add_argument("--tls-key", default=os.getenv("RIXI_SMCP_TLS_KEY"),
+                    help="the private key for --tls-cert (PEM file)")
     ap.add_argument("--search-api-key", default="", help="API key for the web_search tool")
     args = ap.parse_args()
 
@@ -103,8 +108,18 @@ def main():
         )
     except RuntimeError as exc:
         ap.error(str(exc))
+    tls = None
+    if args.tls_cert or args.tls_key:
+        if not (args.tls_cert and args.tls_key):
+            ap.error("--tls-cert and --tls-key go together")
+        import ssl
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(args.tls_cert, args.tls_key)
+    elif host not in ("127.0.0.1", "localhost", "::1"):
+        print("⚠️  no TLS on a public address: pass --tls-cert/--tls-key (or put the server "
+              "behind a TLS proxy) so the connection cannot be read or steered on the way")
     try:
-        asyncio.run(_run(server, host, port))
+        asyncio.run(_run(server, host, port, tls))
     except KeyboardInterrupt:
         print("\nSMCP server shutting down…")
 

@@ -23,8 +23,9 @@ from .protocol import TO_LISTENER, AgentConn, dec, derive_keys, enc, proof, sess
 
 class GatewayClient:
     def __init__(self, gateway_url: str, secret: str, node_id: str = "client",
-                 token: str | None = None, kdf_salt: str = ""):
+                 token: str | None = None, kdf_salt: str = "", ca_cert: str | None = None):
         self.url = gateway_url
+        self.ca_cert = ca_cert   # for wss://: trust this CA/certificate (PEM file), not the system's
         self.secret = secret
         self.key, self.proof_key = derive_keys(secret, kdf_salt)
         self.node_id = node_id
@@ -36,7 +37,12 @@ class GatewayClient:
         self._loop_task: asyncio.Task | None = None
 
     async def connect(self):
-        ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=None)
+        tls = {}
+        if self.url.startswith("wss://") and self.ca_cert:
+            import ssl
+            tls = {"ssl": ssl.create_default_context(cafile=self.ca_cert)}
+        ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=None,
+                                      **tls)
         ch = dec(await asyncio.wait_for(ws.recv(), timeout=10), self.key)
         if ch.get("type") != "challenge":
             raise RuntimeError("expected challenge")
@@ -144,7 +150,8 @@ def _select_from_args(args) -> dict:
 
 
 async def _run(args):
-    gc = GatewayClient(args.to, args.secret, args.node_id, token=args.token, kdf_salt=args.kdf_salt)
+    gc = GatewayClient(args.to, args.secret, args.node_id, token=args.token, kdf_salt=args.kdf_salt,
+                       ca_cert=args.ca_cert)
     await gc.connect()
     if args.teardown:
         r = await gc.teardown(args.teardown)
@@ -187,6 +194,8 @@ def main():
     ap.add_argument("--node-id", default="client", help="this client's id")
     ap.add_argument("--kdf-salt", default=os.getenv("RIXI_GATEWAY_SALT", ""), help="per-deployment KDF salt (or RIXI_GATEWAY_SALT); must match peers")
     ap.add_argument("--token", default=os.getenv("RIXI_JWT"), help="JWT for RBAC (or RIXI_JWT)")
+    ap.add_argument("--ca-cert", default=os.getenv("RIXI_GATEWAY_CA"),
+                    help="for a wss:// gateway: trust this CA or certificate (PEM file)")
     ap.add_argument("--bind", default="127.0.0.1:9100", help="local TCP port to expose")
     ap.add_argument("--route", help="target server node_id to reach")
     ap.add_argument("--resource", help="named resource from the gateway catalog (provision/reuse, then route)")

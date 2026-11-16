@@ -84,7 +84,8 @@ def _gateway_url(gateway) -> str:
     if getattr(gateway, "public_ws_url", None):
         return gateway.public_ws_url
     host = "127.0.0.1" if gateway.ws_host in ("0.0.0.0", "") else gateway.ws_host
-    return f"ws://{host}:{gateway.ws_port}"
+    scheme = "wss" if getattr(gateway, "tls_cert", None) else "ws"
+    return f"{scheme}://{host}:{gateway.ws_port}"
 
 
 def _dummy_defaults(tvars: dict) -> dict:

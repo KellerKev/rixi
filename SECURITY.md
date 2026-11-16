@@ -35,7 +35,9 @@ deployment:
   recorded request from being sent again. Across a network you do not control,
   use TLS: `rixi up` gives each box a certificate of its own and pins it in the
   profile; for your own server pass `--tls-cert/--tls-key` or put it behind a
-  reverse proxy that terminates TLS.
+  reverse proxy that terminates TLS. Where that is not possible and
+  the client signs a fresh token per request, `--single-use-tokens` makes a
+  token seen on the wire worthless (each is accepted once).
 - When several servers trust one issuer, scope their tokens with `--audience`
   (and `--required-claim`), and require `exp` (`--require-exp`). Without an
   audience, a token issued for any of them works on all of them. The gateway
@@ -51,12 +53,18 @@ deployment:
   authenticates membership, not identity. Boxes the gateway provisions prove a
   per-box registration token; clients are told apart by their JWT (set
   `require_jwt` in the policy) — without JWTs, a client is only as distinct as
-  the connection it holds. Dial the gateway over `wss://` when the network
-  between is not yours. The `dummy` provider runs boxes as processes on the
+  the connection it holds. Give the gateway a certificate
+  (`--tls-cert/--tls-key`, or a TLS proxy and `--public-ws-url wss://…`) when
+  the network between is not yours; the tunnel and the SMCP server take the
+  same flags. The `dummy` provider runs boxes as processes on the
   gateway's own host and is off unless the gateway listens on loopback.
 - The inference proxy forwards to its backend with its own token: give it an
   API key or JWT (`authentication` in its config) before it listens anywhere
   but loopback.
+- A task asks the command-line client for something (a local file, a local
+  service) by printing a request line. Only lines carrying the token the client
+  made for that run are acted on (`.rixi_backchannel` in the task's working
+  directory), so text a task merely prints cannot pose as a request.
 - `rixi run` leaves files that look like credentials (`.env`, `*.pem`, keys,
   cloud credential directories) out of what it ships; `.rixiignore` adds
   patterns or, with `!`, sends one after all.
